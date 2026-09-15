@@ -477,24 +477,10 @@ where
         Ok(())
     }
 
-    /// Writes contents to the client in a `RECV_PACKET` frame.
+    /// Writes one relayed payload to the client, once the forwarding policy has admitted it.
     ///
-    /// Errors if the send does not happen within the `timeout` duration
-    /// Does not flush.
-    async fn send_raw(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
-        let remote_endpoint_id = packet.src;
-        let datagrams = packet.data;
-
-        if let Ok(len) = datagrams.contents.len().try_into() {
-            self.metrics.bytes_sent.inc_by(len);
-        }
-        self.write_frame(RelayToClientMsg::Datagrams {
-            remote_endpoint_id,
-            datagrams,
-        })
-        .await
-    }
-
+    /// Errors if the connection does not become ready, or the write does not complete, within the
+    /// `timeout` duration.
     async fn send_packet(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
         trace!("send packet");
 

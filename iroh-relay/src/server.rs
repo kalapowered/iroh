@@ -57,6 +57,7 @@ use self::http_server::{BytesBody, HyperError, HyperResult};
 use crate::{
     defaults::DEFAULT_KEY_CACHE_CAPACITY,
     http::{AUTH_TOKEN_URL_QUERY_PARAM, ProtocolVersion, RELAY_PROBE_PATH},
+    protos::relay::Datagrams,
     quic::server::{QuicServer, QuicSpawnError, ServerHandle as QuicServerHandle},
     tls::CaTlsConfig,
 };
@@ -144,13 +145,15 @@ pub struct RelayConfig {
     pub key_cache_capacity: Option<usize>,
     /// Access control for incoming connections.
     pub access: Arc<dyn DynAccessControl>,
+    /// Forwarding policy for individual relayed payloads.
+    pub forward: Arc<dyn ForwardPolicy>,
 }
 
 impl RelayConfig {
     /// Creates a new [`RelayConfig`] bound to `http_bind_addr` with default settings.
     ///
-    /// TLS is disabled, default [`Limits`] are used, the key cache capacity is unset, and
-    /// access defaults to [`AllowAll`]. Adjust any of these by assigning to the
+    /// TLS is disabled, default [`Limits`] are used, the key cache capacity is unset, access
+    /// defaults to [`AllowAll`] and forwarding defaults to [`ForwardAll`]. Adjust any of these by assigning to the
     /// corresponding fields after construction.
     pub fn new(http_bind_addr: impl Into<SocketAddr>) -> Self {
         Self {
@@ -159,6 +162,7 @@ impl RelayConfig {
             limits: Limits::default(),
             key_cache_capacity: None,
             access: Arc::new(AllowAll),
+            forward: Arc::new(ForwardAll),
         }
     }
 }
@@ -353,6 +357,182 @@ pub enum Access {
     /// Access is denied.
     Deny {
         /// Optional reason for denial to send back to the client.
+        reason: Option<String>,
+    },
+}
+
+/// Decides whether one relayed payload may cross a forwarding boundary.
+///
+/// [`AccessControl`] admits a connection; this admits a payload. They answer different questions,
+/// and an embedder that bills for traffic or enforces a per-pair capability needs the second one:
+/// admitting an endpoint says nothing about which peers it may reach, how many bytes it has left,
+/// or whether the capability it is forwarding under is still current.
+///
+/// Both call sites are on the connection actor, so an implementation sees the payload at the
+/// moment it is read from the sender and again at the moment it is written to the receiver, and
+/// can count it at whichever of the two it chooses.
+pub trait ForwardPolicy: std::fmt::Debug + Send + Sync + 'static {
+    /// Decides one payload at one boundary.
+    ///
+    /// Called on the connection actor's task, once per payload per boundary, so it must not block.
+    /// An admitted payload carries the [`ForwardPermit`] this returns to its next boundary, so a
+    /// policy can tell at the write what it decided at the read.
+    fn on_forward(&self, request: &ForwardRequest<'_>) -> Forward;
+
+    /// Reports what became of a payload this policy admitted at this boundary.
+    ///
+    /// Deciding and counting are separate events because they can disagree. A payload admitted at
+    /// [`ForwardBoundary::Egress`] may still fail to be written, and one admitted at
+    /// [`ForwardBoundary::Ingress`] may find the destination gone, so a policy that billed on the
+    /// decision would charge for traffic that never moved. Called exactly once for each payload
+    /// this policy admitted at this boundary, and never for one it dropped or refused.
+    fn on_settled(&self, request: &ForwardRequest<'_>, outcome: ForwardOutcome) {
+        let _ = (request, outcome);
+    }
+}
+
+/// A policy's own token, issued when it admits a payload and handed back at its later boundaries.
+///
+/// The server never interprets it and never invents one: it carries what the policy put in it from
+/// the boundary that admitted a payload to the boundary that writes it. That is what a policy needs
+/// to enforce a capability across a queue, because the capability a payload was admitted under can
+/// be replaced or revoked while the payload is still waiting, and the payload itself says nothing
+/// about which one it was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForwardPermit {
+    /// The policy's own identifier for the admission this payload was accepted under.
+    pub admission: u64,
+    /// The policy's own identifier for the allocation its bytes are drawn from.
+    pub allocation: u64,
+}
+
+/// What became of a payload a policy admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardOutcome {
+    /// It crossed the boundary: queued for the destination at [`ForwardBoundary::Ingress`],
+    /// written to it at [`ForwardBoundary::Egress`].
+    Committed,
+    /// It did not, and never will. The destination was gone, its queue was full, or the write
+    /// failed.
+    Dropped,
+}
+
+/// A [`ForwardPolicy`] that forwards every payload.
+///
+/// This is the default used by [`RelayConfig::new`], and it is what the server does today.
+#[derive(Debug, Clone, Copy)]
+pub struct ForwardAll;
+
+impl ForwardPolicy for ForwardAll {
+    fn on_forward(&self, _request: &ForwardRequest<'_>) -> Forward {
+        Forward::Allow {
+            permit: ForwardPermit::default(),
+        }
+    }
+}
+
+/// Which side of a relayed payload's journey a [`ForwardRequest`] describes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ForwardBoundary {
+    /// The payload has been read from the sending connection and is about to be queued for the
+    /// receiving one.
+    Ingress,
+    /// The payload has been taken from the receiving connection's queue and is about to be written
+    /// to it.
+    Egress,
+}
+
+/// One payload at one forwarding boundary.
+#[derive(Debug)]
+pub struct ForwardRequest<'a> {
+    boundary: ForwardBoundary,
+    src: EndpointId,
+    dst: EndpointId,
+    connection_id: ConnectionId,
+    permit: Option<ForwardPermit>,
+    datagrams: &'a Datagrams,
+}
+
+impl<'a> ForwardRequest<'a> {
+    /// Creates a request describing `datagrams` crossing `boundary`.
+    ///
+    /// `connection_id` is the connection this boundary belongs to: the sender's at
+    /// [`ForwardBoundary::Ingress`] and the receiver's at [`ForwardBoundary::Egress`]. `permit` is
+    /// what the policy issued when it admitted the payload, and is `None` only at the first
+    /// boundary, where nothing has admitted it yet.
+    pub fn new(
+        boundary: ForwardBoundary,
+        src: EndpointId,
+        dst: EndpointId,
+        connection_id: ConnectionId,
+        permit: Option<ForwardPermit>,
+        datagrams: &'a Datagrams,
+    ) -> Self {
+        Self {
+            boundary,
+            src,
+            dst,
+            connection_id,
+            permit,
+            datagrams,
+        }
+    }
+
+    /// The permit the policy issued when it admitted this payload, if it has been admitted yet.
+    pub fn permit(&self) -> Option<ForwardPermit> {
+        self.permit
+    }
+
+    /// The boundary this payload is at.
+    pub fn boundary(&self) -> ForwardBoundary {
+        self.boundary
+    }
+
+    /// The endpoint that sent the payload.
+    pub fn src(&self) -> EndpointId {
+        self.src
+    }
+
+    /// The endpoint the payload is addressed to.
+    pub fn dst(&self) -> EndpointId {
+        self.dst
+    }
+
+    /// The connection this boundary belongs to.
+    pub fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
+    /// The payload.
+    pub fn datagrams(&self) -> &Datagrams {
+        self.datagrams
+    }
+
+    /// The payload's length in bytes, which is what an implementation meters.
+    pub fn len(&self) -> usize {
+        self.datagrams.contents.len()
+    }
+
+    /// Whether the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What to do with one payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forward {
+    /// Let the payload cross this boundary, carrying `permit` to the next one.
+    Allow {
+        /// The policy's own token for this payload. Returned to it at every later boundary and
+        /// outcome for the same payload.
+        permit: ForwardPermit,
+    },
+    /// Drop the payload and keep the connection.
+    Drop,
+    /// Drop the payload and close the connection this boundary belongs to.
+    Close {
+        /// Optional reason, for the server's own logs.
         reason: Option<String>,
     },
 }
@@ -732,6 +912,7 @@ impl Server {
                     .metrics(metrics.server.clone())
                     .headers(headers)
                     .key_cache_capacity(key_cache_capacity)
+                    .forward(relay_config.forward.clone())
                     .access(relay_config.access)
                     .request_handler(Method::GET, "/", Box::new(root_handler))
                     .request_handler(Method::GET, "/index.html", Box::new(root_handler))

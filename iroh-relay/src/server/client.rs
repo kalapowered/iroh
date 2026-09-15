@@ -29,7 +29,8 @@ use crate::{
         streams::BytesStreamSink,
     },
     server::{
-        ConnectionId, OnDisconnectGuard,
+        ConnectionId, Forward, ForwardBoundary, ForwardOutcome, ForwardPermit, ForwardPolicy,
+        ForwardRequest, OnDisconnectGuard,
         clients::Clients,
         metrics::Metrics,
         streams::{RecvError as RelayRecvError, RelayedStream, SendError as RelaySendError},
@@ -43,6 +44,8 @@ pub(super) struct Packet {
     src: EndpointId,
     /// The data packet bytes.
     data: Datagrams,
+    /// What the forwarding policy issued when it admitted this packet at the sending connection.
+    permit: ForwardPermit,
 }
 
 /// Configuration for a client connection.
@@ -63,6 +66,8 @@ pub struct Config<S> {
     pub channel_capacity: usize,
     /// Protocol version negotiated for this client
     pub protocol_version: ProtocolVersion,
+    /// Decides each relayed payload at this connection's two forwarding boundaries.
+    pub forward: Arc<dyn ForwardPolicy>,
     /// Optional signal to inform the client when it is being rate-limited.
     ///
     /// When set, the connection actor notifies the client once with a
@@ -87,6 +92,7 @@ impl<S> Config<S> {
             write_timeout: SERVER_WRITE_TIMEOUT,
             channel_capacity: PER_CLIENT_SEND_QUEUE_DEPTH,
             rate_limited: None,
+            forward: Arc::new(crate::server::ForwardAll),
         }
     }
 }
@@ -132,6 +138,7 @@ impl Client {
             channel_capacity,
             protocol_version,
             rate_limited,
+            forward,
         } = config;
         let endpoint_id = guard.endpoint_id;
         let connection_id = guard.connection_id;
@@ -151,6 +158,7 @@ impl Client {
             ping_tracker: PingTracker::default(),
             protocol_version,
             rate_limited,
+            forward,
             metrics,
         };
 
@@ -199,8 +207,9 @@ impl Client {
         &self,
         src: EndpointId,
         data: Datagrams,
+        permit: ForwardPermit,
     ) -> Result<(), TrySendError<Packet>> {
-        self.packet_queue.try_send(Packet { src, data })
+        self.packet_queue.try_send(Packet { src, data, permit })
     }
 
     pub(super) fn try_send_peer_gone(
@@ -245,6 +254,8 @@ async fn rate_limited_signal(rx: &mut Option<watch::Receiver<u64>>) -> bool {
 #[allow(missing_docs)]
 #[non_exhaustive]
 pub enum HandleFrameError {
+    #[error("the forwarding policy closed the connection")]
+    ForwardRefused {},
     #[error(transparent)]
     ForwardPacket { source: ForwardPacketError },
     #[error("Stream terminated")]
@@ -260,6 +271,8 @@ pub enum HandleFrameError {
 #[allow(missing_docs)]
 #[non_exhaustive]
 pub enum WriteFrameError {
+    #[error("the forwarding policy closed the connection")]
+    ForwardRefused {},
     #[error(transparent)]
     Stream { source: RelaySendError },
     #[error(transparent)]
@@ -336,6 +349,8 @@ struct Actor<S> {
     protocol_version: ProtocolVersion,
     /// Optional signal counting how often the connection has been rate-limited.
     rate_limited: Option<watch::Receiver<u64>>,
+    /// Decides each relayed payload at this connection's two forwarding boundaries.
+    forward: Arc<dyn ForwardPolicy>,
     metrics: Arc<Metrics>,
 }
 
@@ -472,7 +487,55 @@ where
 
     async fn send_packet(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
         trace!("send packet");
-        match self.send_raw(packet).await {
+        // The egress boundary: the payload has left the queue and is about to be written to this
+        // client. The permit it arrived with is what the policy issued when it admitted the
+        // payload, so a capability replaced or revoked while the payload waited is caught here.
+        // Cloning the packet clones two small fields and a reference-counted buffer, which is what
+        // lets the policy be told the outcome after the write.
+        let settled = packet.clone();
+        let admitted = {
+            let request = ForwardRequest::new(
+                ForwardBoundary::Egress,
+                packet.src,
+                self.guard.endpoint_id(),
+                self.guard.connection_id(),
+                Some(packet.permit),
+                &packet.data,
+            );
+            match self.forward.on_forward(&request) {
+                Forward::Allow { permit } => permit,
+                Forward::Drop => {
+                    self.metrics.send_packets_dropped.inc();
+                    return Ok(());
+                }
+                Forward::Close { reason } => {
+                    self.metrics.send_packets_dropped.inc();
+                    debug!(?reason, "forwarding policy closed the connection");
+                    return Err(e!(WriteFrameError::ForwardRefused));
+                }
+            }
+        };
+
+        let written = self.send_raw(packet).await;
+        let outcome = if written.is_ok() {
+            ForwardOutcome::Committed
+        } else {
+            ForwardOutcome::Dropped
+        };
+        // A policy that meters at this boundary counts on the outcome, so a write that failed is
+        // not a byte anybody pays for.
+        self.forward.on_settled(
+            &ForwardRequest::new(
+                ForwardBoundary::Egress,
+                settled.src,
+                self.guard.endpoint_id(),
+                self.guard.connection_id(),
+                Some(admitted),
+                &settled.data,
+            ),
+            outcome,
+        );
+        match written {
             Ok(()) => {
                 self.metrics.send_packets_sent.inc();
                 Ok(())
@@ -501,10 +564,17 @@ where
                 datagrams,
             } => {
                 let packet_len = datagrams.contents.len();
-                if let Err(err @ ForwardPacketError { .. }) =
-                    self.handle_frame_send_packet(dst_key, datagrams)
-                {
-                    warn!("failed to handle send packet frame: {err:#}");
+                match self.handle_frame_send_packet(dst_key, datagrams) {
+                    Ok(()) => {}
+                    // A policy that refuses a payload outright is refusing the connection, not
+                    // just the payload, so it ends the actor loop rather than being logged and
+                    // forgotten like a full queue.
+                    Err(err) if matches!(err.reason, SendError::Refused) => {
+                        return Err(e!(HandleFrameError::ForwardRefused));
+                    }
+                    Err(err) => {
+                        warn!("failed to handle send packet frame: {err:#}");
+                    }
                 }
                 self.metrics.bytes_recv.inc_by(packet_len as u64);
             }
@@ -527,8 +597,54 @@ where
         data: Datagrams,
     ) -> Result<(), ForwardPacketError> {
         self.metrics.send_packets_recv.inc();
-        self.clients
-            .send_packet(dst, data, self.guard.endpoint_id(), &self.metrics)?;
+        // The ingress boundary: the payload has been read from this client and is about to be
+        // queued for its destination. Nothing has admitted it yet, so there is no permit to show.
+        let permit = {
+            let request = ForwardRequest::new(
+                ForwardBoundary::Ingress,
+                self.guard.endpoint_id(),
+                dst,
+                self.guard.connection_id(),
+                None,
+                &data,
+            );
+            match self.forward.on_forward(&request) {
+                Forward::Allow { permit } => permit,
+                Forward::Drop => {
+                    self.metrics.send_packets_dropped.inc();
+                    return Ok(());
+                }
+                Forward::Close { reason } => {
+                    self.metrics.send_packets_dropped.inc();
+                    debug!(?reason, "forwarding policy closed the connection");
+                    return Err(ForwardPacketError::new(SendError::Refused));
+                }
+            }
+        };
+
+        let settled = data.clone();
+        let queued =
+            self.clients
+                .send_packet(dst, data, self.guard.endpoint_id(), permit, &self.metrics);
+
+        // A policy that meters at this boundary counts on the outcome, so a payload the
+        // destination could not take is not a byte anybody pays for.
+        self.forward.on_settled(
+            &ForwardRequest::new(
+                ForwardBoundary::Ingress,
+                self.guard.endpoint_id(),
+                dst,
+                self.guard.connection_id(),
+                Some(permit),
+                &settled,
+            ),
+            if queued.is_ok() {
+                ForwardOutcome::Committed
+            } else {
+                ForwardOutcome::Dropped
+            },
+        );
+        queued?;
 
         Ok(())
     }
@@ -538,6 +654,7 @@ where
 pub(crate) enum SendError {
     Full,
     Closed,
+    Refused,
 }
 
 /// Error returned when forwarding a packet to a client fails.
@@ -649,6 +766,7 @@ mod tests {
             ping_tracker: PingTracker::default(),
             protocol_version: ProtocolVersion::V2,
             rate_limited: None,
+            forward: Arc::new(crate::server::ForwardAll),
             metrics,
         };
 
@@ -665,6 +783,7 @@ mod tests {
         let packet = Packet {
             src: endpoint_id,
             data: Datagrams::from(&data[..]),
+            permit: ForwardPermit::default(),
         };
         send_queue_s
             .send(packet.clone())
@@ -749,7 +868,13 @@ mod tests {
 
         // Verify basic packet delivery works with V1.
         let data = b"hello world v1!";
-        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        clients.send_packet(
+            a_key,
+            Datagrams::from(&data[..]),
+            b_key,
+            ForwardPermit::default(),
+            &metrics,
+        )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;
         assert_eq!(
             frame,
@@ -778,7 +903,13 @@ mod tests {
 
         // Verify basic packet delivery works with V2.
         let data = b"hello world v2!";
-        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        clients.send_packet(
+            a_key,
+            Datagrams::from(&data[..]),
+            b_key,
+            ForwardPermit::default(),
+            &metrics,
+        )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;
         assert_eq!(
             frame,

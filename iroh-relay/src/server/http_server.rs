@@ -32,8 +32,8 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use super::{
-    AllowAll, ClientRequest, DynAccessControl, SpawnError, clients::Clients,
-    streams::InvalidBucketConfig,
+    AllowAll, ClientRequest, DynAccessControl, ForwardAll, ForwardPolicy, SpawnError,
+    clients::Clients, streams::InvalidBucketConfig,
 };
 use crate::{
     KeyCache,
@@ -352,6 +352,8 @@ pub(super) struct ServerBuilder {
     key_cache_capacity: usize,
     /// Access control for endpoints.
     access: Arc<dyn DynAccessControl>,
+    /// Forwarding policy for individual relayed payloads.
+    forward: Arc<dyn ForwardPolicy>,
     metrics: Option<Arc<Metrics>>,
     establish_timeout: Duration,
 }
@@ -367,6 +369,7 @@ impl ServerBuilder {
             client_rx_ratelimit: None,
             key_cache_capacity: DEFAULT_KEY_CACHE_CAPACITY,
             access: Arc::new(AllowAll),
+            forward: Arc::new(ForwardAll),
             metrics: None,
             establish_timeout: ESTABLISH_TIMEOUT,
         }
@@ -381,6 +384,12 @@ impl ServerBuilder {
     /// Set the access control.
     pub(super) fn access(mut self, access: Arc<dyn DynAccessControl>) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Set the forwarding policy.
+    pub(super) fn forward(mut self, forward: Arc<dyn ForwardPolicy>) -> Self {
+        self.forward = forward;
         self
     }
 
@@ -448,6 +457,7 @@ impl ServerBuilder {
             self.client_rx_ratelimit,
             KeyCache::new(self.key_cache_capacity),
             self.access,
+            self.forward,
             self.metrics.unwrap_or_default(),
         );
 
@@ -535,6 +545,7 @@ struct Inner {
     rate_limit: watch::Sender<Option<ClientRateLimit>>,
     key_cache: KeyCache,
     access: Arc<dyn DynAccessControl>,
+    forward: Arc<dyn ForwardPolicy>,
     metrics: Arc<Metrics>,
 }
 
@@ -692,7 +703,7 @@ impl RelayServiceWithNotify {
 /// # use iroh_relay::{
 /// #     KeyCache,
 /// #     server::{
-/// #         AllowAll, Metrics,
+/// #         AllowAll, ForwardAll, Metrics,
 /// #         http_server::{Handlers, RelayService, RelayServiceWithNotify},
 /// #         streams::MaybeTlsStream
 /// #     },
@@ -704,6 +715,7 @@ impl RelayServiceWithNotify {
 ///     None,
 ///     KeyCache::new(1024),
 ///     Arc::new(AllowAll),
+///     Arc::new(ForwardAll),
 ///     Arc::new(Metrics::default()),
 /// );
 /// let service = RelayServiceWithNotify::new(service, Arc::new(Notify::new()));
@@ -889,6 +901,7 @@ impl Inner {
         let mut client_conn_builder = Config::new(guard, io, protocol_version);
         client_conn_builder.write_timeout = self.write_timeout;
         client_conn_builder.rate_limited = Some(limited_watcher);
+        client_conn_builder.forward = self.forward.clone();
         trace!(endpoint_id = %request.endpoint_id().fmt_short(), "create client");
 
         // build and register client, starting up read & write loops for the client
@@ -919,6 +932,7 @@ impl RelayService {
         rate_limit: Option<ClientRateLimit>,
         key_cache: KeyCache,
         access: Arc<dyn DynAccessControl>,
+        forward: Arc<dyn ForwardPolicy>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self(Arc::new(Inner {
@@ -929,6 +943,7 @@ impl RelayService {
             rate_limit: watch::Sender::new(rate_limit),
             key_cache,
             access,
+            forward,
             metrics,
         }))
     }
@@ -968,7 +983,7 @@ impl RelayService {
     /// # use tokio::net::TcpStream;
     /// # use http::HeaderMap;
     /// # use iroh_relay::server::http_server::{Handlers, RelayService, TlsConfig};
-    /// # use iroh_relay::{KeyCache, server::{AllowAll, Metrics}};
+    /// # use iroh_relay::{KeyCache, server::{AllowAll, ForwardAll, Metrics}};
     /// # use webpki_types::{CertificateDer, PrivateKeyDer};
     /// # async fn example(stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     /// // Create a relay service
@@ -982,6 +997,7 @@ impl RelayService {
     ///     None, // No rate limiting
     ///     key_cache,
     ///     Arc::new(AllowAll),
+    ///     Arc::new(ForwardAll),
     ///     metrics,
     /// );
     ///
@@ -1490,6 +1506,7 @@ mod tests {
             None,
             KeyCache::test(),
             Arc::new(crate::server::AllowAll),
+            Arc::new(crate::server::ForwardAll),
             metrics.clone(),
         );
 
@@ -1602,6 +1619,7 @@ mod tests {
             None,
             KeyCache::test(),
             Arc::new(crate::server::AllowAll),
+            Arc::new(crate::server::ForwardAll),
             Default::default(),
         );
 

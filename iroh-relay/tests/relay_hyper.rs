@@ -23,7 +23,7 @@ use iroh_relay::{
     client::ClientBuilder,
     http::{RELAY_PATH, RELAY_PROBE_PATH},
     server::{
-        AllowAll, Metrics,
+        AllowAll, ForwardAll, Metrics,
         http_server::{BytesBody, Handlers, RelayService, RelayServiceWithNotify},
         streams::MaybeTlsStream,
     },
@@ -60,6 +60,7 @@ async fn serve_hyper() -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
         None,
         KeyCache::new(1024),
         Arc::new(AllowAll),
+        Arc::new(ForwardAll),
         Arc::new(Metrics::default()),
     );
 

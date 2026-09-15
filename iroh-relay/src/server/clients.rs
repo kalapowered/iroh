@@ -10,7 +10,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, trace};
 
 use super::{
-    ConnectionId, OnDisconnectGuard,
+    ConnectionId, ForwardPermit, OnDisconnectGuard,
     client::{Client, Config, ForwardPacketError},
 };
 use crate::{
@@ -197,11 +197,16 @@ impl Clients {
     }
 
     /// Attempt to send a packet to client with [`EndpointId`] `dst`.
+    ///
+    /// `permit` is what the forwarding policy issued when it admitted this payload at the sending
+    /// connection. It travels with the packet so the destination's boundary can show the policy
+    /// what admitted it, however long the payload waited in the queue.
     pub(super) fn send_packet(
         &self,
         dst: EndpointId,
         data: Datagrams,
         src: EndpointId,
+        permit: ForwardPermit,
         metrics: &Metrics,
     ) -> Result<(), ForwardPacketError> {
         let Some(client) = self.0.clients.get(&dst) else {
@@ -209,7 +214,7 @@ impl Clients {
             metrics.send_packets_dropped.inc();
             return Ok(());
         };
-        match client.active.try_send_packet(src, data) {
+        match client.active.try_send_packet(src, data, permit) {
             Ok(_) => {
                 // Record sent_to relationship
                 self.0.sent_to.entry(src).or_default().insert(dst);
@@ -310,7 +315,13 @@ mod tests {
 
         // send packet
         let data = b"hello world!";
-        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        clients.send_packet(
+            a_key,
+            Datagrams::from(&data[..]),
+            b_key,
+            ForwardPermit::default(),
+            &metrics,
+        )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;
         assert_eq!(
             frame,
@@ -361,7 +372,13 @@ mod tests {
 
         // send packet and verify it is send to a1
         let data = b"hello world!";
-        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        clients.send_packet(
+            a_key,
+            Datagrams::from(&data[..]),
+            b_key,
+            ForwardPermit::default(),
+            &metrics,
+        )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a1_rw).await?;
         assert_eq!(
             frame,
@@ -385,7 +402,13 @@ mod tests {
         );
 
         // send packet and verify it is send to a2
-        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        clients.send_packet(
+            a_key,
+            Datagrams::from(&data[..]),
+            b_key,
+            ForwardPermit::default(),
+            &metrics,
+        )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a2_rw).await?;
         assert_eq!(
             frame,
@@ -425,7 +448,13 @@ mod tests {
         assert_eq!(frame, RelayToClientMsg::Status(Status::Healthy));
 
         // a1 should receive packets
-        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        clients.send_packet(
+            a_key,
+            Datagrams::from(&data[..]),
+            b_key,
+            ForwardPermit::default(),
+            &metrics,
+        )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a1_rw).await?;
         assert_eq!(
             frame,
@@ -480,7 +509,13 @@ mod tests {
 
         // A sends a packet to B (records sent_to[A] = {B})
         let data = b"hello b!";
-        clients.send_packet(b_key, Datagrams::from(&data[..]), a_key, &metrics)?;
+        clients.send_packet(
+            b_key,
+            Datagrams::from(&data[..]),
+            a_key,
+            ForwardPermit::default(),
+            &metrics,
+        )?;
 
         // B receives the packet
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut b_rw).await?;

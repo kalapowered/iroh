@@ -201,6 +201,10 @@ impl Clients {
     /// `permit` is what the forwarding policy issued when it admitted this payload at the sending
     /// connection. It travels with the packet so the destination's boundary can show the policy
     /// what admitted it, however long the payload waited in the queue.
+    ///
+    /// Returns whether the payload was queued. A destination that is not connected is not an
+    /// error, because the sender may simply be ahead of it, but it is not a delivery either: the
+    /// payload is gone, and a caller that meters has to know the difference.
     pub(super) fn send_packet(
         &self,
         dst: EndpointId,
@@ -208,17 +212,17 @@ impl Clients {
         src: EndpointId,
         permit: ForwardPermit,
         metrics: &Metrics,
-    ) -> Result<(), ForwardPacketError> {
+    ) -> Result<bool, ForwardPacketError> {
         let Some(client) = self.0.clients.get(&dst) else {
             debug!(dst = %dst.fmt_short(), "no connected client, dropped packet");
             metrics.send_packets_dropped.inc();
-            return Ok(());
+            return Ok(false);
         };
         match client.active.try_send_packet(src, data, permit) {
             Ok(_) => {
                 // Record sent_to relationship
                 self.0.sent_to.entry(src).or_default().insert(dst);
-                Ok(())
+                Ok(true)
             }
             Err(TrySendError::Full(_)) => {
                 debug!(

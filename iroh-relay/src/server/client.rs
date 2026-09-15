@@ -4,7 +4,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use iroh_base::EndpointId;
 use n0_error::{e, stack_error};
-use n0_future::{SinkExt, StreamExt};
+use n0_future::{Sink, SinkExt, StreamExt};
 use rand::RngExt;
 use time::{Date, OffsetDateTime};
 use tokio::{
@@ -375,6 +375,16 @@ where
             }
         }
 
+        // Whatever is still queued for this client will never be written. Each of those payloads
+        // was admitted at its sender's boundary and is still outstanding as far as the policy
+        // knows, so each one is settled as dropped: a connection that goes away must not leave a
+        // debit behind it.
+        self.packet_send_queue.close();
+        while let Ok(packet) = self.packet_send_queue.try_recv() {
+            self.metrics.send_packets_dropped.inc();
+            self.settle_egress(&packet, packet.permit, ForwardOutcome::Dropped);
+        }
+
         self.clients.unregister(self.guard, &self.metrics);
         self.metrics.disconnects.inc();
     }
@@ -487,12 +497,35 @@ where
 
     async fn send_packet(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
         trace!("send packet");
-        // The egress boundary: the payload has left the queue and is about to be written to this
-        // client. The permit it arrived with is what the policy issued when it admitted the
-        // payload, so a capability replaced or revoked while the payload waited is caught here.
-        // Cloning the packet clones two small fields and a reference-counted buffer, which is what
-        // lets the policy be told the outcome after the write.
-        let settled = packet.clone();
+
+        // Wait for the connection to be able to take a frame *before* asking the policy. A payload
+        // can sit here for as long as the client is slow, and a lease can be revoked or expire
+        // while it does, so a decision taken before the wait would be a decision about a moment
+        // that has passed. After this, writing is synchronous: nothing can change between the
+        // answer and the frame going out.
+        let ready = tokio::time::timeout(
+            self.timeout,
+            n0_future::future::poll_fn(|context| {
+                std::pin::Pin::new(&mut self.stream).poll_ready(context)
+            }),
+        )
+        .await;
+        match ready {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.metrics.send_packets_dropped.inc();
+                self.settle_egress(&packet, packet.permit, ForwardOutcome::Dropped);
+                return Err(err.into());
+            }
+            Err(elapsed) => {
+                self.metrics.send_packets_dropped.inc();
+                self.settle_egress(&packet, packet.permit, ForwardOutcome::Dropped);
+                return Err(e!(WriteFrameError::Timeout, elapsed));
+            }
+        }
+
+        // The egress boundary. The permit the payload arrived with is what the policy issued when
+        // it admitted the payload, so a capability replaced while the payload waited is caught.
         let admitted = {
             let request = ForwardRequest::new(
                 ForwardBoundary::Egress,
@@ -516,24 +549,23 @@ where
             }
         };
 
-        let written = self.send_raw(packet).await;
-        let outcome = if written.is_ok() {
-            ForwardOutcome::Committed
-        } else {
-            ForwardOutcome::Dropped
+        let written = match self.start_send_packet(&packet) {
+            // Handed to the stream; now push it out. The policy's answer applied to the hand-off,
+            // which is the last point anything could have changed, so a flush that fails is a
+            // failed write rather than a second decision.
+            Ok(()) => self.flush().await,
+            Err(err) => Err(err),
         };
         // A policy that meters at this boundary counts on the outcome, so a write that failed is
         // not a byte anybody pays for.
-        self.forward.on_settled(
-            &ForwardRequest::new(
-                ForwardBoundary::Egress,
-                settled.src,
-                self.guard.endpoint_id(),
-                self.guard.connection_id(),
-                Some(admitted),
-                &settled.data,
-            ),
-            outcome,
+        self.settle_egress(
+            &packet,
+            admitted,
+            if written.is_ok() {
+                ForwardOutcome::Committed
+            } else {
+                ForwardOutcome::Dropped
+            },
         );
         match written {
             Ok(()) => {
@@ -545,6 +577,48 @@ where
                 Err(err)
             }
         }
+    }
+
+    /// Tells the policy what became of a payload it admitted at this connection's egress boundary.
+    fn settle_egress(&self, packet: &Packet, permit: ForwardPermit, outcome: ForwardOutcome) {
+        self.forward.on_settled(
+            &ForwardRequest::new(
+                ForwardBoundary::Egress,
+                packet.src,
+                self.guard.endpoint_id(),
+                self.guard.connection_id(),
+                Some(permit),
+                &packet.data,
+            ),
+            outcome,
+        );
+    }
+
+    /// Pushes whatever has been handed to the stream out to the client.
+    async fn flush(&mut self) -> Result<(), WriteFrameError> {
+        tokio::time::timeout(
+            self.timeout,
+            n0_future::future::poll_fn(|context| {
+                std::pin::Pin::new(&mut self.stream).poll_flush(context)
+            }),
+        )
+        .await??;
+        Ok(())
+    }
+
+    /// Hands one packet to a stream that has already said it is ready.
+    ///
+    /// Synchronous on purpose: this is the step the policy's answer applies to, and nothing may
+    /// happen between the two.
+    fn start_send_packet(&mut self, packet: &Packet) -> Result<(), WriteFrameError> {
+        if let Ok(len) = packet.data.contents.len().try_into() {
+            self.metrics.bytes_sent.inc_by(len);
+        }
+        std::pin::Pin::new(&mut self.stream).start_send(RelayToClientMsg::Datagrams {
+            remote_endpoint_id: packet.src,
+            datagrams: packet.data.clone(),
+        })?;
+        Ok(())
     }
 
     /// Handles frame read results.

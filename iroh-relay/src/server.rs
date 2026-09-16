@@ -379,13 +379,22 @@ pub trait ForwardPolicy: std::fmt::Debug + Send + Sync + 'static {
     /// policy can tell at the write what it decided at the read.
     fn on_forward(&self, request: &ForwardRequest<'_>) -> Forward;
 
-    /// Reports what became of a payload this policy admitted at this boundary.
+    /// Reports what finally became of a payload this policy admitted.
     ///
-    /// Deciding and counting are separate events because they can disagree. A payload admitted at
-    /// [`ForwardBoundary::Egress`] may still fail to be written, and one admitted at
-    /// [`ForwardBoundary::Ingress`] may find the destination gone, so a policy that billed on the
-    /// decision would charge for traffic that never moved. Called exactly once for each payload
-    /// this policy admitted at this boundary, and never for one it dropped or refused.
+    /// Deciding and counting are separate events because they can disagree: a payload admitted at
+    /// the sender may find the destination gone, sit in a queue that is discarded, be refused at
+    /// the destination's own boundary, or fail to be written. A policy that billed on the decision
+    /// would charge for traffic that never moved.
+    ///
+    /// The contract is one call per admitted payload, and it is deliberately not one per boundary:
+    ///
+    /// * It is called exactly once for every payload [`Self::on_forward`] admitted at
+    ///   [`ForwardBoundary::Ingress`], and never for one it dropped or refused there.
+    /// * The request describes that ingress admission — the same source, destination, connection
+    ///   and [`ForwardPermit`] — whichever side of the relay finally disposes of the payload, so a
+    ///   policy correlates the outcome with the admission by the permit it issued.
+    /// * A payload the destination's own boundary refuses is reported [`ForwardOutcome::Dropped`]
+    ///   here; there is no separate settlement for the egress decision.
     fn on_settled(&self, request: &ForwardRequest<'_>, outcome: ForwardOutcome) {
         let _ = (request, outcome);
     }
@@ -409,12 +418,19 @@ pub struct ForwardPermit {
 /// What became of a payload a policy admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardOutcome {
-    /// It crossed the boundary: queued for the destination at [`ForwardBoundary::Ingress`],
-    /// written to it at [`ForwardBoundary::Egress`].
+    /// It was written to the destination.
     Committed,
-    /// It did not, and never will. The destination was gone, its queue was full, or the write
-    /// failed.
+    /// It was not, and never will be: the destination was gone, its queue was full or discarded,
+    /// the destination's own boundary refused it, or the write was rejected before any of its
+    /// bytes were handed to the transport.
     Dropped,
+    /// It was handed to the transport and the write did not complete.
+    ///
+    /// Some of its bytes may have reached the client and some may not. A policy that meters cannot
+    /// treat this as either outcome: section 17 settles unknown consumption conservatively rather
+    /// than refunding it, because refunding what may have moved is how an unreported allowance is
+    /// created.
+    Uncertain,
 }
 
 /// A [`ForwardPolicy`] that forwards every payload.

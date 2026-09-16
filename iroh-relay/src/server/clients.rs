@@ -211,6 +211,7 @@ impl Clients {
         data: Datagrams,
         src: EndpointId,
         permit: ForwardPermit,
+        src_connection_id: ConnectionId,
         metrics: &Metrics,
     ) -> Result<bool, ForwardPacketError> {
         let Some(client) = self.0.clients.get(&dst) else {
@@ -218,7 +219,10 @@ impl Clients {
             metrics.send_packets_dropped.inc();
             return Ok(false);
         };
-        match client.active.try_send_packet(src, data, permit) {
+        match client
+            .active
+            .try_send_packet(src, data, permit, src_connection_id)
+        {
             Ok(_) => {
                 // Record sent_to relationship
                 self.0.sent_to.entry(src).or_default().insert(dst);
@@ -324,6 +328,7 @@ mod tests {
             Datagrams::from(&data[..]),
             b_key,
             ForwardPermit::default(),
+            OnDisconnectGuard::empty(b_key).connection_id(),
             &metrics,
         )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;
@@ -381,6 +386,7 @@ mod tests {
             Datagrams::from(&data[..]),
             b_key,
             ForwardPermit::default(),
+            OnDisconnectGuard::empty(b_key).connection_id(),
             &metrics,
         )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a1_rw).await?;
@@ -411,6 +417,7 @@ mod tests {
             Datagrams::from(&data[..]),
             b_key,
             ForwardPermit::default(),
+            OnDisconnectGuard::empty(b_key).connection_id(),
             &metrics,
         )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a2_rw).await?;
@@ -457,6 +464,7 @@ mod tests {
             Datagrams::from(&data[..]),
             b_key,
             ForwardPermit::default(),
+            OnDisconnectGuard::empty(b_key).connection_id(),
             &metrics,
         )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a1_rw).await?;
@@ -518,6 +526,7 @@ mod tests {
             Datagrams::from(&data[..]),
             a_key,
             ForwardPermit::default(),
+            OnDisconnectGuard::empty(b_key).connection_id(),
             &metrics,
         )?;
 
@@ -552,6 +561,243 @@ mod tests {
         // B should receive EndpointGone(a_key): notifying B that A is gone
         let frame = recv_frame(FrameType::EndpointGone, &mut b_rw).await?;
         assert_eq!(frame, RelayToClientMsg::EndpointGone(a_key));
+
+        clients.shutdown().await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod forwarding_policy_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use iroh_base::SecretKey;
+    use n0_error::Result;
+    use n0_future::{SinkExt, StreamExt};
+    use n0_tracing_test::traced_test;
+    use rand::{RngExt, SeedableRng};
+
+    use super::*;
+    use crate::client::conn::Conn;
+    use crate::http::ProtocolVersion;
+    use crate::protos::{common::FrameType, streams::WsBytesFramed};
+    use crate::server::{
+        Forward, ForwardBoundary, ForwardOutcome, ForwardPermit, ForwardPolicy, ForwardRequest,
+        streams::{MaybeTlsStream, RateLimited, ServerRelayedStream},
+    };
+
+    /// A policy that records what it admitted and what it was told became of each payload.
+    ///
+    /// The point of these tests is the settlement contract, and the only way to see it is to be
+    /// the policy: exactly one outcome per admitted payload, describing the admission rather than
+    /// whichever side of the relay disposed of it.
+    #[derive(Debug, Default)]
+    struct RecordingPolicy {
+        /// Payloads admitted at the sending connection, by the permit issued for each.
+        admitted: Mutex<Vec<u64>>,
+        /// Outcomes, as (permit, boundary the request described, outcome).
+        settled: Mutex<Vec<(u64, ForwardBoundary, ForwardOutcome)>>,
+        /// Whether the destination's own boundary refuses what reaches it.
+        refuse_at_egress: bool,
+    }
+
+    impl RecordingPolicy {
+        fn shared(refuse_at_egress: bool) -> Arc<Self> {
+            Arc::new(Self {
+                refuse_at_egress,
+                ..Self::default()
+            })
+        }
+
+        fn settled(&self) -> Vec<(u64, ForwardBoundary, ForwardOutcome)> {
+            self.settled.lock().expect("the recorder").clone()
+        }
+    }
+
+    impl ForwardPolicy for RecordingPolicy {
+        fn on_forward(&self, request: &ForwardRequest<'_>) -> Forward {
+            match request.boundary() {
+                ForwardBoundary::Ingress => {
+                    let mut admitted = self.admitted.lock().expect("the recorder");
+                    let permit = admitted.len() as u64 + 1;
+                    admitted.push(permit);
+                    Forward::Allow {
+                        permit: ForwardPermit {
+                            admission: permit,
+                            allocation: 7,
+                        },
+                    }
+                }
+                ForwardBoundary::Egress if self.refuse_at_egress => Forward::Drop,
+                ForwardBoundary::Egress => Forward::Allow {
+                    permit: request.permit().unwrap_or_default(),
+                },
+            }
+        }
+
+        fn on_settled(&self, request: &ForwardRequest<'_>, outcome: ForwardOutcome) {
+            self.settled.lock().expect("the recorder").push((
+                request.permit().unwrap_or_default().admission,
+                request.boundary(),
+                outcome,
+            ));
+        }
+    }
+
+    fn client_with(
+        key: EndpointId,
+        policy: Arc<RecordingPolicy>,
+    ) -> (Config<WsBytesFramed<RateLimited<MaybeTlsStream>>>, Conn) {
+        let (server, client) = tokio::io::duplex(1024);
+        let protocol_version = ProtocolVersion::default();
+        let mut config = Config::new(
+            OnDisconnectGuard::empty(key),
+            ServerRelayedStream::test(server),
+            protocol_version,
+        );
+        config.write_timeout = Duration::from_secs(1);
+        config.channel_capacity = 10;
+        config.forward = policy;
+        (config, Conn::test(client, protocol_version))
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_payload_with_nowhere_to_go_is_settled_as_dropped() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7u64);
+        let sender = SecretKey::from_bytes(&rng.random()).public();
+        let absent = SecretKey::from_bytes(&rng.random()).public();
+
+        let policy = RecordingPolicy::shared(false);
+        let clients = Clients::default();
+        let metrics = Arc::new(Metrics::default());
+        let (config, mut sender_rw) = client_with(sender, policy.clone());
+        let connection = config.guard.connection_id();
+        clients.register(config, metrics.clone());
+
+        sender_rw
+            .send(crate::protos::relay::ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: absent,
+                datagrams: Datagrams::from(&b"nowhere"[..]),
+            })
+            .await?;
+
+        // The sending connection admitted it and nothing else will ever see it, so the sending
+        // connection is what reports the outcome.
+        let settled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let seen = policy.settled();
+                if !seen.is_empty() {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an outcome");
+
+        assert_eq!(settled.len(), 1, "exactly one outcome per admitted payload");
+        assert_eq!(
+            settled[0],
+            (1, ForwardBoundary::Ingress, ForwardOutcome::Dropped)
+        );
+        let _ = connection;
+        clients.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_delivered_payload_is_settled_once_as_committed() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9u64);
+        let sender = SecretKey::from_bytes(&rng.random()).public();
+        let receiver = SecretKey::from_bytes(&rng.random()).public();
+
+        let policy = RecordingPolicy::shared(false);
+        let clients = Clients::default();
+        let metrics = Arc::new(Metrics::default());
+        let (sender_config, mut sender_rw) = client_with(sender, policy.clone());
+        let (receiver_config, mut receiver_rw) = client_with(receiver, policy.clone());
+        clients.register(sender_config, metrics.clone());
+        clients.register(receiver_config, metrics.clone());
+
+        sender_rw
+            .send(crate::protos::relay::ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: receiver,
+                datagrams: Datagrams::from(&b"through"[..]),
+            })
+            .await?;
+
+        let frame = receiver_rw.next().await.expect("a frame")?;
+        assert_eq!(frame.typ(), FrameType::RelayToClientDatagram);
+
+        let settled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let seen = policy.settled();
+                if !seen.is_empty() {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an outcome");
+
+        // One outcome, carrying the permit the sending connection was given and describing that
+        // admission, although it was the receiving connection that wrote the payload out.
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            settled[0],
+            (1, ForwardBoundary::Ingress, ForwardOutcome::Committed)
+        );
+
+        clients.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_payload_the_destination_refuses_is_settled_as_dropped() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11u64);
+        let sender = SecretKey::from_bytes(&rng.random()).public();
+        let receiver = SecretKey::from_bytes(&rng.random()).public();
+
+        // The capability was replaced while the payload sat in the queue, so the destination's own
+        // boundary refuses it. That is the payload's end, and it is reported as such rather than
+        // quietly disappearing with a debit behind it.
+        let policy = RecordingPolicy::shared(true);
+        let clients = Clients::default();
+        let metrics = Arc::new(Metrics::default());
+        let (sender_config, mut sender_rw) = client_with(sender, policy.clone());
+        let (receiver_config, _receiver_rw) = client_with(receiver, policy.clone());
+        clients.register(sender_config, metrics.clone());
+        clients.register(receiver_config, metrics.clone());
+
+        sender_rw
+            .send(crate::protos::relay::ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: receiver,
+                datagrams: Datagrams::from(&b"fenced"[..]),
+            })
+            .await?;
+
+        let settled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let seen = policy.settled();
+                if !seen.is_empty() {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an outcome");
+
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            settled[0],
+            (1, ForwardBoundary::Ingress, ForwardOutcome::Dropped)
+        );
 
         clients.shutdown().await;
         Ok(())

@@ -46,6 +46,9 @@ pub(super) struct Packet {
     data: Datagrams,
     /// What the forwarding policy issued when it admitted this packet at the sending connection.
     permit: ForwardPermit,
+    /// The sending connection, so whoever finally disposes of the packet can report the outcome
+    /// against the admission that let it in rather than against its own side of the relay.
+    src_connection_id: ConnectionId,
 }
 
 /// Configuration for a client connection.
@@ -208,8 +211,14 @@ impl Client {
         src: EndpointId,
         data: Datagrams,
         permit: ForwardPermit,
+        src_connection_id: ConnectionId,
     ) -> Result<(), TrySendError<Packet>> {
-        self.packet_queue.try_send(Packet { src, data, permit })
+        self.packet_queue.try_send(Packet {
+            src,
+            data,
+            permit,
+            src_connection_id,
+        })
     }
 
     pub(super) fn try_send_peer_gone(
@@ -379,10 +388,16 @@ where
         // was admitted at its sender's boundary and is still outstanding as far as the policy
         // knows, so each one is settled as dropped: a connection that goes away must not leave a
         // debit behind it.
+        //
+        // The queue is closed and then drained to its end rather than sampled. A sender that has
+        // taken a permit but not yet inserted its packet is between the two halves of `try_send`,
+        // and `try_recv` would report the queue empty while that packet was still on its way in;
+        // awaiting the receiver waits those senders out and returns `None` only once no packet can
+        // arrive.
         self.packet_send_queue.close();
-        while let Ok(packet) = self.packet_send_queue.try_recv() {
+        while let Some(packet) = self.packet_send_queue.recv().await {
             self.metrics.send_packets_dropped.inc();
-            self.settle_egress(&packet, packet.permit, ForwardOutcome::Dropped);
+            self.settle(&packet, ForwardOutcome::Dropped);
         }
 
         self.clients.unregister(self.guard, &self.metrics);
@@ -500,19 +515,21 @@ where
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 self.metrics.send_packets_dropped.inc();
-                self.settle_egress(&packet, packet.permit, ForwardOutcome::Dropped);
+                self.settle(&packet, ForwardOutcome::Dropped);
                 return Err(err.into());
             }
             Err(elapsed) => {
                 self.metrics.send_packets_dropped.inc();
-                self.settle_egress(&packet, packet.permit, ForwardOutcome::Dropped);
+                self.settle(&packet, ForwardOutcome::Dropped);
                 return Err(e!(WriteFrameError::Timeout, elapsed));
             }
         }
 
         // The egress boundary. The permit the payload arrived with is what the policy issued when
-        // it admitted the payload, so a capability replaced while the payload waited is caught.
-        let admitted = {
+        // it admitted the payload, so a capability replaced while the payload waited is caught. A
+        // refusal here is the payload's end, and it is reported as such.
+        let mut refused = None;
+        {
             let request = ForwardRequest::new(
                 ForwardBoundary::Egress,
                 packet.src,
@@ -522,58 +539,65 @@ where
                 &packet.data,
             );
             match self.forward.on_forward(&request) {
-                Forward::Allow { permit } => permit,
+                Forward::Allow { .. } => {}
                 Forward::Drop => {
                     self.metrics.send_packets_dropped.inc();
-                    return Ok(());
+                    refused = Some(None);
                 }
                 Forward::Close { reason } => {
                     self.metrics.send_packets_dropped.inc();
                     debug!(?reason, "forwarding policy closed the connection");
-                    return Err(e!(WriteFrameError::ForwardRefused));
+                    refused = Some(Some(()));
                 }
             }
-        };
-
-        let written = match self.start_send_packet(&packet) {
-            // Handed to the stream; now push it out. The policy's answer applied to the hand-off,
-            // which is the last point anything could have changed, so a flush that fails is a
-            // failed write rather than a second decision.
-            Ok(()) => self.flush().await,
-            Err(err) => Err(err),
-        };
-        // A policy that meters at this boundary counts on the outcome, so a write that failed is
-        // not a byte anybody pays for.
-        self.settle_egress(
-            &packet,
-            admitted,
-            if written.is_ok() {
-                ForwardOutcome::Committed
+        }
+        if let Some(closes) = refused {
+            self.settle(&packet, ForwardOutcome::Dropped);
+            return if closes.is_some() {
+                Err(e!(WriteFrameError::ForwardRefused))
             } else {
-                ForwardOutcome::Dropped
-            },
-        );
-        match written {
-            Ok(()) => {
-                self.metrics.send_packets_sent.inc();
                 Ok(())
-            }
+            };
+        }
+
+        // Handing the frame over is synchronous, so nothing can change between the policy's answer
+        // and the bytes leaving. The flush afterwards is not: it can fail with some, all or none of
+        // them already given to the transport, and nobody can say which, so that outcome is
+        // reported as the uncertainty it is rather than as a refund.
+        match self.start_send_packet(&packet) {
             Err(err) => {
                 self.metrics.send_packets_dropped.inc();
+                self.settle(&packet, ForwardOutcome::Dropped);
                 Err(err)
             }
+            Ok(()) => match self.flush().await {
+                Ok(()) => {
+                    self.metrics.send_packets_sent.inc();
+                    self.settle(&packet, ForwardOutcome::Committed);
+                    Ok(())
+                }
+                Err(err) => {
+                    self.metrics.send_packets_dropped.inc();
+                    self.settle(&packet, ForwardOutcome::Uncertain);
+                    Err(err)
+                }
+            },
         }
     }
 
-    /// Tells the policy what became of a payload it admitted at this connection's egress boundary.
-    fn settle_egress(&self, packet: &Packet, permit: ForwardPermit, outcome: ForwardOutcome) {
+    /// Tells the policy what finally became of a payload it admitted at the sending connection.
+    ///
+    /// The request describes that admission rather than this connection, because the policy issued
+    /// the permit there and that is what it correlates the outcome with. This is the only
+    /// settlement a queued payload gets, whichever way it ends.
+    fn settle(&self, packet: &Packet, outcome: ForwardOutcome) {
         self.forward.on_settled(
             &ForwardRequest::new(
-                ForwardBoundary::Egress,
+                ForwardBoundary::Ingress,
                 packet.src,
                 self.guard.endpoint_id(),
-                self.guard.connection_id(),
-                Some(permit),
+                packet.src_connection_id,
+                Some(packet.permit),
                 &packet.data,
             ),
             outcome,
@@ -683,27 +707,31 @@ where
         };
 
         let settled = data.clone();
-        let queued =
-            self.clients
-                .send_packet(dst, data, self.guard.endpoint_id(), permit, &self.metrics);
-
-        // A policy that meters at this boundary counts on the outcome, so a payload the
-        // destination could not take is not a byte anybody pays for.
-        self.forward.on_settled(
-            &ForwardRequest::new(
-                ForwardBoundary::Ingress,
-                self.guard.endpoint_id(),
-                dst,
-                self.guard.connection_id(),
-                Some(permit),
-                &settled,
-            ),
-            if queued.is_ok() {
-                ForwardOutcome::Committed
-            } else {
-                ForwardOutcome::Dropped
-            },
+        let queued = self.clients.send_packet(
+            dst,
+            data,
+            self.guard.endpoint_id(),
+            permit,
+            self.guard.connection_id(),
+            &self.metrics,
         );
+
+        // A payload that reached the destination's queue is settled by the destination, when its
+        // fate is actually known. One that did not is settled here, because nothing else will ever
+        // see it: the destination was not connected, its queue was full, or it had closed.
+        if !matches!(queued, Ok(true)) {
+            self.forward.on_settled(
+                &ForwardRequest::new(
+                    ForwardBoundary::Ingress,
+                    self.guard.endpoint_id(),
+                    dst,
+                    self.guard.connection_id(),
+                    Some(permit),
+                    &settled,
+                ),
+                ForwardOutcome::Dropped,
+            );
+        }
         queued?;
 
         Ok(())
@@ -844,6 +872,7 @@ mod tests {
             src: endpoint_id,
             data: Datagrams::from(&data[..]),
             permit: ForwardPermit::default(),
+            src_connection_id: OnDisconnectGuard::empty(endpoint_id).connection_id(),
         };
         send_queue_s
             .send(packet.clone())
@@ -933,6 +962,7 @@ mod tests {
             Datagrams::from(&data[..]),
             b_key,
             ForwardPermit::default(),
+            OnDisconnectGuard::empty(b_key).connection_id(),
             &metrics,
         )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;
@@ -968,6 +998,7 @@ mod tests {
             Datagrams::from(&data[..]),
             b_key,
             ForwardPermit::default(),
+            OnDisconnectGuard::empty(b_key).connection_id(),
             &metrics,
         )?;
         let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;

@@ -420,16 +420,17 @@ pub struct ForwardPermit {
 pub enum ForwardOutcome {
     /// It was written to the destination.
     Committed,
-    /// It was not, and never will be: the destination was gone, its queue was full or discarded,
-    /// the destination's own boundary refused it, or the write was rejected before any of its
-    /// bytes were handed to the transport.
+    /// It was not, and never will be, and nothing of it was given to the transport: the
+    /// destination was gone, its queue was full or was discarded, the destination's own boundary
+    /// refused it, or the connection never became ready to take it.
     Dropped,
-    /// It was handed to the transport and the write did not complete.
+    /// It reached the transport and the write did not complete.
     ///
-    /// Some of its bytes may have reached the client and some may not. A policy that meters cannot
-    /// treat this as either outcome: section 17 settles unknown consumption conservatively rather
-    /// than refunding it, because refunding what may have moved is how an unreported allowance is
-    /// created.
+    /// Some of its bytes may have reached the client and some may not, whether the hand-off itself
+    /// failed or the flush after it did: a sink may write as it takes a frame. A policy that meters
+    /// cannot treat this as either outcome, and section 17 settles unknown consumption
+    /// conservatively rather than refunding it, because refunding what may have moved is how an
+    /// unreported allowance is created.
     Uncertain,
 }
 

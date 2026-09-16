@@ -567,7 +567,11 @@ where
         match self.start_send_packet(&packet) {
             Err(err) => {
                 self.metrics.send_packets_dropped.inc();
-                self.settle(&packet, ForwardOutcome::Dropped);
+                // Uncertain, not dropped. A sink is free to write during the hand-off, and the
+                // embedded adapters do: the error says the hand-off failed, not that nothing left
+                // the machine, and refunding bytes that may have moved is how an unreported
+                // allowance is created.
+                self.settle(&packet, ForwardOutcome::Uncertain);
                 Err(err)
             }
             Ok(()) => match self.flush().await {
@@ -619,7 +623,8 @@ where
     /// Hands one packet to a stream that has already said it is ready.
     ///
     /// Synchronous on purpose: this is the step the policy's answer applies to, and nothing may
-    /// happen between the two.
+    /// happen between the two. A failure here is not proof that nothing was written: the sink is
+    /// an embedder's, and some write bytes as they take them.
     fn start_send_packet(&mut self, packet: &Packet) -> Result<(), WriteFrameError> {
         if let Ok(len) = packet.data.contents.len().try_into() {
             self.metrics.bytes_sent.inc_by(len);

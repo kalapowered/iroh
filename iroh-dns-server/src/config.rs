@@ -66,6 +66,10 @@ pub struct Config {
     ///
     /// Each source gets 100 lookups at once and 50 more every second, shared by the three routes.
     /// DNS over UDP and TCP is not limited here.
+    ///
+    /// A source is the IPv4 address of the connection or its IPv6 /64. With
+    /// [`RateLimitConfig::Smart`] the address is read from forwarding headers first, which a
+    /// client can set to anything: use it only behind a proxy that replaces them.
     #[serde(default)]
     pub lookup_rate_limit: RateLimitConfig,
 

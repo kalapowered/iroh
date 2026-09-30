@@ -27,16 +27,33 @@ packet origin will be appended with the origin as configured by this server.
   `pkarr_put_rate_limit`: one request every four seconds, two at once.
 - **Lookups** (`GET /pkarr/{key}` and `/dns-query` by `GET` and `POST`) are limited by
   `lookup_rate_limit`: 50 a second, 100 at once, one quota per source shared by the three
-  routes. An IPv4 client is its own source and an IPv6 client is its /64. A refused lookup is
-  answered `429` and counted in `lookup_rate_limited`. DNS over UDP and TCP is not limited by
-  the server.
+  routes. With `simple`, a source is the IPv4 address of the connection, or the IPv6 /64 of it
+  (an IPv4 address that arrives IPv6-mapped counts as IPv4). With `smart` the client address is
+  read from the forwarding headers a reverse proxy sets (`X-Forwarded-For`, `X-Real-IP`,
+  `Forwarded`) before it is mapped to its source: use it only behind a proxy that replaces
+  those headers, because a client can send any value in them. A refused lookup is answered `429`
+  and counted in `lookup_rate_limited`. Requests no route answers spend neither quota. DNS over
+  UDP and TCP is not limited by the server.
 - **Timestamps.** A packet stays in the store for `zone_store.eviction` counted from the time it
   is signed with. A publication signed more than 10 minutes ahead of the server's clock is
-  refused with `400` and counted in `pkarr_publish_timestamp_ahead`. A packet stored before
-  that limit existed, or while the server's clock was set back, stays until its own date has
-  passed and the retention period after it.
-- **Eviction** removes a packet from the store and from the zone cache, so DNS never answers
-  with a record that `GET /pkarr/{key}` reports absent.
+  refused with `400` and counted in `pkarr_publish_timestamp_ahead`; the server's clock has to
+  be right for this to hold.
+  - The refusal keeps a packet dated far ahead out of the store, and a later publication with a
+    correct date replaces the record.
+  - The publisher in iroh 1.2 does not read the body of the `400`, so its device is not told.
+    The publisher's timestamp never goes back inside a process: a process whose clock ran fast
+    keeps signing ahead of the server until real time catches up, or until it restarts with a
+    correct clock. Its last accepted record expires after the retention period meanwhile.
+  - A packet stored before the limit existed, or while the server's clock was set back, stays
+    until its own date has passed and the retention period after it, and until then the store
+    ignores the device's publications with a correct date (they answer `204` and change
+    nothing). No cleanup removes such packets.
+- **Eviction** removes a packet from the store and, when the store's writer does, from the zone
+  cache. Once an eviction is done, DNS no longer answers the record from the store or the cache,
+  and a lookup that read the packet before the eviction cannot put it back in the cache. A lookup
+  that was already running can still answer with it once. With the mainline fallback on, DNS can
+  answer the record from the DHT and cache it for 300 seconds, while `GET /pkarr/{key}` reads
+  only the store and reports it absent.
 
 `GET /healthz` reports `git_hash`: the revision in the `KR_FORK_REV` environment variable when
 the server was built, and `unknown` when it was built without one.

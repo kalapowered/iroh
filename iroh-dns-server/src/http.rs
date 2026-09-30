@@ -245,7 +245,13 @@ async fn healthz() -> Json<Health> {
 }
 
 pub(crate) fn create_app(state: AppState, rate_limits: &RateLimits) -> Router {
-    create_app_with_quotas(state, rate_limits, PUT_QUOTA, LOOKUP_QUOTA)
+    create_app_with_quotas(
+        state,
+        rate_limits,
+        PUT_QUOTA,
+        LOOKUP_QUOTA,
+        option_env!("KR_FORK_REV"),
+    )
 }
 
 /// [`create_app`] with the quotas named, so a test can use one that only a count of requests can
@@ -255,6 +261,7 @@ fn create_app_with_quotas(
     rate_limits: &RateLimits,
     put_quota: Quota,
     lookup_quota: Quota,
+    _revision: Option<&'static str>,
 ) -> Router {
     // configure cors middleware
     let cors = CorsLayer::new()
@@ -528,6 +535,15 @@ mod tests {
             put_burst: u32,
             lookup_burst: u32,
         ) -> Result<Served> {
+            serve_revision(limits, put_burst, lookup_burst, None).await
+        }
+
+        pub(super) async fn serve_revision(
+            limits: RateLimits,
+            put_burst: u32,
+            lookup_burst: u32,
+            revision: Option<&'static str>,
+        ) -> Result<Served> {
             let metrics = Arc::new(Metrics::default());
             let store = ZoneStore::in_memory(Options::default(), metrics.clone())?;
             let state_store = store.clone();
@@ -540,7 +556,13 @@ mod tests {
                 store,
                 metrics: metrics.clone(),
             };
-            let app = create_app_with_quotas(state, &limits, quota(put_burst), quota(lookup_burst));
+            let app = create_app_with_quotas(
+                state,
+                &limits,
+                quota(put_burst),
+                quota(lookup_burst),
+                revision,
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .anyerr()?;
@@ -602,6 +624,18 @@ mod tests {
                     .await
                     .anyerr()?;
                 Ok(res.status())
+            }
+
+            /// The answer of `GET /healthz`.
+            pub(super) async fn healthz(&self) -> Result<serde_json::Value> {
+                self.client
+                    .get(format!("http://{}/healthz", self.addr))
+                    .send()
+                    .await
+                    .anyerr()?
+                    .json()
+                    .await
+                    .anyerr()
             }
 
             /// Publish a packet, and return the status and the body of the answer.
@@ -722,6 +756,42 @@ mod tests {
             served.put_pkarr().await?;
             served.put_pkarr().await?;
             assert_eq!(served.put_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            Ok(())
+        }
+    }
+
+    /// The health check names the build that answers.
+    mod health {
+        use n0_error::Result;
+
+        use super::rate_limits::{limits, serve_revision};
+        use crate::http::RateLimitConfig;
+
+        fn unlimited() -> crate::http::RateLimits {
+            limits(RateLimitConfig::Disabled, RateLimitConfig::Disabled)
+        }
+
+        #[tokio::test]
+        async fn healthz_carries_the_revision_the_build_was_given() -> Result {
+            let revision = "0123456789abcdef0123456789abcdef01234567";
+            let served = serve_revision(unlimited(), 1, 1, Some(revision)).await?;
+
+            let health = served.healthz().await?;
+
+            assert_eq!(health["status"], "ok");
+            assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(health["git_hash"], revision);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn healthz_says_unknown_when_the_build_was_given_no_revision() -> Result {
+            let served = serve_revision(unlimited(), 1, 1, None).await?;
+
+            let health = served.healthz().await?;
+
+            assert_eq!(health["status"], "ok");
+            assert_eq!(health["git_hash"], "unknown");
             Ok(())
         }
     }

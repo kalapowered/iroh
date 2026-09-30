@@ -11,6 +11,9 @@ pub struct Metrics {
     pub pkarr_publish_update: Counter,
     /// Number of pkarr relay puts that did not change the stored packet.
     pub pkarr_publish_noop: Counter,
+    /// Number of pkarr relay puts refused because the packet was signed too far ahead of the
+    /// server's clock.
+    pub pkarr_publish_timestamp_ahead: Counter,
     /// Total number of DNS requests across all transports.
     pub dns_requests: Counter,
     /// Number of DNS requests received over UDP.

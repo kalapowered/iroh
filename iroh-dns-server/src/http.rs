@@ -509,9 +509,10 @@ mod tests {
             }
         }
 
-        struct Served {
+        pub(super) struct Served {
             addr: SocketAddr,
-            metrics: Arc<Metrics>,
+            pub(super) metrics: Arc<Metrics>,
+            pub(super) store: ZoneStore,
             client: reqwest::Client,
             task: tokio::task::JoinHandle<()>,
         }
@@ -522,9 +523,14 @@ mod tests {
             }
         }
 
-        async fn serve(limits: RateLimits, put_burst: u32, lookup_burst: u32) -> Result<Served> {
+        pub(super) async fn serve(
+            limits: RateLimits,
+            put_burst: u32,
+            lookup_burst: u32,
+        ) -> Result<Served> {
             let metrics = Arc::new(Metrics::default());
             let store = ZoneStore::in_memory(Options::default(), metrics.clone())?;
+            let state_store = store.clone();
             let state = AppState {
                 dns_handler: DnsHandler::new(
                     store.clone(),
@@ -554,6 +560,7 @@ mod tests {
             Ok(Served {
                 addr,
                 metrics,
+                store: state_store,
                 client,
                 task,
             })
@@ -597,6 +604,23 @@ mod tests {
                 Ok(res.status())
             }
 
+            /// Publish a packet, and return the status and the body of the answer.
+            pub(super) async fn put_packet(
+                &self,
+                packet: &iroh_dns::pkarr::SignedPacket,
+            ) -> Result<(StatusCode, String)> {
+                let key = packet.public_key().to_z32();
+                let res = self
+                    .client
+                    .put(format!("http://{}/pkarr/{key}", self.addr))
+                    .body(packet.to_relay_payload())
+                    .send()
+                    .await
+                    .anyerr()?;
+                let status = res.status();
+                Ok((status, res.text().await.anyerr()?))
+            }
+
             /// A publication whose body is not a packet: the handler refuses it with a 400, so
             /// any other status is the limit's.
             async fn put_pkarr(&self) -> Result<StatusCode> {
@@ -612,7 +636,7 @@ mod tests {
             }
         }
 
-        fn limits(pkarr_put: RateLimitConfig, lookup: RateLimitConfig) -> RateLimits {
+        pub(super) fn limits(pkarr_put: RateLimitConfig, lookup: RateLimitConfig) -> RateLimits {
             RateLimits { pkarr_put, lookup }
         }
 
@@ -698,6 +722,75 @@ mod tests {
             served.put_pkarr().await?;
             served.put_pkarr().await?;
             assert_eq!(served.put_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            Ok(())
+        }
+    }
+
+    /// What a publication is checked against before it is stored.
+    mod publication {
+        use http::StatusCode;
+        use iroh::SecretKey;
+        use n0_error::Result;
+
+        use super::rate_limits::{limits, serve};
+        use crate::{
+            http::RateLimitConfig,
+            testing::{now_micros, signed_packet_at},
+            util::PublicKeyBytes,
+        };
+
+        const SECOND: u64 = 1_000_000;
+
+        fn unlimited() -> crate::http::RateLimits {
+            limits(RateLimitConfig::Disabled, RateLimitConfig::Disabled)
+        }
+
+        #[tokio::test]
+        async fn a_packet_signed_far_ahead_of_the_server_clock_is_refused_and_says_so() -> Result {
+            let served = serve(unlimited(), 1, 1).await?;
+            let endpoint = SecretKey::generate();
+            let key = PublicKeyBytes::new_unchecked(*endpoint.public().as_bytes());
+            let now = now_micros();
+
+            let current = signed_packet_at(&endpoint, now, "current");
+            let (status, _) = served.put_packet(&current).await?;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+
+            // A device whose clock is an hour fast.
+            let ahead = signed_packet_at(&endpoint, now + 3600 * SECOND, "ahead");
+            let (status, body) = served.put_packet(&ahead).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("ahead"), "the answer says why: {body}");
+            assert_eq!(served.metrics.pkarr_publish_timestamp_ahead.get(), 1);
+
+            // The stored packet is the one it replaced nothing of, and the device's next
+            // publication, signed by a corrected clock, replaces it.
+            let stored = served.store.get_signed_packet(&key).await?.expect("stored");
+            assert_eq!(stored.as_bytes(), current.as_bytes());
+            let corrected = signed_packet_at(&endpoint, now + SECOND, "corrected");
+            let (status, _) = served.put_packet(&corrected).await?;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let stored = served.store.get_signed_packet(&key).await?.expect("stored");
+            assert_eq!(stored.as_bytes(), corrected.as_bytes());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_packet_signed_within_the_allowed_margin_is_stored() -> Result {
+            let served = serve(unlimited(), 1, 1).await?;
+            let now = now_micros();
+
+            // Signed now, and signed five minutes ahead (a clock that is a little fast).
+            for signed in [now, now + 300 * SECOND] {
+                let endpoint = SecretKey::generate();
+                let key = PublicKeyBytes::new_unchecked(*endpoint.public().as_bytes());
+                let packet = signed_packet_at(&endpoint, signed, "relay");
+                let (status, _) = served.put_packet(&packet).await?;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+                let stored = served.store.get_signed_packet(&key).await?.expect("stored");
+                assert_eq!(stored.as_bytes(), packet.as_bytes());
+            }
+            assert_eq!(served.metrics.pkarr_publish_timestamp_ahead.get(), 0);
             Ok(())
         }
     }

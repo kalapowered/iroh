@@ -295,22 +295,25 @@ fn create_app_with_quotas(
     // configure routes
     //
     // Lookups share one quota for each source, and a lookup refused for it is counted.
-    // Publications have a quota of their own.
-    let mut lookups = Router::new()
-        .route("/dns-query", get(doh::get).post(doh::post))
-        .route("/pkarr/{key}", get(pkarr::get));
+    // Publications have a quota of their own. A limit is a route layer on a method router, which
+    // wraps the method handlers and not the answers for a method the route lacks, so a request no
+    // handler answers (an unknown path, a `DELETE`) spends neither quota.
+    let mut dns_query = get(doh::get).post(doh::post);
+    let mut pkarr_get = get(pkarr::get);
     if let Some(limit) = lookup_limit {
-        lookups = lookups.layer(limit).layer(middleware::from_fn_with_state(
-            state.clone(),
-            count_refused_lookups,
-        ));
+        let count = middleware::from_fn_with_state(state.clone(), count_refused_lookups);
+        dns_query = dns_query
+            .route_layer(limit.clone())
+            .route_layer(count.clone());
+        pkarr_get = pkarr_get.route_layer(limit).route_layer(count);
     }
-    let mut publications = Router::new().route("/pkarr/{key}", put(pkarr::put));
+    let mut pkarr_put = put(pkarr::put);
     if let Some(limit) = put_limit {
-        publications = publications.layer(limit);
+        pkarr_put = pkarr_put.route_layer(limit);
     }
-    let router = lookups
-        .merge(publications)
+    let router = Router::new()
+        .route("/dns-query", dns_query)
+        .route("/pkarr/{key}", pkarr_get.merge(pkarr_put))
         // Deprecated: use /healthz instead
         .route("/healthcheck", get(|| async { "OK" }))
         .route("/healthz", get(move || async move { health(revision) }))

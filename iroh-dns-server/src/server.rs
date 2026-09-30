@@ -13,7 +13,7 @@ use crate::http::HttpsConfig;
 use crate::{
     config::Config,
     dns::{DnsHandler, DnsServer},
-    http::HttpServer,
+    http::{HttpServer, RateLimits},
     metrics::Metrics,
     state::AppState,
     store::ZoneStore,
@@ -85,7 +85,10 @@ impl Server {
         let http_server = HttpServer::spawn(
             config.http,
             config.https,
-            config.pkarr_put_rate_limit,
+            RateLimits {
+                pkarr_put: config.pkarr_put_rate_limit,
+                lookup: config.lookup_rate_limit,
+            },
             state.clone(),
             cert_cache_dir,
         )

@@ -31,6 +31,8 @@ mod pkarr;
 mod rate_limiting;
 mod tls;
 
+pub(crate) use self::rate_limiting::RateLimits;
+use self::rate_limiting::{LOOKUP_QUOTA, PUT_QUOTA, Quota};
 pub use self::{rate_limiting::RateLimitConfig, tls::CertMode};
 use crate::state::AppState;
 
@@ -101,7 +103,7 @@ impl HttpServer {
     pub(crate) async fn spawn(
         http_config: Option<HttpConfig>,
         https_config: Option<HttpsConfig>,
-        rate_limit_config: RateLimitConfig,
+        rate_limits: RateLimits,
         state: AppState,
         cert_cache_dir: PathBuf,
     ) -> Result<HttpServer> {
@@ -109,7 +111,7 @@ impl HttpServer {
             bail_any!("Either http or https config is required");
         }
 
-        let app = create_app(state, &rate_limit_config);
+        let app = create_app(state, &rate_limits);
 
         let mut tasks = JoinSet::new();
 
@@ -242,7 +244,18 @@ async fn healthz() -> Json<Health> {
     })
 }
 
-pub(crate) fn create_app(state: AppState, rate_limit_config: &RateLimitConfig) -> Router {
+pub(crate) fn create_app(state: AppState, rate_limits: &RateLimits) -> Router {
+    create_app_with_quotas(state, rate_limits, PUT_QUOTA, LOOKUP_QUOTA)
+}
+
+/// [`create_app`] with the quotas named, so a test can use one that only a count of requests can
+/// exhaust.
+fn create_app_with_quotas(
+    state: AppState,
+    rate_limits: &RateLimits,
+    put_quota: Quota,
+    _lookup_quota: Quota,
+) -> Router {
     // configure cors middleware
     let cors = CorsLayer::new()
         // allow `GET` and `POST` when accessing the resource
@@ -267,7 +280,7 @@ pub(crate) fn create_app(state: AppState, rate_limit_config: &RateLimitConfig) -
     });
 
     // configure rate limiting middleware
-    let rate_limit = rate_limiting::create(rate_limit_config);
+    let rate_limit = rate_limiting::create(&rate_limits.pkarr_put, put_quota);
 
     // configure routes
     //
@@ -448,6 +461,225 @@ mod tests {
 
         server.shutdown().await?;
         Ok(())
+    }
+
+    /// The request limits, on a server that is answering on a local port.
+    mod rate_limits {
+        use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+        use http::StatusCode;
+        use iroh::SecretKey;
+        use n0_error::{Result, StdResultExt};
+
+        use super::tls;
+        use crate::{
+            config::Config,
+            dns::DnsHandler,
+            http::{RateLimitConfig, RateLimits, create_app_with_quotas, rate_limiting::Quota},
+            metrics::Metrics,
+            state::AppState,
+            store::{Options, ZoneStore},
+        };
+
+        /// A quota that replenishes so slowly that only how many requests came decides.
+        fn quota(burst: u32) -> Quota {
+            Quota {
+                replenish: Duration::from_secs(3600),
+                burst,
+            }
+        }
+
+        struct Served {
+            addr: SocketAddr,
+            metrics: Arc<Metrics>,
+            client: reqwest::Client,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        impl Drop for Served {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        async fn serve(limits: RateLimits, put_burst: u32, lookup_burst: u32) -> Result<Served> {
+            let metrics = Arc::new(Metrics::default());
+            let store = ZoneStore::in_memory(Options::default(), metrics.clone())?;
+            let state = AppState {
+                dns_handler: DnsHandler::new(
+                    store.clone(),
+                    &Config::default().dns,
+                    metrics.clone(),
+                )?,
+                store,
+                metrics: metrics.clone(),
+            };
+            let app = create_app_with_quotas(state, &limits, quota(put_burst), quota(lookup_burst));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .anyerr()?;
+            let addr = listener.local_addr().anyerr()?;
+            let task = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .ok();
+            });
+            let client = reqwest::Client::builder()
+                .use_preconfigured_tls(tls::insecure_tls_config())
+                .build()
+                .anyerr()?;
+            Ok(Served {
+                addr,
+                metrics,
+                client,
+                task,
+            })
+        }
+
+        impl Served {
+            async fn get_pkarr(&self) -> Result<StatusCode> {
+                let key = SecretKey::generate().public().to_z32();
+                let res = self
+                    .client
+                    .get(format!("http://{}/pkarr/{key}", self.addr))
+                    .send()
+                    .await
+                    .anyerr()?;
+                Ok(res.status())
+            }
+
+            async fn get_doh(&self) -> Result<StatusCode> {
+                let res = self
+                    .client
+                    .get(format!(
+                        "http://{}/dns-query?name=x.example.&type=txt",
+                        self.addr
+                    ))
+                    .header("accept", "application/dns-json")
+                    .send()
+                    .await
+                    .anyerr()?;
+                Ok(res.status())
+            }
+
+            async fn post_doh(&self) -> Result<StatusCode> {
+                let res = self
+                    .client
+                    .post(format!("http://{}/dns-query", self.addr))
+                    .header("content-type", "application/dns-message")
+                    .body(Vec::<u8>::new())
+                    .send()
+                    .await
+                    .anyerr()?;
+                Ok(res.status())
+            }
+
+            /// A publication whose body is not a packet: the handler refuses it with a 400, so
+            /// any other status is the limit's.
+            async fn put_pkarr(&self) -> Result<StatusCode> {
+                let key = SecretKey::generate().public().to_z32();
+                let res = self
+                    .client
+                    .put(format!("http://{}/pkarr/{key}", self.addr))
+                    .body("not a packet")
+                    .send()
+                    .await
+                    .anyerr()?;
+                Ok(res.status())
+            }
+        }
+
+        fn limits(pkarr_put: RateLimitConfig, lookup: RateLimitConfig) -> RateLimits {
+            RateLimits { pkarr_put, lookup }
+        }
+
+        #[tokio::test]
+        async fn lookups_are_refused_after_the_burst_whichever_route_they_take() -> Result {
+            let served = serve(
+                limits(RateLimitConfig::Simple, RateLimitConfig::Simple),
+                2,
+                3,
+            )
+            .await?;
+
+            // Under the burst every route answers, and each request spends the one quota.
+            assert_ne!(served.get_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            assert_ne!(served.get_doh().await?, StatusCode::TOO_MANY_REQUESTS);
+            assert_ne!(served.post_doh().await?, StatusCode::TOO_MANY_REQUESTS);
+
+            // Past it every route refuses.
+            assert_eq!(served.get_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(served.get_doh().await?, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(served.post_doh().await?, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(served.metrics.lookup_rate_limited.get(), 3);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn publications_keep_their_own_quota() -> Result {
+            let served = serve(
+                limits(RateLimitConfig::Simple, RateLimitConfig::Simple),
+                2,
+                3,
+            )
+            .await?;
+
+            // Spend the lookup quota: publications are still answered by their handler.
+            for _ in 0..3 {
+                served.get_pkarr().await?;
+            }
+            assert_eq!(served.get_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(served.put_pkarr().await?, StatusCode::BAD_REQUEST);
+            assert_eq!(served.put_pkarr().await?, StatusCode::BAD_REQUEST);
+
+            // The publication quota is its own and is spent as it was: two, then refused.
+            assert_eq!(served.put_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn publications_do_not_spend_the_lookup_quota() -> Result {
+            let served = serve(
+                limits(RateLimitConfig::Simple, RateLimitConfig::Simple),
+                2,
+                3,
+            )
+            .await?;
+
+            served.put_pkarr().await?;
+            served.put_pkarr().await?;
+            assert_eq!(served.put_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+
+            for _ in 0..3 {
+                assert_ne!(served.get_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_disabled_lookup_limit_refuses_nothing_and_leaves_publications_limited() -> Result
+        {
+            let served = serve(
+                limits(RateLimitConfig::Simple, RateLimitConfig::Disabled),
+                2,
+                3,
+            )
+            .await?;
+
+            for _ in 0..20 {
+                assert_ne!(served.get_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+                assert_ne!(served.get_doh().await?, StatusCode::TOO_MANY_REQUESTS);
+            }
+            assert_eq!(served.metrics.lookup_rate_limited.get(), 0);
+
+            served.put_pkarr().await?;
+            served.put_pkarr().await?;
+            assert_eq!(served.put_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            Ok(())
+        }
     }
 
     mod tls {

@@ -61,6 +61,14 @@ pub struct Config {
     #[serde(default)]
     pub pkarr_put_rate_limit: RateLimitConfig,
 
+    /// Rate limit applied to lookups over HTTP: `GET /pkarr/{key}` and `/dns-query` by `GET` and
+    /// `POST`.
+    ///
+    /// Each source gets 100 lookups at once and 50 more every second, shared by the three routes.
+    /// DNS over UDP and TCP is not limited here.
+    #[serde(default)]
+    pub lookup_rate_limit: RateLimitConfig,
+
     /// Location where the server stores its data.
     ///
     /// When `None`, [`Self::data_dir`] falls back to the `IROH_DNS_DATA_DIR`
@@ -285,6 +293,7 @@ impl Default for Config {
             metrics: None,
             mainline: None,
             pkarr_put_rate_limit: RateLimitConfig::default(),
+            lookup_rate_limit: RateLimitConfig::default(),
             data_dir: None,
         }
     }

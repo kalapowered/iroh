@@ -29,6 +29,8 @@ pub struct Metrics {
     pub http_requests_success: Counter,
     /// Number of HTTP requests that returned a non-2xx status code.
     pub http_requests_error: Counter,
+    /// Number of lookups over HTTP refused because their source went over its request quota.
+    pub lookup_rate_limited: Counter,
     /// Cumulative duration of all HTTP requests, in milliseconds.
     pub http_requests_duration_ms: Counter,
     /// Number of signed packets newly inserted into the store.

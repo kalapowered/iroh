@@ -38,11 +38,42 @@ impl Default for &RateLimitConfig {
     }
 }
 
-/// Create the default rate-limiting layer.
+/// The rate limit settings of the HTTP server.
+#[derive(Debug, Clone)]
+pub(crate) struct RateLimits {
+    /// The limit on `PUT /pkarr`.
+    pub(crate) pkarr_put: RateLimitConfig,
+    /// The limit on the lookups: `GET /pkarr/{key}` and `/dns-query`.
+    pub(crate) lookup: RateLimitConfig,
+}
+
+/// How fast a source may send requests: one is replenished every `replenish`, and a source that
+/// has been quiet may send `burst` at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Quota {
+    pub(super) replenish: Duration,
+    pub(super) burst: u32,
+}
+
+/// One publication every four seconds, two at once.
+pub(super) const PUT_QUOTA: Quota = Quota {
+    replenish: Duration::from_secs(4),
+    burst: 2,
+};
+
+/// Fifty lookups a second, a hundred at once. Many endpoints can sit behind one address, so the
+/// quota is far above what one endpoint needs.
+pub(super) const LOOKUP_QUOTA: Quota = Quota {
+    replenish: Duration::from_millis(20),
+    burst: 100,
+};
+
+/// Create the rate-limiting layer for a quota.
 ///
 /// This spawns a background thread to clean up the rate limiting cache.
 pub(super) fn create<RespBody>(
     rate_limit_config: &RateLimitConfig,
+    quota: Quota,
 ) -> Option<GovernorLayer<PeerIpKeyExtractor, NoOpMiddleware<QuantaInstant>, RespBody>> {
     let use_smart_extractor = match rate_limit_config {
         RateLimitConfig::Disabled => {
@@ -55,13 +86,9 @@ pub(super) fn create<RespBody>(
 
     tracing::info!("Rate limiting enabled ({rate_limit_config:?})");
 
-    // Configure rate limiting:
-    // * allow bursts with up to five requests per IP address
-    // * replenish one element every two seconds
     let mut governor_conf_builder = GovernorConfigBuilder::default();
-    // governor_conf_builder.use_headers()
-    governor_conf_builder.per_second(4);
-    governor_conf_builder.burst_size(2);
+    governor_conf_builder.period(quota.replenish);
+    governor_conf_builder.burst_size(quota.burst);
 
     if use_smart_extractor {
         governor_conf_builder.key_extractor(SmartIpKeyExtractor);

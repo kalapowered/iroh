@@ -22,16 +22,19 @@ pub enum RateLimitConfig {
     Disabled,
     /// Rate limits by the connection's peer IP address.
     ///
-    /// See [`PeerIpKeyExtractor`].
+    /// For publications the key is the peer address itself, see [`PeerIpKeyExtractor`]. For
+    /// lookups it is the peer address's network: an IPv4 address, or the /64 of an IPv6 address.
     ///
     /// [`PeerIpKeyExtractor`]: https://docs.rs/tower_governor/latest/tower_governor/key_extractor/struct.PeerIpKeyExtractor.html
     #[default]
     Simple,
     /// Rate limits by the client IP, extracted from reverse-proxy headers.
     ///
-    /// Uses the headers commonly set by reverse proxies (for example
-    /// `X-Forwarded-For`) to extract the original client IP, falling back to the
-    /// connection's peer IP address. See [`SmartIpKeyExtractor`].
+    /// For lookups this uses the headers commonly set by reverse proxies (for example
+    /// `X-Forwarded-For`) to extract the original client IP, falling back to the connection's
+    /// peer IP address, and then maps it to its network as `Simple` does. See
+    /// [`SmartIpKeyExtractor`]. For publications the headers are not read and this keys on the
+    /// peer address, as `Simple` does.
     ///
     /// [`SmartIpKeyExtractor`]: https://docs.rs/tower_governor/latest/tower_governor/key_extractor/struct.SmartIpKeyExtractor.html
     Smart,

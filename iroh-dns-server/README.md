@@ -45,9 +45,11 @@ packet origin will be appended with the origin as configured by this server.
     keeps signing ahead of the server until real time catches up, or until it restarts with a
     correct clock. Its last accepted record expires after the retention period meanwhile.
   - A packet stored before the limit existed, or while the server's clock was set back, stays
-    until its own date has passed and the retention period after it, and until then the store
-    ignores the device's publications with a correct date (they answer `204` and change
-    nothing). No cleanup removes such packets.
+    until its own date has passed. Until then the store ignores that endpoint's publications
+    with an earlier date, which is every correct one (they answer `204` and change nothing), and
+    the first publication dated after it replaces the packet. An endpoint that no longer
+    publishes leaves it until its date plus the retention period. No cleanup removes such
+    packets.
 - **Eviction** removes a packet from the store and, when the store's writer does, from the zone
   cache. Once an eviction is done, DNS no longer answers the record from the store or the cache,
   and a lookup that read the packet before the eviction cannot put it back in the cache. A lookup

@@ -837,13 +837,21 @@ mod tests {
     #[test]
     fn a_cache_left_in_doubt_by_a_panic_starts_over_and_counts_a_change_for_every_key() {
         let cache = std::sync::Mutex::new(super::ZoneCache::new(16, Default::default()));
-        let endpoint = SecretKey::generate();
-        let pubkey = key(&endpoint);
+        let (cached, dht_cached) = (SecretKey::generate(), SecretKey::generate());
         let noted = {
             let mut cache = cache.lock().expect("lock");
-            cache.insert(pubkey, zone_of(&endpoint, "cached"));
-            assert!(cache.cache.contains(&pubkey));
-            cache.changes(&pubkey)
+            cache.insert(key(&cached), zone_of(&cached, "cached"));
+            let dht_noted = cache.changes(&key(&dht_cached));
+            cache.insert_and_resolve_dht(
+                &key(&dht_cached),
+                zone_of(&dht_cached, "dht"),
+                dht_noted,
+                &name(),
+                RecordType::TXT,
+            );
+            assert!(cache.cache.contains(&key(&cached)));
+            assert!(cache.dht_cache.contains_key(&key(&dht_cached)));
+            cache.changes.clone()
         };
 
         // A thread panics while it holds the lock.
@@ -858,16 +866,24 @@ mod tests {
         assert!(panicked.is_err());
         assert!(cache.is_poisoned());
 
-        let guard = super::lock_cache(&cache);
+        let mut guard = super::lock_cache(&cache);
         assert!(
-            !guard.cache.contains(&pubkey),
+            !guard.cache.contains(&key(&cached)),
             "what was cached is forgotten"
         );
-        assert_ne!(
-            guard.changes(&pubkey),
-            noted,
-            "a lookup in flight caches nothing"
+        assert!(
+            !guard.dht_cache.contains_key(&key(&dht_cached)),
+            "what came from the DHT is forgotten"
         );
+        assert!(
+            guard
+                .changes
+                .iter()
+                .zip(noted.iter())
+                .all(|(after, before)| after != before),
+            "a lookup in flight caches nothing, whichever key it was for"
+        );
+        assert!(guard.cache.is_empty() && guard.dht_cache.iter().count() == 0);
         drop(guard);
         assert!(!cache.is_poisoned(), "the lock works again");
     }

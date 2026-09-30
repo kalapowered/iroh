@@ -16,7 +16,7 @@ service was built from.
 
 | | |
 | --- | --- |
-| Tag | `v1.2.0` (upstream's `v1.3.0` names the same commit) |
+| Tag | `v1.2.0` |
 | Commit | `17c0612f80f78f5288e97b818b1360ae6ea0a51a` |
 | `iroh`, `iroh-relay`, `iroh-dns-server`, `iroh-base` | 1.2.0 |
 | `iroh-dns` | 1.3.0 |

@@ -74,9 +74,11 @@ A release that fixes a vulnerability in `iroh`, `iroh-relay`, `iroh-dns-server`,
    A patch upstream has replaced is removed together with its tests and its row.
 3. Before rollout, in the web repository, run the relay wrapper's tests (`cargo test` in
    `infra/relay/kr-relay`, with its lock file at the new fork commit as step 5 says) and the relay
-   and discovery end-to-end suites (`scripts/e2e-relay.sh`, `scripts/e2e-discovery.sh`), with the
-   merged builds against every client version the signed release matrix supports. A network tier
-   is compatible with the installed clients before a client that needs the new behaviour ships.
+   end-to-end suite (`scripts/e2e-relay.sh`), with the merged builds against every client version
+   the signed release matrix supports. `scripts/e2e-discovery.sh` talks to the live discovery
+   service, so it runs after the discovery deploy of step 5, as the first end-to-end proof of the
+   new build, against the same client versions. A network tier is compatible with the installed
+   clients before a client that needs the new behaviour ships.
 4. Fast-forward `kalareach` to the merge branch.
 5. In one change to the web repository, move both pins to the new tip:
    - discovery: `IROH_DNS_SERVER_FORK_REV` in `infra/discovery/deployment.env`;
@@ -105,7 +107,8 @@ it, to the patched version:
 
 - In the fork's `Cargo.lock`, for the discovery server: `cargo update -p <package> --precise
   <version>` on a branch from `kalareach`, the suites of step 2, a fast-forward, then the
-  discovery pin of step 5 and a discovery deploy. The relay is untouched.
+  discovery pin of step 5, a discovery deploy and `scripts/e2e-discovery.sh` against the supported
+  client versions. The relay is untouched.
 - In `infra/relay/kr-relay/Cargo.lock`, for the relay: the same `cargo update` in that directory,
   in the web repository. It needs no fork commit and no fast-forward. Run the wrapper's tests and
   `scripts/e2e-relay.sh` of step 3, then deploy the relay.
@@ -128,7 +131,9 @@ reported and do not fail the check.
 the RustSec database with `cargo audit`, and the five crates above against GitHub's published
 advisories. Both are needed: `cargo audit` matches only packages from a registry, and the fork's
 crates are path packages in the fork's own lock file and git packages in the relay's, so it never
-reports one for them, whatever RustSec lists. GitHub imports the RustSec advisories too, and its
+reports one for them, whatever RustSec lists. (The relay's lock file also holds registry copies of
+some of them, pulled in by a dev-dependency on the published `iroh`, which `cargo audit` does check;
+the relay binary runs the git copies.) GitHub imports the RustSec advisories too, and its
 review of an advisory upstream has published can take days; the deadline counts from publication.
 The check exits `1`, naming each advisory, its patched version and its deadline, when an advisory
 applies and is not acknowledged, and `2` when a source cannot be read, after printing what it could

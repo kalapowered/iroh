@@ -238,7 +238,7 @@ struct Health {
     git_hash: &'static str,
 }
 
-async fn healthz(revision: Option<&'static str>) -> Json<Health> {
+fn health(revision: Option<&'static str>) -> Json<Health> {
     Json(Health {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -313,7 +313,7 @@ fn create_app_with_quotas(
         .merge(publications)
         // Deprecated: use /healthz instead
         .route("/healthcheck", get(|| async { "OK" }))
-        .route("/healthz", get(move || healthz(revision)))
+        .route("/healthz", get(move || async move { health(revision) }))
         .route("/", get(|| async { "Hi!" }))
         .with_state(state.clone());
 

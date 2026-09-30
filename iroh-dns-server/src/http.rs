@@ -657,6 +657,29 @@ mod tests {
                 Ok((status, res.text().await.anyerr()?))
             }
 
+            /// A request the server has no route for.
+            async fn get_unknown(&self) -> Result<StatusCode> {
+                let res = self
+                    .client
+                    .get(format!("http://{}/nothing-here", self.addr))
+                    .send()
+                    .await
+                    .anyerr()?;
+                Ok(res.status())
+            }
+
+            /// A `DELETE`, which no route answers.
+            async fn delete_pkarr(&self) -> Result<StatusCode> {
+                let key = SecretKey::generate().public().to_z32();
+                let res = self
+                    .client
+                    .delete(format!("http://{}/pkarr/{key}", self.addr))
+                    .send()
+                    .await
+                    .anyerr()?;
+                Ok(res.status())
+            }
+
             /// A publication whose body is not a packet: the handler refuses it with a 400, so
             /// any other status is the limit's.
             async fn put_pkarr(&self) -> Result<StatusCode> {
@@ -717,6 +740,31 @@ mod tests {
 
             // The publication quota is its own and is spent as it was: two, then refused.
             assert_eq!(served.put_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn requests_no_route_answers_spend_neither_quota() -> Result {
+            let served = serve(
+                limits(RateLimitConfig::Simple, RateLimitConfig::Simple),
+                2,
+                3,
+            )
+            .await?;
+
+            // More of them than either burst holds.
+            for _ in 0..5 {
+                assert_eq!(served.get_unknown().await?, StatusCode::NOT_FOUND);
+                assert_eq!(served.delete_pkarr().await?, StatusCode::METHOD_NOT_ALLOWED);
+            }
+
+            // Both quotas are whole: two publications and three lookups still get through.
+            assert_eq!(served.put_pkarr().await?, StatusCode::BAD_REQUEST);
+            assert_eq!(served.put_pkarr().await?, StatusCode::BAD_REQUEST);
+            for _ in 0..3 {
+                assert_ne!(served.get_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
+            }
+            assert_eq!(served.metrics.lookup_rate_limited.get(), 0);
             Ok(())
         }
 

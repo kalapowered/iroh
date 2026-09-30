@@ -5,7 +5,7 @@ use std::{
     num::NonZeroUsize,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use hickory_server::proto::{
@@ -14,10 +14,10 @@ use hickory_server::proto::{
 };
 use iroh_dns::pkarr::{SignedPacket, SignedPacketVerifyError, Timestamp};
 use lru::LruCache;
-use n0_error::{Result, StdResultExt};
+use n0_error::{AnyError, Result, StdResultExt, e, stack_error};
 use n0_mainline::{Dht, DhtBuilder, MutableItem};
 pub(crate) use signed_packets::Options;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use ttl_cache::TtlCache;
 
 use self::signed_packets::{OnChange, SignedPacketStore};
@@ -37,6 +37,52 @@ const DHT_CACHE_TTL: Duration = Duration::from_secs(300);
 /// `CHANGE_COUNTERS` others on average, so a change to one key rarely makes a lookup of another
 /// skip its cache fill.
 const CHANGE_COUNTERS: usize = 1024;
+
+/// The furthest ahead of the server's clock a packet may be signed.
+///
+/// The store keeps a packet for a retention period counted from its signed time, so a packet
+/// signed far in the future would stay long after the period it was meant for. A publisher whose
+/// clock is a little fast is still served.
+pub(crate) const MAX_TIMESTAMP_AHEAD: Duration = Duration::from_secs(10 * 60);
+
+/// Why a packet was not inserted.
+#[stack_error(derive, add_meta)]
+pub(crate) enum InsertError {
+    /// The packet is signed too far ahead of the server's clock.
+    #[error(
+        "the packet is signed {} seconds ahead of the server's clock, more than the {} seconds allowed",
+        ahead.as_secs(),
+        MAX_TIMESTAMP_AHEAD.as_secs()
+    )]
+    TimestampAhead { ahead: Duration },
+    /// The packet store failed.
+    #[error("the packet store failed")]
+    Store { source: AnyError },
+}
+
+/// Check that a packet signed at `timestamp` is not too far ahead of `now`, the server's clock in
+/// microseconds since the UNIX epoch.
+fn check_timestamp_ahead(timestamp: Timestamp, now: u64) -> Result<(), InsertError> {
+    let signed = timestamp.as_micros();
+    let latest_allowed = now.saturating_add(MAX_TIMESTAMP_AHEAD.as_micros() as u64);
+    if signed > latest_allowed {
+        return Err(e!(InsertError::TimestampAhead {
+            ahead: Duration::from_micros(signed - now)
+        }));
+    }
+    Ok(())
+}
+
+/// The server's wall clock in microseconds since the UNIX epoch, read once for each check.
+///
+/// Not [`Timestamp::now`]: that one never goes back, so after the clock is set back it stays
+/// ahead of the wall clock and would let a packet through that is ahead of it.
+fn wall_clock_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_micros() as u64)
+        .unwrap_or(0)
+}
 
 /// Where a new pkarr packet comes from
 pub(crate) enum PacketSource {
@@ -229,6 +275,10 @@ impl ZoneStore {
 
     /// Insert a signed packet into the store.
     ///
+    /// Refuses a packet signed more than [`MAX_TIMESTAMP_AHEAD`] ahead of the server's clock.
+    /// This is the only way a packet reaches the store: a packet from the DHT fallback goes to
+    /// the cache only.
+    ///
     /// Returns whether this produced an update, i.e. whether the packet is the newest for its
     /// pubkey. The cache drops its zone for the key when the store's writer applies the update,
     /// not when this call returns, so a publication whose request is dropped half way still
@@ -239,8 +289,22 @@ impl ZoneStore {
         &self,
         signed_packet: SignedPacket,
         _source: PacketSource,
-    ) -> Result<bool> {
-        if self.store.upsert(signed_packet).await? {
+    ) -> Result<bool, InsertError> {
+        if let Err(err) = check_timestamp_ahead(signed_packet.timestamp(), wall_clock_micros()) {
+            self.metrics.pkarr_publish_timestamp_ahead.inc();
+            let key = signed_packet.public_key().to_z32();
+            info!(
+                key = key.get(..10).unwrap_or(&key),
+                "publication refused: {err}"
+            );
+            return Err(err);
+        }
+        let updated = self
+            .store
+            .upsert(signed_packet)
+            .await
+            .map_err(|source| e!(InsertError::Store, source))?;
+        if updated {
             self.metrics.pkarr_publish_update.inc();
             Ok(true)
         } else {
@@ -509,7 +573,11 @@ mod tests {
     use iroh_dns::pkarr::SignedPacket;
     use n0_error::Result;
 
-    use super::{Options, PacketSource, ZoneStore};
+    use iroh_dns::pkarr::Timestamp;
+
+    use super::{
+        InsertError, MAX_TIMESTAMP_AHEAD, Options, PacketSource, ZoneStore, check_timestamp_ahead,
+    };
     use crate::{
         testing::{DAY_MICROS, now_micros, signed_packet_at},
         util::PublicKeyBytes,
@@ -540,7 +608,7 @@ mod tests {
     }
 
     async fn publish(store: &ZoneStore, packet: SignedPacket) -> Result<bool> {
-        store.insert(packet, PacketSource::PkarrPublish).await
+        Ok(store.insert(packet, PacketSource::PkarrPublish).await?)
     }
 
     async fn lookup(store: &ZoneStore, secret_key: &SecretKey) -> Result<Option<String>> {
@@ -707,6 +775,60 @@ mod tests {
         assert_eq!(
             lookup(&store, &endpoint).await?.as_deref(),
             Some("relay=newer")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_timestamp_exactly_at_the_allowed_margin_is_accepted_and_one_microsecond_more_is_not() {
+        let now = 1_800_000_000_000_000u64;
+        let margin = MAX_TIMESTAMP_AHEAD.as_micros() as u64;
+        assert_eq!(margin, 600_000_000);
+
+        assert!(check_timestamp_ahead(Timestamp::from_micros(now + margin), now).is_ok());
+        let refused = check_timestamp_ahead(Timestamp::from_micros(now + margin + 1), now)
+            .expect_err("one microsecond past the margin");
+        match refused {
+            InsertError::TimestampAhead { ahead, .. } => {
+                assert_eq!(ahead, Duration::from_micros(margin + 1));
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamps_in_the_past_and_at_the_clock_are_accepted_and_the_largest_is_not() {
+        let now = 1_800_000_000_000_000u64;
+        assert!(check_timestamp_ahead(Timestamp::from_micros(0), now).is_ok());
+        assert!(check_timestamp_ahead(Timestamp::from_micros(now - 1), now).is_ok());
+        assert!(check_timestamp_ahead(Timestamp::from_micros(now), now).is_ok());
+        assert!(check_timestamp_ahead(Timestamp::from_micros(u64::MAX), now).is_err());
+        // A clock so late that the margin would overflow does not wrap.
+        assert!(check_timestamp_ahead(Timestamp::from_micros(u64::MAX), u64::MAX - 1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_refused_publication_changes_neither_the_store_nor_the_cache() -> Result {
+        let store = store()?;
+        let endpoint = SecretKey::generate();
+        let now = now_micros();
+        publish(&store, signed_packet_at(&endpoint, now, "current")).await?;
+        assert_eq!(
+            lookup(&store, &endpoint).await?.as_deref(),
+            Some("relay=current")
+        );
+
+        let ahead = signed_packet_at(&endpoint, now + 3600 * 1_000_000, "ahead");
+        let err = publish(&store, ahead).await.expect_err("refused");
+        assert!(
+            err.to_string().contains("ahead of the server's clock"),
+            "{err}"
+        );
+
+        assert!(store.cached(&key(&endpoint)));
+        assert_eq!(
+            lookup(&store, &endpoint).await?.as_deref(),
+            Some("relay=current")
         );
         Ok(())
     }

@@ -6,10 +6,15 @@ use bytes::Bytes;
 use http::{StatusCode, header};
 use iroh_base::PublicKey;
 use iroh_dns::pkarr::SignedPacket;
+use n0_error::AnyError;
 use tracing::info;
 
 use super::error::AppError;
-use crate::{state::AppState, store::PacketSource, util::PublicKeyBytes};
+use crate::{
+    state::AppState,
+    store::{InsertError, PacketSource},
+    util::PublicKeyBytes,
+};
 
 pub(super) async fn put(
     State(state): State<AppState>,
@@ -29,7 +34,14 @@ pub(super) async fn put(
     let updated = state
         .store
         .insert(signed_packet, PacketSource::PkarrPublish)
-        .await?;
+        .await
+        .map_err(|err| match err {
+            InsertError::TimestampAhead { .. } => AppError::new(
+                StatusCode::BAD_REQUEST,
+                Some(format!("{err}; check the device's clock")),
+            ),
+            err => AppError::from(AnyError::from_stack(err)),
+        })?;
     info!(key = %label, ?updated, "pkarr upsert");
     Ok(StatusCode::NO_CONTENT)
 }

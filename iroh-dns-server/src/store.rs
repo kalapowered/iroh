@@ -1,6 +1,12 @@
 //! Pkarr packet store used to resolve DNS queries.
 
-use std::{collections::BTreeMap, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroUsize,
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use hickory_server::proto::{
     ProtoError,
@@ -11,11 +17,10 @@ use lru::LruCache;
 use n0_error::{Result, StdResultExt};
 use n0_mainline::{Dht, DhtBuilder, MutableItem};
 pub(crate) use signed_packets::Options;
-use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
 use ttl_cache::TtlCache;
 
-use self::signed_packets::SignedPacketStore;
+use self::signed_packets::{OnChange, SignedPacketStore};
 use crate::{
     config::BootstrapOption,
     metrics::Metrics,
@@ -28,6 +33,10 @@ mod signed_packets;
 const DEFAULT_CACHE_CAPACITY: usize = 1024 * 1024;
 /// Default TTL for DHT cache entries
 const DHT_CACHE_TTL: Duration = Duration::from_secs(300);
+/// The number of change counters the zone cache keeps. A key shares its counter with one in
+/// `CHANGE_COUNTERS` others on average, so a change to one key rarely makes a lookup of another
+/// skip its cache fill.
+const CHANGE_COUNTERS: usize = 1024;
 
 /// Where a new pkarr packet comes from
 pub(crate) enum PacketSource {
@@ -39,6 +48,11 @@ pub(crate) enum PacketSource {
 ///
 /// Packets are stored in the persistent `SignedPacketStore`, and cached on-demand in an in-memory LRU
 /// cache used for resolving DNS queries.
+///
+/// The packet store's writer is the only thing that changes a stored packet, and it tells the
+/// cache about every change (a publication that replaces a packet, an eviction) before it takes
+/// its next message. So once a publication or an eviction is done, no lookup that starts later
+/// answers from the packet it replaced or removed, and no lookup that started earlier caches it.
 #[derive(Debug, Clone)]
 pub(crate) struct ZoneStore {
     cache: Arc<Mutex<ZoneCache>>,
@@ -46,7 +60,7 @@ pub(crate) struct ZoneStore {
     dht: Option<Dht>,
     metrics: Arc<Metrics>,
     #[cfg(test)]
-    read_gate: Arc<std::sync::Mutex<Option<Arc<ReadGate>>>>,
+    read_gate: Arc<Mutex<Option<Arc<ReadGate>>>>,
 }
 
 impl ZoneStore {
@@ -56,15 +70,19 @@ impl ZoneStore {
         options: Options,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
-        let packet_store = SignedPacketStore::persistent(path, options, metrics.clone())?;
-        Ok(Self::new(packet_store, metrics))
+        let cache = new_cache(&metrics);
+        let packet_store =
+            SignedPacketStore::persistent(path, options, metrics.clone(), invalidator(&cache))?;
+        Ok(Self::new(packet_store, cache, metrics))
     }
 
     /// Create an in-memory store.
     #[cfg(test)]
     pub(crate) fn in_memory(options: Options, metrics: Arc<Metrics>) -> Result<Self> {
-        let packet_store = SignedPacketStore::in_memory(options, metrics.clone())?;
-        Ok(Self::new(packet_store, metrics))
+        let cache = new_cache(&metrics);
+        let packet_store =
+            SignedPacketStore::in_memory(options, metrics.clone(), invalidator(&cache))?;
+        Ok(Self::new(packet_store, cache, metrics))
     }
 
     /// Create an in-memory store that evicts only when [`Self::evict_expired`] is called.
@@ -73,8 +91,13 @@ impl ZoneStore {
         options: Options,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
-        let packet_store = SignedPacketStore::in_memory_manual_eviction(options, metrics.clone())?;
-        Ok(Self::new(packet_store, metrics))
+        let cache = new_cache(&metrics);
+        let packet_store = SignedPacketStore::in_memory_manual_eviction(
+            options,
+            metrics.clone(),
+            invalidator(&cache),
+        )?;
+        Ok(Self::new(packet_store, cache, metrics))
     }
 
     /// Configure a mainline DHT client for resolution of packets as a fallback.
@@ -96,16 +119,23 @@ impl ZoneStore {
     }
 
     /// Create a new zone store.
-    fn new(store: SignedPacketStore, metrics: Arc<Metrics>) -> Self {
-        let zone_cache = ZoneCache::new(DEFAULT_CACHE_CAPACITY, metrics.clone());
+    fn new(store: SignedPacketStore, cache: Arc<Mutex<ZoneCache>>, metrics: Arc<Metrics>) -> Self {
         Self {
             store: Arc::new(store),
-            cache: Arc::new(Mutex::new(zone_cache)),
+            cache,
             dht: None,
             metrics,
             #[cfg(test)]
             read_gate: Default::default(),
         }
+    }
+
+    /// Lock the zone cache.
+    ///
+    /// The cache is never held across an await: the guard is not `Send`, so a handler that did
+    /// would not compile, and the packet store's writer takes the same lock from its own thread.
+    fn lock_cache(&self) -> MutexGuard<'_, ZoneCache> {
+        lock_cache(&self.cache)
     }
 
     /// Resolve a DNS query.
@@ -118,9 +148,10 @@ impl ZoneStore {
     ) -> Result<Option<Arc<RecordSet>>> {
         trace!("store resolve");
 
-        // Check cache first (short lock scope)
-        {
-            let mut cache = self.cache.lock().await;
+        // Check cache first (short lock scope). A miss also notes the key's change counter: a
+        // packet read from the store below is cached only if the counter has not moved by then.
+        let changes = {
+            let mut cache = self.lock_cache();
             if let Some(rset) = cache.resolve(pubkey, name, record_type) {
                 debug!(
                     len = rset.records_without_rrsigs().count(),
@@ -128,15 +159,24 @@ impl ZoneStore {
                 );
                 return Ok(Some(rset));
             }
-        }
+            cache.changes(pubkey)
+        };
 
         // Check persistent store
         if let Some(packet) = self.store.get(pubkey).await? {
             trace!(packet_timestamp = ?packet.timestamp(), "store hit");
             #[cfg(test)]
             self.pause_after_store_read().await;
-            let mut cache = self.cache.lock().await;
-            let result = cache.insert_and_resolve(&packet, name, record_type);
+            let result = match CachedZone::from_signed_packet(&packet).anyerr() {
+                Ok(zone) => Ok(self.lock_cache().insert_and_resolve(
+                    pubkey,
+                    zone,
+                    changes,
+                    name,
+                    record_type,
+                )),
+                Err(err) => Err(err),
+            };
             return match result {
                 Ok(Some(rset)) => {
                     debug!(
@@ -163,11 +203,14 @@ impl ZoneStore {
                 && let Ok(packet) = mutable_item_to_signed_packet(&item)
             {
                 debug!("DHT resolve successful {:?}", packet);
-                return self
-                    .cache
-                    .lock()
-                    .await
-                    .insert_and_resolve_dht(&packet, name, record_type);
+                let zone = CachedZone::from_signed_packet(&packet).anyerr()?;
+                return Ok(self.lock_cache().insert_and_resolve_dht(
+                    pubkey,
+                    zone,
+                    changes,
+                    name,
+                    record_type,
+                ));
             }
             debug!("DHT resolve failed");
         }
@@ -184,10 +227,12 @@ impl ZoneStore {
         self.store.get(pubkey).await
     }
 
-    /// Insert a signed packet into the cache and the store.
+    /// Insert a signed packet into the store.
     ///
     /// Returns whether this produced an update, i.e. whether the packet is the newest for its
-    /// pubkey.
+    /// pubkey. The cache drops its zone for the key when the store's writer applies the update,
+    /// not when this call returns, so a publication whose request is dropped half way still
+    /// reaches the cache.
     // allow unused async: this will be async soon.
     #[allow(clippy::unused_async)]
     pub(crate) async fn insert(
@@ -195,16 +240,37 @@ impl ZoneStore {
         signed_packet: SignedPacket,
         _source: PacketSource,
     ) -> Result<bool> {
-        let pubkey = PublicKeyBytes::from_signed_packet(&signed_packet);
         if self.store.upsert(signed_packet).await? {
             self.metrics.pkarr_publish_update.inc();
-            self.cache.lock().await.remove(&pubkey);
             Ok(true)
         } else {
             self.metrics.pkarr_publish_noop.inc();
             Ok(false)
         }
     }
+}
+
+fn new_cache(metrics: &Arc<Metrics>) -> Arc<Mutex<ZoneCache>> {
+    Arc::new(Mutex::new(ZoneCache::new(
+        DEFAULT_CACHE_CAPACITY,
+        metrics.clone(),
+    )))
+}
+
+/// What the packet store's writer calls when it has changed a key's stored packet.
+fn invalidator(cache: &Arc<Mutex<ZoneCache>>) -> OnChange {
+    let cache = cache.clone();
+    Arc::new(move |pubkey| lock_cache(&cache).remove(pubkey))
+}
+
+/// Lock the zone cache, and start it over if a panic under the lock left it in doubt.
+fn lock_cache(cache: &Mutex<ZoneCache>) -> MutexGuard<'_, ZoneCache> {
+    cache.lock().unwrap_or_else(|poisoned| {
+        let mut guard = poisoned.into_inner();
+        guard.reset();
+        cache.clear_poison();
+        guard
+    })
 }
 
 #[cfg(test)]
@@ -216,11 +282,7 @@ impl ZoneStore {
 
     /// Whether the cache holds a zone for this key.
     pub(crate) fn cached(&self, pubkey: &PublicKeyBytes) -> bool {
-        self.cache
-            .try_lock()
-            .expect("the cache is not in use")
-            .cache
-            .contains(pubkey)
+        self.lock_cache().cache.contains(pubkey)
     }
 
     /// Pause the next lookup that finds a packet in the store, after it has read the packet and
@@ -280,6 +342,13 @@ struct ZoneCache {
     /// so we don't cache stale entries indefinitely.
     #[debug("dht_cache")]
     dht_cache: TtlCache<PublicKeyBytes, CachedZone>,
+    /// Counts the changes made to the stored packets, one counter for each group of keys.
+    ///
+    /// A lookup that reads the store notes its key's counter first and caches what it read only
+    /// if the counter is the same afterwards: a change in between is one the lookup may have
+    /// missed, and what it read may be older than the store.
+    #[debug("changes")]
+    changes: Box<[u64; CHANGE_COUNTERS]>,
     #[debug("metrics")]
     metrics: Arc<Metrics>,
 }
@@ -291,8 +360,19 @@ impl ZoneCache {
         Self {
             cache,
             dht_cache,
+            changes: Box::new([0; CHANGE_COUNTERS]),
             metrics,
         }
+    }
+
+    fn counter(pubkey: &PublicKeyBytes) -> usize {
+        let bytes = pubkey.as_bytes();
+        usize::from(u16::from_be_bytes([bytes[0], bytes[1]])) % CHANGE_COUNTERS
+    }
+
+    /// The change counter of the group `pubkey` belongs to.
+    fn changes(&self, pubkey: &PublicKeyBytes) -> u64 {
+        self.changes[Self::counter(pubkey)]
     }
 
     fn resolve(
@@ -312,61 +392,84 @@ impl ZoneCache {
         zone.resolve(name, record_type)
     }
 
+    /// Cache a zone built from the store's packet and answer from the cache, unless the key's
+    /// stored packet changed since `changes` was noted: then answer from the zone alone.
     fn insert_and_resolve(
         &mut self,
-        signed_packet: &SignedPacket,
+        pubkey: &PublicKeyBytes,
+        zone: CachedZone,
+        changes: u64,
         name: &Name,
         record_type: RecordType,
-    ) -> Result<Option<Arc<RecordSet>>> {
-        let pubkey = PublicKeyBytes::from_signed_packet(signed_packet);
-        self.insert(signed_packet)?;
-        Ok(self.resolve(&pubkey, name, record_type))
+    ) -> Option<Arc<RecordSet>> {
+        if self.changes(pubkey) != changes {
+            trace!("insert skip: the stored packet changed during the lookup");
+            return zone.resolve(name, record_type);
+        }
+        self.insert(*pubkey, zone);
+        self.resolve(pubkey, name, record_type)
     }
 
     fn insert_and_resolve_dht(
         &mut self,
-        signed_packet: &SignedPacket,
+        pubkey: &PublicKeyBytes,
+        zone: CachedZone,
+        changes: u64,
         name: &Name,
         record_type: RecordType,
-    ) -> Result<Option<Arc<RecordSet>>> {
-        let pubkey = PublicKeyBytes::from_signed_packet(signed_packet);
-        let zone = CachedZone::from_signed_packet(signed_packet).anyerr()?;
+    ) -> Option<Arc<RecordSet>> {
         let res = zone.resolve(name, record_type);
-        self.dht_cache.insert(pubkey, zone, DHT_CACHE_TTL);
+        if self.changes(pubkey) != changes {
+            trace!("dht insert skip: the stored packet changed during the lookup");
+            return res;
+        }
+        self.dht_cache.insert(*pubkey, zone, DHT_CACHE_TTL);
         self.metrics
             .cache_zones_dht
             .set(self.dht_cache.iter().count() as i64);
-        Ok(res)
+        res
     }
 
-    fn insert(&mut self, signed_packet: &SignedPacket) -> Result<()> {
-        let pubkey = PublicKeyBytes::from_signed_packet(signed_packet);
+    fn insert(&mut self, pubkey: PublicKeyBytes, zone: CachedZone) {
         if self
             .cache
             .peek(&pubkey)
-            .map(|old| old.is_newer_than(signed_packet))
+            .map(|old| old.is_newer_than(&zone))
             .unwrap_or(false)
         {
             trace!("insert skip: cached is newer");
-            Ok(())
         } else {
-            self.cache.put(
-                pubkey,
-                CachedZone::from_signed_packet(signed_packet).anyerr()?,
-            );
+            self.cache.put(pubkey, zone);
             self.metrics.cache_zones.set(self.cache.len() as i64);
             trace!("inserted into cache");
-            Ok(())
         }
     }
 
+    /// Drop the zones cached for a key whose stored packet changed, and count the change.
+    ///
+    /// Runs on the packet store's writer thread, so it does no work that grows with the cache.
     fn remove(&mut self, pubkey: &PublicKeyBytes) {
+        let counter = Self::counter(pubkey);
+        self.changes[counter] = self.changes[counter].wrapping_add(1);
         self.cache.pop(pubkey);
-        self.dht_cache.remove(pubkey);
         self.metrics.cache_zones.set(self.cache.len() as i64);
-        self.metrics
-            .cache_zones_dht
-            .set(self.dht_cache.iter().count() as i64);
+        // The DHT cache has no cheap length, so its gauge is counted only when a zone left it.
+        if self.dht_cache.remove(pubkey).is_some() {
+            self.metrics
+                .cache_zones_dht
+                .set(self.dht_cache.iter().count() as i64);
+        }
+    }
+
+    /// Forget everything cached and count a change for every key.
+    fn reset(&mut self) {
+        self.cache.clear();
+        self.dht_cache.clear();
+        for counter in self.changes.iter_mut() {
+            *counter = counter.wrapping_add(1);
+        }
+        self.metrics.cache_zones.set(0);
+        self.metrics.cache_zones_dht.set(0);
     }
 }
 
@@ -386,8 +489,8 @@ impl CachedZone {
         })
     }
 
-    fn is_newer_than(&self, signed_packet: &SignedPacket) -> bool {
-        self.timestamp > signed_packet.timestamp()
+    fn is_newer_than(&self, other: &CachedZone) -> bool {
+        self.timestamp > other.timestamp
     }
 
     fn resolve(&self, name: &Name, record_type: RecordType) -> Option<Arc<RecordSet>> {
@@ -576,6 +679,35 @@ mod tests {
 
         assert!(!store.cached(&key(&endpoint)));
         assert_eq!(lookup(&store, &endpoint).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_publication_the_store_applied_reaches_the_cache_without_its_caller() -> Result {
+        let store = store()?;
+        let endpoint = SecretKey::generate();
+        let now = now_micros();
+        publish(&store, signed_packet_at(&endpoint, now, "older")).await?;
+        assert_eq!(
+            lookup(&store, &endpoint).await?.as_deref(),
+            Some("relay=older")
+        );
+        assert!(store.cached(&key(&endpoint)));
+
+        // A request that is dropped after its packet reached the store never runs the code after
+        // `ZoneStore::insert`'s store call. Applying the packet to the store alone stands for it.
+        assert!(
+            store
+                .store
+                .upsert(signed_packet_at(&endpoint, now + 1, "newer"))
+                .await?
+        );
+
+        assert!(!store.cached(&key(&endpoint)));
+        assert_eq!(
+            lookup(&store, &endpoint).await?.as_deref(),
+            Some("relay=newer")
+        );
         Ok(())
     }
 

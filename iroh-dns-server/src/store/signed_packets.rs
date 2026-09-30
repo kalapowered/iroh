@@ -17,6 +17,13 @@ use crate::{metrics::Metrics, util::PublicKeyBytes};
 
 type SignedPacketsKey = [u8; 32];
 
+/// Called by the writer for a key whose stored packet it has just replaced or removed.
+///
+/// It runs on the writer's thread, before the writer takes its next message: no read of the store
+/// that the writer answers after the change can be answered before the callback has run. It must
+/// be quick and must not wait for the store.
+pub(super) type OnChange = Arc<dyn Fn(&PublicKeyBytes) + Send + Sync>;
+
 const SIGNED_PACKETS_TABLE: TableDefinition<&SignedPacketsKey, &[u8]> =
     TableDefinition::new("signed-packets-1");
 const UPDATE_TIME_TABLE: MultimapTableDefinition<[u8; 8], SignedPacketsKey> =
@@ -71,6 +78,7 @@ struct Actor {
     cancel: CancellationToken,
     options: Options,
     metrics: Arc<Metrics>,
+    on_change: OnChange,
 }
 
 /// Configuration for the signed-packet store.
@@ -193,6 +201,7 @@ impl Actor {
                 } else {
                     self.metrics.store_packets_inserted.inc();
                 }
+                (self.on_change)(&key);
                 res.send(true).ok();
             }
             #[cfg(test)]
@@ -206,6 +215,7 @@ impl Actor {
                             .remove(&packet.timestamp().to_be_bytes(), key.as_bytes())
                             .anyerr()?;
                         self.metrics.store_packets_removed.inc();
+                        (self.on_change)(&key);
                         true
                     }
                     _ => false,
@@ -231,6 +241,7 @@ impl Actor {
                                 .anyerr()?;
                             let _ = tables.signed_packets.remove(key.as_bytes()).anyerr()?;
                             self.metrics.store_packets_expired.inc();
+                            (self.on_change)(&key);
                             debug!("removed expired packet {key}");
                         } else {
                             debug!(
@@ -298,6 +309,7 @@ impl SignedPacketStore {
         path: impl AsRef<Path>,
         options: Options,
         metrics: Arc<Metrics>,
+        on_change: OnChange,
     ) -> Result<Self> {
         let path = path.as_ref();
         info!("loading packet database from {}", path.to_string_lossy());
@@ -312,16 +324,20 @@ impl SignedPacketStore {
         let db = Database::builder()
             .create(path)
             .std_context("failed to open packet database")?;
-        Self::open(db, options, metrics, true)
+        Self::open(db, options, metrics, on_change, true)
     }
 
     #[cfg(test)]
-    pub(crate) fn in_memory(options: Options, metrics: Arc<Metrics>) -> Result<Self> {
+    pub(crate) fn in_memory(
+        options: Options,
+        metrics: Arc<Metrics>,
+        on_change: OnChange,
+    ) -> Result<Self> {
         info!("using in-memory packet database");
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .anyerr()?;
-        Self::open(db, options, metrics, true)
+        Self::open(db, options, metrics, on_change, true)
     }
 
     /// An in-memory store whose periodic eviction task does not run: eviction happens only when
@@ -330,17 +346,19 @@ impl SignedPacketStore {
     pub(crate) fn in_memory_manual_eviction(
         options: Options,
         metrics: Arc<Metrics>,
+        on_change: OnChange,
     ) -> Result<Self> {
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .anyerr()?;
-        Self::open(db, options, metrics, false)
+        Self::open(db, options, metrics, on_change, false)
     }
 
     pub(crate) fn open(
         db: Database,
         options: Options,
         metrics: Arc<Metrics>,
+        on_change: OnChange,
         run_eviction_task: bool,
     ) -> Result<Self> {
         // create tables
@@ -358,6 +376,7 @@ impl SignedPacketStore {
             cancel: cancel2,
             options,
             metrics,
+            on_change,
         };
         // start an io thread and donate it to the tokio runtime so we can do blocking IO
         // inside the thread despite being in a tokio runtime
@@ -623,6 +642,7 @@ mod tests {
     use iroh_base::SecretKey;
 
     use super::*;
+    use crate::testing::signed_packet_at;
 
     fn test_signed_packet() -> SignedPacket {
         let secret_key = SecretKey::generate();
@@ -647,10 +667,28 @@ mod tests {
         assert_eq!(packet.as_bytes(), deserialized.as_bytes());
     }
 
+    /// A hook that records the keys it is called with.
+    fn recording_hook() -> (OnChange, Arc<std::sync::Mutex<Vec<PublicKeyBytes>>>) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: OnChange = {
+            let calls = calls.clone();
+            Arc::new(move |key| calls.lock().expect("calls").push(*key))
+        };
+        (hook, calls)
+    }
+
+    fn no_hook() -> OnChange {
+        Arc::new(|_| {})
+    }
+
     #[tokio::test]
     async fn remove_in_memory() {
-        let store = SignedPacketStore::in_memory(Options::default(), Arc::new(Metrics::default()))
-            .expect("in-memory store");
+        let store = SignedPacketStore::in_memory(
+            Options::default(),
+            Arc::new(Metrics::default()),
+            no_hook(),
+        )
+        .expect("in-memory store");
         let packet = test_signed_packet();
         let key = PublicKeyBytes::from_signed_packet(&packet);
 
@@ -661,5 +699,110 @@ mod tests {
         assert!(store.get(&key).await.expect("get after remove").is_none());
 
         assert!(!store.remove(&key).await.expect("remove missing"));
+    }
+
+    #[tokio::test]
+    async fn the_writer_reports_each_change_it_applies_and_no_other() {
+        let (hook, calls) = recording_hook();
+        let store = SignedPacketStore::in_memory_manual_eviction(
+            Options::default(),
+            Arc::new(Metrics::default()),
+            hook,
+        )
+        .expect("in-memory store");
+        let secret_key = SecretKey::generate();
+        let now = Timestamp::now().as_micros();
+        let newer = signed_packet_at(&secret_key, now + 1, "newer");
+        let older = signed_packet_at(&secret_key, now, "older");
+        let key = PublicKeyBytes::from_signed_packet(&newer);
+        let count = || calls.lock().expect("calls").len();
+
+        assert!(store.upsert(newer.clone()).await.expect("first upsert"));
+        assert_eq!(count(), 1, "a new packet is a change");
+
+        // The store keeps the newer packet, so nothing changed and nobody is told.
+        assert!(!store.upsert(older).await.expect("older upsert"));
+        assert_eq!(count(), 1, "a refused upsert is not a change");
+
+        assert!(store.remove(&key).await.expect("remove"));
+        assert_eq!(count(), 2, "a removal is a change");
+        assert!(!store.remove(&key).await.expect("remove missing"));
+        assert_eq!(count(), 2, "removing nothing is not a change");
+        assert!(
+            calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .all(|called| *called == key)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eviction_is_reported_while_its_transaction_is_still_open() {
+        // A batch that neither fills nor times out, so nothing in this test is committed: the
+        // report has to come from the removal, not from a commit.
+        let options = Options {
+            max_batch_size: 1000,
+            max_batch_time: Duration::from_secs(3600),
+            eviction: Duration::from_secs(24 * 3600),
+            eviction_interval: Duration::from_secs(3600),
+        };
+        let (hook, calls) = recording_hook();
+        let store = SignedPacketStore::in_memory_manual_eviction(
+            options,
+            Arc::new(Metrics::default()),
+            hook,
+        )
+        .expect("in-memory store");
+        let secret_key = SecretKey::generate();
+        let signed = Timestamp::now().as_micros() - 2 * 24 * 3600 * 1_000_000;
+        let packet = signed_packet_at(&secret_key, signed, "old");
+        let key = PublicKeyBytes::from_signed_packet(&packet);
+        assert!(store.upsert(packet.clone()).await.expect("upsert"));
+        let before = calls.lock().expect("calls").len();
+
+        store
+            .send
+            .send(Message::CheckExpired {
+                time: packet.timestamp(),
+                key,
+            })
+            .await
+            .expect("send");
+        // The writer answers this read after the check, in the same open transaction.
+        assert!(store.get(&key).await.expect("get").is_none());
+
+        assert_eq!(calls.lock().expect("calls").len(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn a_packet_that_has_not_expired_is_not_reported_by_a_check() {
+        let (hook, calls) = recording_hook();
+        let store = SignedPacketStore::in_memory_manual_eviction(
+            Options {
+                max_batch_size: 1,
+                max_batch_time: Duration::from_secs(3600),
+                ..Options::default()
+            },
+            Arc::new(Metrics::default()),
+            hook,
+        )
+        .expect("in-memory store");
+        let packet = test_signed_packet();
+        let key = PublicKeyBytes::from_signed_packet(&packet);
+        assert!(store.upsert(packet.clone()).await.expect("upsert"));
+        let before = calls.lock().expect("calls").len();
+
+        store
+            .send
+            .send(Message::CheckExpired {
+                time: packet.timestamp(),
+                key,
+            })
+            .await
+            .expect("send");
+        assert!(store.get(&key).await.expect("get").is_some());
+
+        assert_eq!(calls.lock().expect("calls").len(), before);
     }
 }

@@ -511,18 +511,14 @@ impl ZoneCache {
 
     /// Drop the zones cached for a key whose stored packet changed, and count the change.
     ///
-    /// Runs on the packet store's writer thread, so it does no work that grows with the cache.
+    /// Runs on the packet store's writer thread, so it does no work that grows with the cache:
+    /// the gauge of DHT zones is refreshed when a DHT zone is cached, not here.
     fn remove(&mut self, pubkey: &PublicKeyBytes) {
         let counter = Self::counter(pubkey);
         self.changes[counter] = self.changes[counter].wrapping_add(1);
         self.cache.pop(pubkey);
+        self.dht_cache.remove(pubkey);
         self.metrics.cache_zones.set(self.cache.len() as i64);
-        // The DHT cache has no cheap length, so its gauge is counted only when a zone left it.
-        if self.dht_cache.remove(pubkey).is_some() {
-            self.metrics
-                .cache_zones_dht
-                .set(self.dht_cache.iter().count() as i64);
-        }
     }
 
     /// Forget everything cached and count a change for every key.
@@ -831,6 +827,87 @@ mod tests {
             Some("relay=current")
         );
         Ok(())
+    }
+
+    fn zone_of(secret_key: &SecretKey, relay: &str) -> super::CachedZone {
+        super::CachedZone::from_signed_packet(&signed_packet_at(secret_key, now_micros(), relay))
+            .expect("a zone")
+    }
+
+    #[test]
+    fn a_cache_left_in_doubt_by_a_panic_starts_over_and_counts_a_change_for_every_key() {
+        let cache = std::sync::Mutex::new(super::ZoneCache::new(16, Default::default()));
+        let endpoint = SecretKey::generate();
+        let pubkey = key(&endpoint);
+        let noted = {
+            let mut cache = cache.lock().expect("lock");
+            cache.insert(pubkey, zone_of(&endpoint, "cached"));
+            assert!(cache.cache.contains(&pubkey));
+            cache.changes(&pubkey)
+        };
+
+        // A thread panics while it holds the lock.
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = cache.lock().expect("lock");
+                    panic!("a panic under the cache lock");
+                })
+                .join()
+        });
+        assert!(panicked.is_err());
+        assert!(cache.is_poisoned());
+
+        let guard = super::lock_cache(&cache);
+        assert!(
+            !guard.cache.contains(&pubkey),
+            "what was cached is forgotten"
+        );
+        assert_ne!(
+            guard.changes(&pubkey),
+            noted,
+            "a lookup in flight caches nothing"
+        );
+        drop(guard);
+        assert!(!cache.is_poisoned(), "the lock works again");
+    }
+
+    #[test]
+    fn a_dht_zone_is_not_cached_if_the_stored_packet_changed_during_the_lookup() {
+        let mut cache = super::ZoneCache::new(16, Default::default());
+        let endpoint = SecretKey::generate();
+        let pubkey = key(&endpoint);
+
+        // No change since the lookup began: the zone is answered and cached.
+        let noted = cache.changes(&pubkey);
+        let answer = cache.insert_and_resolve_dht(
+            &pubkey,
+            zone_of(&endpoint, "first"),
+            noted,
+            &name(),
+            RecordType::TXT,
+        );
+        assert_eq!(
+            answer.as_deref().map(relay_of).as_deref(),
+            Some("relay=first")
+        );
+        assert!(cache.dht_cache.contains_key(&pubkey));
+
+        // A change since the lookup began: answered from the zone, and not cached.
+        cache.remove(&pubkey);
+        assert!(!cache.dht_cache.contains_key(&pubkey));
+        let answer = cache.insert_and_resolve_dht(
+            &pubkey,
+            zone_of(&endpoint, "second"),
+            noted,
+            &name(),
+            RecordType::TXT,
+        );
+        assert_eq!(
+            answer.as_deref().map(relay_of).as_deref(),
+            Some("relay=second")
+        );
+        assert!(!cache.dht_cache.contains_key(&pubkey));
     }
 
     #[tokio::test]

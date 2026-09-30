@@ -1,4 +1,5 @@
 pkarr_put_rate_limit = "disabled"
+lookup_rate_limit = "disabled"
 
 [http]
 port = 8080

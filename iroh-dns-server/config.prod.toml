@@ -1,4 +1,7 @@
 pkarr_put_rate_limit = "smart"
+# Lookups over HTTP (GET /pkarr/{key} and /dns-query): 100 at once and 50 a second for each
+# source network, shared by the three routes. DNS over UDP and TCP is not limited here.
+lookup_rate_limit = "simple"
 
 [https]
 port = 443

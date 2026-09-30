@@ -298,3 +298,32 @@ impl Default for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_example_configurations_parse_with_the_lookup_limit() {
+        let dev: Config = toml::from_str(include_str!("../config.dev.toml")).expect("dev config");
+        assert!(matches!(dev.lookup_rate_limit, RateLimitConfig::Disabled));
+        let prod: Config =
+            toml::from_str(include_str!("../config.prod.toml")).expect("prod config");
+        assert!(matches!(prod.lookup_rate_limit, RateLimitConfig::Simple));
+    }
+
+    #[test]
+    fn a_configuration_without_the_setting_limits_lookups() {
+        let config: Config = toml::from_str(
+            r#"
+            [dns]
+            port = 53
+            default_soa = "a b 0 1 1 1 1"
+            default_ttl = 30
+            origins = ["."]
+            "#,
+        )
+        .expect("a configuration");
+        assert!(matches!(config.lookup_rate_limit, RateLimitConfig::Simple));
+    }
+}

@@ -21,6 +21,26 @@ The server will expose the following services:
 All received and valid pkarr signed packets will be served over DNS. The pkarr
 packet origin will be appended with the origin as configured by this server.
 
+## Limits
+
+- **Publications** (`PUT /pkarr/{key}`) are limited per peer address by
+  `pkarr_put_rate_limit`: one request every four seconds, two at once.
+- **Lookups** (`GET /pkarr/{key}` and `/dns-query` by `GET` and `POST`) are limited by
+  `lookup_rate_limit`: 50 a second, 100 at once, one quota per source shared by the three
+  routes. An IPv4 client is its own source and an IPv6 client is its /64. A refused lookup is
+  answered `429` and counted in `lookup_rate_limited`. DNS over UDP and TCP is not limited by
+  the server.
+- **Timestamps.** A packet stays in the store for `zone_store.eviction` counted from the time it
+  is signed with. A publication signed more than 10 minutes ahead of the server's clock is
+  refused with `400` and counted in `pkarr_publish_timestamp_ahead`. A packet stored before
+  that limit existed, or while the server's clock was set back, stays until its own date has
+  passed and the retention period after it.
+- **Eviction** removes a packet from the store and from the zone cache, so DNS never answers
+  with a record that `GET /pkarr/{key}` reports absent.
+
+`GET /healthz` reports `git_hash`: the revision in the `KR_FORK_REV` environment variable when
+the server was built, and `unknown` when it was built without one.
+
 # License
 
 This project is licensed under either of

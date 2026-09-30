@@ -233,14 +233,16 @@ impl HttpServer {
 struct Health {
     status: &'static str,
     version: &'static str,
+    /// The revision the build was made from: the fork's commit, set in `KR_FORK_REV` when the
+    /// server is built, or `unknown` for a build that was given none.
     git_hash: &'static str,
 }
 
-async fn healthz() -> Json<Health> {
+async fn healthz(revision: Option<&'static str>) -> Json<Health> {
     Json(Health {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
-        git_hash: "unknown",
+        git_hash: revision.unwrap_or("unknown"),
     })
 }
 
@@ -261,7 +263,7 @@ fn create_app_with_quotas(
     rate_limits: &RateLimits,
     put_quota: Quota,
     lookup_quota: Quota,
-    _revision: Option<&'static str>,
+    revision: Option<&'static str>,
 ) -> Router {
     // configure cors middleware
     let cors = CorsLayer::new()
@@ -311,7 +313,7 @@ fn create_app_with_quotas(
         .merge(publications)
         // Deprecated: use /healthz instead
         .route("/healthcheck", get(|| async { "OK" }))
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(move || healthz(revision)))
         .route("/", get(|| async { "Hi!" }))
         .with_state(state.clone());
 

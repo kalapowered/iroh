@@ -57,9 +57,9 @@ it.
 
 ## Fixing a vulnerability
 
-The daily check reads the lockfiles that build the two deployed binaries: the fork's `Cargo.lock`
-at the discovery pin, and `infra/relay/kr-relay/Cargo.lock` in the web repository for the relay.
-An advisory applies when the version a lockfile holds is in its affected range.
+The daily check reads the lock files that build the two deployed binaries: the fork's `Cargo.lock`
+at the discovery pin, and `infra/relay/kr-relay/Cargo.lock` in the web repository for the relay. An
+advisory applies when the version a lock file holds is in its affected range.
 
 ### An upstream release of an iroh crate
 
@@ -72,33 +72,43 @@ A release that fixes a vulnerability in `iroh`, `iroh-relay`, `iroh-dns-server`,
 2. Run the suites of the two services: `cargo test --locked -p iroh-relay --features server` and
    `cargo test --locked -p iroh-dns-server`. Every test named above must still exist and pass.
    A patch upstream has replaced is removed together with its tests and its row.
-3. Before rollout, run the relay wrapper's tests (`cargo test` in `infra/relay/kr-relay` of the
-   web repository, with its lockfile at the new fork commit) and the relay and discovery
-   end-to-end suites (`scripts/e2e-relay.sh`, `scripts/e2e-discovery.sh`), with the merged
-   builds against every client version the signed release matrix supports. A network tier is
-   compatible with the installed clients before a client that needs the new behaviour ships.
+3. Before rollout, in the web repository, run the relay wrapper's tests (`cargo test` in
+   `infra/relay/kr-relay`, with its lock file at the new fork commit as step 5 says) and the relay
+   and discovery end-to-end suites (`scripts/e2e-relay.sh`, `scripts/e2e-discovery.sh`), with the
+   merged builds against every client version the signed release matrix supports. A network tier
+   is compatible with the installed clients before a client that needs the new behaviour ships.
 4. Fast-forward `kalareach` to the merge branch.
-5. In one change to the web repository, move `IROH_RELAY_FORK_REV` (`infra/relay/deployment.env`)
-   and `IROH_DNS_SERVER_FORK_REV` (`infra/discovery/deployment.env`) to the new tip and
-   `IROH_UPSTREAM_BASE_REV` in both to the merged upstream commit, then deploy both services.
+5. In one change to the web repository, move both pins to the new tip:
+   - discovery: `IROH_DNS_SERVER_FORK_REV` in `infra/discovery/deployment.env`;
+   - relay: `IROH_RELAY_FORK_REV` in `infra/relay/deployment.env`, the two `rev =` lines naming the
+     fork in `infra/relay/kr-relay/Cargo.toml`, and `infra/relay/kr-relay/Cargo.lock` regenerated
+     to hold that commit (the relay's installer refuses a lock file that does not);
+   - `IROH_UPSTREAM_BASE_REV` in both `deployment.env` files, to the merged upstream commit.
+
+   Then deploy both services.
 
 A fix that a merge cannot deliver in time, because the release also carries changes that need
 review, may be cherry-picked onto a branch from `kalareach` instead. A cherry-pick leaves the
 crate versions where they were, so the daily check keeps reporting the advisory until it is
-acknowledged in `infra/scripts/upstream-security.acknowledgements.json` with the fork commit that
-carries the fix. The merge follows when the review is done.
+acknowledged in `infra/scripts/upstream-security.acknowledgements.json`, with a reason that names
+the fork commit that carries the fix. The merge follows when the review is done.
 
-The client links the published `iroh` crate. A release that fixes the client side is a dependency
-step in the client's own repository, scheduled through the release matrix; the check says so when
-an advisory names one of these crates, and the acknowledgement records that it is the client's.
+The client links the published `iroh` crate, and through it `iroh-relay`, `iroh-base` and
+`iroh-dns`. When an advisory names one of those, the check says that if the advisory is in code the
+client uses, the fix is also a dependency step in the client's own repository, scheduled through
+the release matrix.
 
-### A vulnerability in another package a lockfile holds
+### A vulnerability in another package a lock file holds
 
-A package such as `hickory-server`, `rustls`, `hyper` or `h2` is updated in the lockfile that
-holds it, to the patched version: `cargo update -p <package> --precise <version>` on a branch
-from `kalareach` for the discovery server's `Cargo.lock`, and the same in
-`infra/relay/kr-relay/Cargo.lock` for the relay. Then steps 2 to 5 above, moving only the pin
-whose lockfile changed.
+A package such as `hickory-server`, `rustls`, `hyper` or `h2` is updated in the lock file that holds
+it, to the patched version:
+
+- In the fork's `Cargo.lock`, for the discovery server: `cargo update -p <package> --precise
+  <version>` on a branch from `kalareach`, the suites of step 2, a fast-forward, then the
+  discovery pin of step 5 and a discovery deploy. The relay is untouched.
+- In `infra/relay/kr-relay/Cargo.lock`, for the relay: the same `cargo update` in that directory,
+  in the web repository. It needs no fork commit and no fast-forward. Run the wrapper's tests and
+  `scripts/e2e-relay.sh` of step 3, then deploy the relay.
 
 ### How fast
 
@@ -114,8 +124,12 @@ reported and do not fail the check.
 ### How a lapse is noticed
 
 `infra/scripts/upstream-security.mjs` in the web repository runs daily as the
-`upstream-security` workflow, and on demand. It checks every package in the two lockfiles against
-the RustSec database, and the five crates above against GitHub's published advisories, because
-RustSec carries none for them. It exits `1`, naming each advisory, its patched version and its
-deadline, when an advisory applies and is not acknowledged, and `2` when a source cannot be read.
-A failed run is the notice.
+`upstream-security` workflow, and on demand. It checks every package in the two lock files against
+the RustSec database with `cargo audit`, and the five crates above against GitHub's published
+advisories. Both are needed: `cargo audit` matches only packages from a registry, and the fork's
+crates are path packages in the fork's own lock file and git packages in the relay's, so it never
+reports one for them, whatever RustSec lists. GitHub imports the RustSec advisories too, and its
+review of an advisory upstream has published can take days; the deadline counts from publication.
+The check exits `1`, naming each advisory, its patched version and its deadline, when an advisory
+applies and is not acknowledged, and `2` when a source cannot be read, after printing what it could
+read. A failed run is the notice.

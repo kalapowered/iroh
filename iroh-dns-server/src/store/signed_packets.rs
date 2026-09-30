@@ -26,8 +26,10 @@ const UPDATE_TIME_TABLE: MultimapTableDefinition<[u8; 8], SignedPacketsKey> =
 pub(super) struct SignedPacketStore {
     send: mpsc::Sender<Message>,
     cancel: CancellationToken,
+    #[cfg(test)]
+    options: Options,
     _write_thread: IoThread,
-    _evict_thread: IoThread,
+    _evict_thread: Option<IoThread>,
 }
 
 impl Drop for SignedPacketStore {
@@ -310,7 +312,7 @@ impl SignedPacketStore {
         let db = Database::builder()
             .create(path)
             .std_context("failed to open packet database")?;
-        Self::open(db, options, metrics)
+        Self::open(db, options, metrics, true)
     }
 
     #[cfg(test)]
@@ -319,10 +321,28 @@ impl SignedPacketStore {
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .anyerr()?;
-        Self::open(db, options, metrics)
+        Self::open(db, options, metrics, true)
     }
 
-    pub(crate) fn open(db: Database, options: Options, metrics: Arc<Metrics>) -> Result<Self> {
+    /// An in-memory store whose periodic eviction task does not run: eviction happens only when
+    /// [`Self::evict_expired`] is called, so a test decides when.
+    #[cfg(test)]
+    pub(crate) fn in_memory_manual_eviction(
+        options: Options,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .anyerr()?;
+        Self::open(db, options, metrics, false)
+    }
+
+    pub(crate) fn open(
+        db: Database,
+        options: Options,
+        metrics: Arc<Metrics>,
+        run_eviction_task: bool,
+    ) -> Result<Self> {
         // create tables
         let write_tx = db.begin_write().anyerr()?;
         let _ = Tables::new(&write_tx).anyerr()?;
@@ -342,15 +362,44 @@ impl SignedPacketStore {
         // start an io thread and donate it to the tokio runtime so we can do blocking IO
         // inside the thread despite being in a tokio runtime
         let _write_thread = IoThread::new("packet-store-actor", move || actor.run())?;
-        let _evict_thread = IoThread::new("packet-store-evict", move || {
-            evict_task(send2, options, cancel3)
-        })?;
+        let _evict_thread = if run_eviction_task {
+            Some(IoThread::new("packet-store-evict", move || {
+                evict_task(send2, options, cancel3)
+            })?)
+        } else {
+            None
+        };
         Ok(Self {
             send,
             cancel,
+            #[cfg(test)]
+            options,
             _write_thread,
             _evict_thread,
         })
+    }
+
+    /// Run one eviction pass, the one the periodic task runs, and return once the writer has
+    /// handled every packet the pass checked.
+    ///
+    /// The writer takes messages in order, so the answer to a read sent after the pass shows that
+    /// the pass is done.
+    #[cfg(test)]
+    pub(crate) async fn evict_expired(&self) -> Result<()> {
+        evict_expired_once(&self.send, self.options).await?;
+        let (tx, rx) = oneshot::channel();
+        // Any key does: the writer answers the read after everything queued before it.
+        let barrier =
+            PublicKeyBytes::new_unchecked(*iroh_base::SecretKey::generate().public().as_bytes());
+        self.send
+            .send(Message::Get {
+                key: barrier,
+                res: tx,
+            })
+            .await
+            .anyerr()?;
+        rx.await.anyerr()?;
+        Ok(())
     }
 
     pub(crate) async fn upsert(&self, packet: SignedPacket) -> Result<bool> {
@@ -435,57 +484,63 @@ async fn evict_task(send: mpsc::Sender<Message>, options: Options, cancel: Cance
 
 /// Periodically check for expired packets and remove them.
 async fn evict_task_inner(send: mpsc::Sender<Message>, options: Options) -> Result<()> {
-    let expiry_us = options.eviction.as_micros() as u64;
     loop {
-        let (tx, rx) = oneshot::channel();
-        let _ = send.send(Message::Snapshot { res: tx }).await.ok();
-        // if we can't get the snapshot we exit the loop, main actor dead
-        let snapshot = rx.await.std_context("failed to get snapshot")?;
-
-        let expired =
-            Timestamp::from_micros(Timestamp::now().as_micros().saturating_sub(expiry_us));
-        trace!("evicting packets older than {}", fmt_time(expired));
-        // if getting the range fails we exit the loop and shut down
-        // if individual reads fail we log the error and limp on
-        for item in snapshot
-            .update_time
-            .range(..expired.to_be_bytes())
-            .anyerr()?
-        {
-            let (time, keys) = match item {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("failed to read update_time row {:?}", e);
-                    continue;
-                }
-            };
-            let time = Timestamp::from_be_bytes(time.value());
-            trace!("evicting expired packets at {}", fmt_time(time));
-            for item in keys {
-                let key = match item {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!(
-                            "failed to read update_time item at {}: {:?}",
-                            fmt_time(time),
-                            e
-                        );
-                        continue;
-                    }
-                };
-                // Safety: bytes were originally written from a validated PublicKey.
-                // If the database is corrupt, to_z32() may panic downstream.
-                let key = PublicKeyBytes::new_unchecked(key.value());
-
-                debug!("evicting expired packet {} {}", fmt_time(time), key);
-                send.send(Message::CheckExpired { time, key })
-                    .await
-                    .anyerr()?;
-            }
-        }
+        evict_expired_once(&send, options).await?;
         // sleep for the eviction interval so we don't constantly check
         tokio::time::sleep(options.eviction_interval).await;
     }
+}
+
+/// One eviction pass: take a snapshot of the store and have the writer check every packet the
+/// snapshot lists as older than the retention window.
+async fn evict_expired_once(send: &mpsc::Sender<Message>, options: Options) -> Result<()> {
+    let expiry_us = options.eviction.as_micros() as u64;
+    let (tx, rx) = oneshot::channel();
+    let _ = send.send(Message::Snapshot { res: tx }).await.ok();
+    // if we can't get the snapshot we exit the loop, main actor dead
+    let snapshot = rx.await.std_context("failed to get snapshot")?;
+
+    let expired = Timestamp::from_micros(Timestamp::now().as_micros().saturating_sub(expiry_us));
+    trace!("evicting packets older than {}", fmt_time(expired));
+    // if getting the range fails we exit the loop and shut down
+    // if individual reads fail we log the error and limp on
+    for item in snapshot
+        .update_time
+        .range(..expired.to_be_bytes())
+        .anyerr()?
+    {
+        let (time, keys) = match item {
+            Ok(v) => v,
+            Err(e) => {
+                error!("failed to read update_time row {:?}", e);
+                continue;
+            }
+        };
+        let time = Timestamp::from_be_bytes(time.value());
+        trace!("evicting expired packets at {}", fmt_time(time));
+        for item in keys {
+            let key = match item {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(
+                        "failed to read update_time item at {}: {:?}",
+                        fmt_time(time),
+                        e
+                    );
+                    continue;
+                }
+            };
+            // Safety: bytes were originally written from a validated PublicKey.
+            // If the database is corrupt, to_z32() may panic downstream.
+            let key = PublicKeyBytes::new_unchecked(key.value());
+
+            debug!("evicting expired packet {} {}", fmt_time(time), key);
+            send.send(Message::CheckExpired { time, key })
+                .await
+                .anyerr()?;
+        }
+    }
+    Ok(())
 }
 
 /// An io thread that drives a future to completion on the current tokio runtime

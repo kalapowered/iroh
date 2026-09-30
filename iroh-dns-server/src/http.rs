@@ -8,12 +8,12 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{ConnectInfo, Request, State},
-    handler::Handler,
-    http::Method,
+    http::{Method, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::get,
+    routing::{get, put},
 };
 use n0_error::{Result, StdResultExt, anyerr, bail_any};
 use serde::{Deserialize, Serialize};
@@ -254,7 +254,7 @@ fn create_app_with_quotas(
     state: AppState,
     rate_limits: &RateLimits,
     put_quota: Quota,
-    _lookup_quota: Quota,
+    lookup_quota: Quota,
 ) -> Router {
     // configure cors middleware
     let cors = CorsLayer::new()
@@ -280,21 +280,28 @@ fn create_app_with_quotas(
     });
 
     // configure rate limiting middleware
-    let rate_limit = rate_limiting::create(&rate_limits.pkarr_put, put_quota);
+    let put_limit = rate_limiting::create(&rate_limits.pkarr_put, put_quota);
+    let lookup_limit = rate_limiting::create_lookup::<Body>(&rate_limits.lookup, lookup_quota);
 
     // configure routes
     //
-    // only the pkarr::put route gets a rate limit
-    let router = Router::new()
+    // Lookups share one quota for each source, and a lookup refused for it is counted.
+    // Publications have a quota of their own.
+    let mut lookups = Router::new()
         .route("/dns-query", get(doh::get).post(doh::post))
-        .route(
-            "/pkarr/{key}",
-            if let Some(rate_limit) = rate_limit {
-                get(pkarr::get).put(pkarr::put.layer(rate_limit))
-            } else {
-                get(pkarr::get).put(pkarr::put)
-            },
-        )
+        .route("/pkarr/{key}", get(pkarr::get));
+    if let Some(limit) = lookup_limit {
+        lookups = lookups.layer(limit).layer(middleware::from_fn_with_state(
+            state.clone(),
+            count_refused_lookups,
+        ));
+    }
+    let mut publications = Router::new().route("/pkarr/{key}", put(pkarr::put));
+    if let Some(limit) = put_limit {
+        publications = publications.layer(limit);
+    }
+    let router = lookups
+        .merge(publications)
         // Deprecated: use /healthz instead
         .route("/healthcheck", get(|| async { "OK" }))
         .route("/healthz", get(healthz))
@@ -306,6 +313,19 @@ fn create_app_with_quotas(
         .layer(cors)
         .layer(trace)
         .route_layer(middleware::from_fn_with_state(state, metrics_middleware))
+}
+
+/// Count the lookups the request limit refused.
+async fn count_refused_lookups(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    let response = next.run(req).await;
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        state.metrics.lookup_rate_limited.inc();
+    }
+    response
 }
 
 /// Record request metrics.

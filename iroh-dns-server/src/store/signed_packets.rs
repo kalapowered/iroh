@@ -1705,14 +1705,20 @@ mod tests {
         assert_eq!(stored.expect("upsert"), Upsert::Stored);
 
         // The commit of the first packet is done before the disk fails; then a commit fails, and
-        // the open that follows is held.
+        // the open that follows is held. The publication that meets the failure and the request
+        // after it stand inside the same limit as the checks below: a writer that waits for the
+        // open fails the case on that limit and does not hang it.
         barrier(&store).await;
         disk.set(Disk::NoWrites);
-        let _ = store.upsert(packet_for(&SecretKey::generate(), now)).await;
-        barrier(&store).await;
+        let limit = Duration::from_secs(30);
+        let failure = async {
+            let _ = store.upsert(packet_for(&SecretKey::generate(), now)).await;
+            barrier(&store).await;
+        };
+        let answered = tokio::time::timeout(limit, failure).await;
+        answered.expect("the writer did not answer while the open was held");
 
         // Every request is refused at once, and none waits for the open.
-        let limit = Duration::from_secs(30);
         for _ in 0..3 {
             let read = tokio::time::timeout(limit, store.get(&endpoint_key(&kept))).await;
             assert!(read.expect("a read waited for the open").is_err());

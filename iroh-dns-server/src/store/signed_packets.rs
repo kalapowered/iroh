@@ -1691,14 +1691,9 @@ mod tests {
             reopen,
         )
         .expect("a store");
-        // Let the gate go when the test ends, so that a failing test does not wait for it.
-        struct Release(std::sync::mpsc::Sender<()>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                self.0.send(()).ok();
-            }
-        }
-        let _release = Release(release.clone());
+        // The sender is bound again after the store, so that it is dropped before the store is: with
+        // it gone every held open goes at once, and a failing test does not wait for them.
+        let release = release;
         let now = Timestamp::now().as_micros();
         let kept = SecretKey::generate();
         let stored = store.upsert(packet_for(&kept, now)).await;
@@ -1771,12 +1766,19 @@ mod tests {
             reopen,
         )
         .expect("a store");
+        // The sender is bound again after the store, so that it is dropped before the store is: with
+        // it gone every held open goes at once, and a failing test does not wait for them.
+        let release = release;
         let now = Timestamp::now().as_micros();
 
-        // A commit fails, and the attempt that follows is held.
+        // A commit fails, and the attempt that follows is held. The writer answers meanwhile.
         disk.set(Disk::NoWrites);
-        let _ = store.upsert(packet_for(&SecretKey::generate(), now)).await;
-        barrier(&store).await;
+        let failure = async {
+            let _ = store.upsert(packet_for(&SecretKey::generate(), now)).await;
+            barrier(&store).await;
+        };
+        let answered = tokio::time::timeout(Duration::from_secs(30), failure).await;
+        answered.expect("the writer did not answer while the open was held");
         assert_eq!(metrics.store_reopens.get(), 1);
 
         // The attempt has now lasted as long as the pause, and then it ends without a database.

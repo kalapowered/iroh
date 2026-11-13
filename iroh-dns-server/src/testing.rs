@@ -51,6 +51,8 @@ pub(crate) enum Disk {
     NoNewBlocks,
     /// Every write and sync is refused.
     NoWrites,
+    /// Writes work and every sync is refused: a commit can reach the file and still fail.
+    NoSync,
     /// The file cannot grow: a file system that reserves the space of a file when it is
     /// extended refuses the extension.
     NoGrowth,
@@ -113,7 +115,10 @@ impl redb::StorageBackend for FullDisk {
     }
 
     fn sync_data(&self) -> std::io::Result<()> {
-        if *self.mode.lock().expect("mode") == Disk::NoWrites {
+        if matches!(
+            *self.mode.lock().expect("mode"),
+            Disk::NoWrites | Disk::NoSync
+        ) {
             return Err(Self::refused());
         }
         self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

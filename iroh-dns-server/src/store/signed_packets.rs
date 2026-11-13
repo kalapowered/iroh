@@ -92,8 +92,9 @@ enum Message {
     },
 }
 
-/// Opens the database again after it failed.
-type Reopen = Box<dyn FnMut() -> Result<Database> + Send>;
+/// Opens the database again after it failed. It runs on a thread of its own: after an I/O error
+/// redb repairs the whole file on open, which takes as long as the file is big.
+type Reopen = Arc<dyn Fn() -> Result<Database> + Send + Sync>;
 
 /// The answer to a publication: what to send, and the caller to send it to.
 type Ack = (oneshot::Sender<Upsert>, Upsert);
@@ -102,7 +103,13 @@ struct Actor {
     /// The database, or `None` while a reopen after a failure has not worked.
     db: Option<Database>,
     reopen: Reopen,
+    /// The open that is running, and where its result arrives.
+    reopening: Option<std::sync::mpsc::Receiver<Result<Database>>>,
+    /// When the last open ended, for the pause before the next.
     last_reopen: Option<Instant>,
+    /// The number of packets the last commit holds, which the count shows after a batch is rolled
+    /// back and the database has not been read again.
+    committed: i64,
     /// Set when a batch has failed, until a batch that changed the store has committed. A
     /// publication is acknowledged before its batch commits, which is what makes a batch fast;
     /// while this is set, each batch holds one message and its answer waits for the commit, so a
@@ -240,6 +247,7 @@ impl Actor {
         }
         drop(tables);
         transaction.commit().anyerr()?;
+        self.committed = self.metrics.store_packets.get();
         for (res, outcome) in waiting {
             res.send(outcome).ok();
         }
@@ -254,6 +262,8 @@ impl Actor {
     fn failed(&mut self, err: AnyError) {
         self.metrics.store_failures.inc();
         self.failing = true;
+        // The count shown included the rolled back batch.
+        self.metrics.store_packets.set(self.committed);
         error!("packet store write failed, the open batch is rolled back: {err:#}");
         // redb refuses every later operation on a handle after an I/O error, so a handle that
         // can no longer start a write is dropped (which releases the file) and replaced.
@@ -266,28 +276,58 @@ impl Actor {
         }
     }
 
-    /// Open the database again, unless the last attempt was less than the pause ago.
+    /// Take the result of the open that is running, or start one unless the last ended less than
+    /// the pause ago.
+    ///
+    /// The open does not run on the writer's thread: the writer goes on answering while it runs,
+    /// every request it cannot serve with an error, so a lookup fails at once and does not wait for
+    /// a repair of the file.
     fn try_reopen(&mut self) {
+        if let Some(running) = &self.reopening {
+            let result = match running.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(anyerr!(
+                    "the thread that opens the database ended without an answer"
+                )),
+            };
+            self.reopening = None;
+            self.last_reopen = Some(Instant::now());
+            match result {
+                Ok(db) => {
+                    info!("packet database reopened");
+                    self.db = Some(db);
+                    self.refresh_count();
+                }
+                Err(err) => warn!("packet database did not reopen: {err:#}"),
+            }
+            return;
+        }
         let paused = self
             .last_reopen
             .is_some_and(|at| at.elapsed() < self.options.reopen_pause);
         if paused {
             return;
         }
-        self.last_reopen = Some(Instant::now());
         self.metrics.store_reopens.inc();
-        match (self.reopen)() {
-            Ok(db) => {
-                info!("packet database reopened");
-                self.db = Some(db);
-                self.refresh_count();
+        let (send, recv) = std::sync::mpsc::channel();
+        let reopen = self.reopen.clone();
+        let spawned = std::thread::Builder::new()
+            .name("packet-store-reopen".into())
+            .spawn(move || {
+                send.send(reopen()).ok();
+            });
+        match spawned {
+            Ok(_) => self.reopening = Some(recv),
+            Err(err) => {
+                self.last_reopen = Some(Instant::now());
+                warn!("could not start the thread that opens the database: {err:#}");
             }
-            Err(err) => warn!("packet database did not reopen: {err:#}"),
         }
     }
 
     /// Publish the number of packets the last commit holds, after a batch that did not.
-    fn refresh_count(&self) {
+    fn refresh_count(&mut self) {
         let Some(db) = &self.db else { return };
         let count = db
             .begin_read()
@@ -297,6 +337,7 @@ impl Actor {
         match count {
             Ok(count) => {
                 self.metrics.store_packets.set(count as i64);
+                self.committed = count as i64;
             }
             Err(err) => warn!("could not read the number of packets: {err:#}"),
         }
@@ -499,7 +540,7 @@ impl Snapshot {
 /// The reopen of a store that is not in a file: there is nothing to open again.
 #[cfg(test)]
 fn no_reopen() -> Reopen {
-    Box::new(|| Err(anyerr!("an in-memory packet store cannot be opened again")))
+    Arc::new(|| Err(anyerr!("an in-memory packet store cannot be opened again")))
 }
 
 impl SignedPacketStore {
@@ -523,9 +564,10 @@ impl SignedPacketStore {
             .create(path)
             .std_context("failed to open packet database")?;
         let path = path.to_path_buf();
-        let reopen: Reopen = Box::new(move || {
+        // Open, and not create: a file that is gone is not an empty store to carry on with.
+        let reopen: Reopen = Arc::new(move || {
             Database::builder()
-                .create(&path)
+                .open(&path)
                 .std_context("failed to reopen packet database")
         });
         Self::open(db, options, metrics, on_change, true, reopen)
@@ -568,14 +610,33 @@ impl SignedPacketStore {
         on_change: OnChange,
         run_eviction_task: bool,
     ) -> Result<Self> {
-        let db = Database::builder()
-            .create_with_backend(backend.clone())
-            .anyerr()?;
-        let reopen: Reopen = Box::new(move || {
+        let again = backend.clone();
+        let reopen: Reopen = Arc::new(move || {
             Database::builder()
-                .create_with_backend(backend.clone())
+                .create_with_backend(again.clone())
                 .anyerr()
         });
+        Self::with_backend_and_reopen(
+            backend,
+            options,
+            metrics,
+            on_change,
+            run_eviction_task,
+            reopen,
+        )
+    }
+
+    /// [`Self::with_backend`] with the function that opens the database again named.
+    #[cfg(test)]
+    pub(crate) fn with_backend_and_reopen(
+        backend: impl redb::StorageBackend,
+        options: Options,
+        metrics: Arc<Metrics>,
+        on_change: OnChange,
+        run_eviction_task: bool,
+        reopen: Reopen,
+    ) -> Result<Self> {
+        let db = Database::builder().create_with_backend(backend).anyerr()?;
         Self::open(db, options, metrics, on_change, run_eviction_task, reopen)
     }
 
@@ -603,7 +664,9 @@ impl SignedPacketStore {
         let actor = Actor {
             db: Some(db),
             reopen,
+            reopening: None,
             last_reopen: None,
+            committed: stored as i64,
             failing: false,
             recv: PeekableReceiver::new(recv),
             cancel: cancel2,
@@ -1278,6 +1341,23 @@ mod tests {
         let _ = store.get(&endpoint_key(&SecretKey::generate())).await;
     }
 
+    /// Wait until the writer answers a read again. The database opens again on a thread of its
+    /// own, so the requests after a failure are refused until it has: the wait ends on that, and
+    /// its limit is one that only a hang reaches.
+    async fn recovered(store: &SignedPacketStore) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while store
+                .get(&endpoint_key(&SecretKey::generate()))
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the store did not recover");
+    }
+
     fn packet_for(endpoint: &SecretKey, micros: u64) -> SignedPacket {
         signed_packet_at(endpoint, micros, "relay")
     }
@@ -1301,6 +1381,7 @@ mod tests {
         }
         assert!(metrics.store_failures.get() >= 1);
         disk.set(Disk::Healthy);
+        recovered(&store).await;
 
         // Without a restart: reads, eviction and publication work, and none of what was
         // published while the disk was full is there.
@@ -1344,6 +1425,7 @@ mod tests {
         }
         let refused = refused.expect("the file never needed to grow");
         disk.set(Disk::Healthy);
+        recovered(&store).await;
 
         // The refused publication was not stored and the cache was not told of it; the writer
         // goes on, and the count is what the store holds.
@@ -1412,7 +1494,11 @@ mod tests {
         let stored = store.upsert(packet_for(&endpoints[3], now)).await;
         assert_eq!(stored.expect("upsert"), Upsert::Stored);
         barrier(&store).await;
+        // The count shows the commit and not the batch that was rolled back, whether or not the
+        // database has opened again.
+        assert_eq!(metrics.store_packets.get(), 2);
         disk.set(Disk::Healthy);
+        recovered(&store).await;
 
         // The store holds what was committed, the count says so, and the ceiling counts the same.
         for (endpoint, held) in endpoints.iter().zip([true, true, false, false]) {
@@ -1472,6 +1558,7 @@ mod tests {
         let _ = store.upsert(packet_for(&SecretKey::generate(), now)).await;
         barrier(&store).await;
         disk.set(Disk::Healthy);
+        recovered(&store).await;
 
         // While the writer is failing a publication is committed, and the database synced,
         // before it is answered.
@@ -1501,6 +1588,7 @@ mod tests {
         let _ = store.evict_expired().await;
         assert!(metrics.store_failures.get() >= 1);
         disk.set(Disk::Healthy);
+        recovered(&store).await;
 
         store.evict_expired().await.expect("the next pass runs");
         assert!(
@@ -1537,5 +1625,109 @@ mod tests {
         evict_loop(pass, Duration::from_millis(1), writer_gone).await;
 
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_that_reaches_the_file_and_fails_to_sync_leaves_the_store_whole() {
+        let disk = FullDisk::default();
+        let (store, metrics) = disk_store(&disk, 2, 10, Duration::ZERO, no_hook());
+        let now = Timestamp::now().as_micros();
+        let endpoints: Vec<_> = (0..4).map(|_| SecretKey::generate()).collect();
+
+        for endpoint in &endpoints[..3] {
+            let stored = store.upsert(packet_for(endpoint, now)).await;
+            assert_eq!(stored.expect("upsert"), Upsert::Stored);
+        }
+        // The third was the first of a batch of two, and the fourth completes it: the commit
+        // writes its pages and fails at the sync.
+        disk.set(Disk::NoSync);
+        let stored = store.upsert(packet_for(&endpoints[3], now)).await;
+        assert_eq!(stored.expect("upsert"), Upsert::Stored);
+        barrier(&store).await;
+        disk.set(Disk::Healthy);
+        recovered(&store).await;
+
+        // The batch is in the file or it is not, and the count says which: a commit that failed at
+        // its end may still be there once the database is read again.
+        let mut present = 0;
+        for endpoint in &endpoints {
+            if store
+                .get(&endpoint_key(endpoint))
+                .await
+                .expect("get")
+                .is_some()
+            {
+                present += 1;
+            }
+        }
+        assert!(present == 2 || present == 4, "half a batch is in the store");
+        assert_eq!(metrics.store_packets.get(), present);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopen_that_takes_long_does_not_hold_the_writer() {
+        // The database opens again only when the test lets it.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let disk = FullDisk::default();
+        let again = disk.clone();
+        let reopen: Reopen = Arc::new(move || {
+            held.lock().expect("gate").recv().ok();
+            Database::builder()
+                .create_with_backend(again.clone())
+                .anyerr()
+        });
+        let metrics = Arc::new(Metrics::default());
+        let store = SignedPacketStore::with_backend_and_reopen(
+            disk.clone(),
+            Options {
+                max_batch_size: 1,
+                max_batch_time: Duration::from_secs(3600),
+                reopen_pause: Duration::ZERO,
+                ..Options::default()
+            },
+            metrics.clone(),
+            no_hook(),
+            false,
+            reopen,
+        )
+        .expect("a store");
+        // Let the gate go when the test ends, so that a failing test does not wait for it.
+        struct Release(std::sync::mpsc::Sender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.send(()).ok();
+            }
+        }
+        let _release = Release(release.clone());
+        let now = Timestamp::now().as_micros();
+        let kept = SecretKey::generate();
+        let stored = store.upsert(packet_for(&kept, now)).await;
+        assert_eq!(stored.expect("upsert"), Upsert::Stored);
+
+        // The commit of the first packet is done before the disk fails; then a commit fails, and
+        // the open that follows is held.
+        barrier(&store).await;
+        disk.set(Disk::NoWrites);
+        let _ = store.upsert(packet_for(&SecretKey::generate(), now)).await;
+        barrier(&store).await;
+
+        // Every request is refused at once, and none waits for the open.
+        let limit = Duration::from_secs(30);
+        for _ in 0..3 {
+            let read = tokio::time::timeout(limit, store.get(&endpoint_key(&kept))).await;
+            assert!(read.expect("a read waited for the open").is_err());
+            let write = store.upsert(packet_for(&SecretKey::generate(), now));
+            let write = tokio::time::timeout(limit, write).await;
+            assert!(write.expect("a publication waited for the open").is_err());
+        }
+        assert_eq!(metrics.store_reopens.get(), 1, "a second open started");
+
+        // The open ends, and the store answers what it holds.
+        disk.set(Disk::Healthy);
+        release.send(()).expect("gate");
+        recovered(&store).await;
+        let found = store.get(&endpoint_key(&kept)).await;
+        assert!(found.expect("get").is_some());
     }
 }

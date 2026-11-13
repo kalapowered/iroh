@@ -921,6 +921,14 @@ mod tests {
             assert_eq!(found.as_deref(), Some("relay=old"));
         }
         disk.set(Disk::Healthy);
+        // The database opens again on a thread of its own: wait until it answers.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while store.get_signed_packet(&key(&other)).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the store did not recover");
 
         // The store answers again from what it committed, and what was lost is gone.
         assert_eq!(

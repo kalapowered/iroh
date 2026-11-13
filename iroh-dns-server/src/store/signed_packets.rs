@@ -1735,4 +1735,71 @@ mod tests {
         let found = store.get(&endpoint_key(&kept)).await;
         assert!(found.expect("get").is_some());
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pause_before_a_new_attempt_starts_when_an_attempt_ends() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The first attempt is held for longer than the pause and then fails; a later one fails
+        // at once.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let first = AtomicBool::new(true);
+        let ended = Arc::new(AtomicBool::new(false));
+        let attempt_ended = ended.clone();
+        let reopen: Reopen = Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                held.lock().expect("gate").recv().ok();
+            }
+            attempt_ended.store(true, Ordering::SeqCst);
+            Err(anyerr!("the database did not open"))
+        });
+        let disk = FullDisk::default();
+        let pause = Duration::from_secs(3);
+        let metrics = Arc::new(Metrics::default());
+        let store = SignedPacketStore::with_backend_and_reopen(
+            disk.clone(),
+            Options {
+                max_batch_size: 1,
+                max_batch_time: Duration::from_secs(3600),
+                reopen_pause: pause,
+                ..Options::default()
+            },
+            metrics.clone(),
+            no_hook(),
+            false,
+            reopen,
+        )
+        .expect("a store");
+        let now = Timestamp::now().as_micros();
+
+        // A commit fails, and the attempt that follows is held.
+        disk.set(Disk::NoWrites);
+        let _ = store.upsert(packet_for(&SecretKey::generate(), now)).await;
+        barrier(&store).await;
+        assert_eq!(metrics.store_reopens.get(), 1);
+
+        // The attempt has now lasted as long as the pause, and then it ends without a database.
+        tokio::time::sleep(pause).await;
+        release.send(()).expect("gate");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !ended.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the attempt did not end");
+
+        // The pause runs from the end of the attempt, so the requests that follow it start no new
+        // one. A pause that ran from the start of the attempt would be over by now.
+        for _ in 0..100 {
+            let read = store.get(&endpoint_key(&SecretKey::generate())).await;
+            assert!(read.is_err(), "a request was served without a database");
+        }
+        assert_eq!(
+            metrics.store_reopens.get(),
+            1,
+            "an attempt started inside the pause after the last one ended"
+        );
+    }
 }

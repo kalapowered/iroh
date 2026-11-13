@@ -1661,6 +1661,17 @@ mod tests {
         assert_eq!(held[2], held[3], "half a batch is in the store");
         let present = held.iter().filter(|is_held| **is_held).count() as i64;
         assert_eq!(metrics.store_packets.get(), present);
+
+        // A later batch that fails leaves the count at what the file holds, the batch that was
+        // kept included: the count to go back to is the one read when the database opened again.
+        disk.set(Disk::NoWrites);
+        let refused = store.upsert(packet_for(&SecretKey::generate(), now)).await;
+        assert!(
+            refused.is_err(),
+            "a publication was answered with the disk failing"
+        );
+        barrier(&store).await;
+        assert_eq!(metrics.store_packets.get(), present);
     }
 
     #[tokio::test(flavor = "multi_thread")]

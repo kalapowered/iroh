@@ -1647,20 +1647,19 @@ mod tests {
         disk.set(Disk::Healthy);
         recovered(&store).await;
 
-        // The batch is in the file or it is not, and the count says which: a commit that failed at
-        // its end may still be there once the database is read again.
-        let mut present = 0;
+        // The commit failed, and the two packets committed before it are still there.
+        assert!(metrics.store_failures.get() >= 1, "no commit failed");
+        let mut held = Vec::new();
         for endpoint in &endpoints {
-            if store
-                .get(&endpoint_key(endpoint))
-                .await
-                .expect("get")
-                .is_some()
-            {
-                present += 1;
-            }
+            let stored = store.get(&endpoint_key(endpoint)).await.expect("get");
+            held.push(stored.is_some());
         }
-        assert!(present == 2 || present == 4, "half a batch is in the store");
+        assert_eq!(held[..2], [true, true], "a packet committed before is lost");
+        // The batch is in the file or it is not, and the count says which: a commit that failed at
+        // its end may still be there once the database is read again, the whole batch or none of
+        // it.
+        assert_eq!(held[2], held[3], "half a batch is in the store");
+        let present = held.iter().filter(|is_held| **is_held).count() as i64;
         assert_eq!(metrics.store_packets.get(), present);
     }
 

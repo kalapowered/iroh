@@ -932,6 +932,60 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn the_metrics_name_the_count_the_ceiling_and_the_refusals() -> Result {
+        use iroh_metrics::{MetricsSource, Registry};
+
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let store = ZoneStore::in_memory_manual_eviction(
+            Options {
+                max_batch_size: 1,
+                max_batch_time: Duration::from_secs(3600),
+                eviction: Duration::from_secs(24 * 3600),
+                max_packets: 2,
+                ..Options::default()
+            },
+            metrics.clone(),
+        )?;
+        let now = now_micros();
+        for _ in 0..2 {
+            publish(
+                &store,
+                signed_packet_at(&SecretKey::generate(), now, "relay"),
+            )
+            .await?;
+        }
+        let refused = publish(
+            &store,
+            signed_packet_at(&SecretKey::generate(), now, "late"),
+        )
+        .await;
+        assert!(matches!(
+            refused.expect_err("refused").downcast_ref::<InsertError>(),
+            Some(InsertError::StoreFull { max_packets: 2, .. })
+        ));
+
+        // What the metrics endpoint serves is this text.
+        let mut registry = Registry::default();
+        registry.register(metrics.clone());
+        let text = registry
+            .encode_openmetrics_to_string()
+            .expect("metrics encode");
+        for line in [
+            "dns_server_store_packets 2",
+            "dns_server_store_packets_max 2",
+            "dns_server_pkarr_publish_store_full_total 1",
+            "dns_server_store_failures_total 0",
+            "dns_server_store_reopens_total 0",
+        ] {
+            assert!(
+                text.lines().any(|l| l == line),
+                "no line `{line}` in:\n{text}"
+            );
+        }
+        Ok(())
+    }
+
     fn zone_of(secret_key: &SecretKey, relay: &str) -> super::CachedZone {
         super::CachedZone::from_signed_packet(&signed_packet_at(secret_key, now_micros(), relay))
             .expect("a zone")

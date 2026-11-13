@@ -354,6 +354,7 @@ impl Actor {
                         let held = tables.signed_packets.len().anyerr()?;
                         if held >= self.options.max_packets as u64 {
                             debug!("refused {key}: the store holds {held} packets");
+                            self.metrics.pkarr_publish_store_full.inc();
                             return Ok(Some((res, Upsert::Full)));
                         }
                         false
@@ -593,6 +594,7 @@ impl SignedPacketStore {
         drop(tables);
         write_tx.commit().anyerr()?;
         metrics.store_packets.set(stored as i64);
+        metrics.store_packets_max.set(options.max_packets as i64);
         let (send, recv) = mpsc::channel(1024);
         let send2 = send.clone();
         let cancel = CancellationToken::new();

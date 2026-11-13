@@ -11,6 +11,9 @@ pub struct Metrics {
     pub pkarr_publish_update: Counter,
     /// Number of pkarr relay puts that did not change the stored packet.
     pub pkarr_publish_noop: Counter,
+    /// Number of pkarr relay puts refused because the store held its largest number of packets
+    /// and none for the endpoint.
+    pub pkarr_publish_store_full: Counter,
     /// Number of pkarr relay puts refused because the packet was signed too far ahead of the
     /// server's clock.
     pub pkarr_publish_timestamp_ahead: Counter,
@@ -48,6 +51,8 @@ pub struct Metrics {
     pub store_packets_expired: Counter,
     /// Current number of signed packets in the store.
     pub store_packets: Gauge,
+    /// The most signed packets the store holds, as configured.
+    pub store_packets_max: Gauge,
     /// Number of write batches that failed and were rolled back.
     pub store_failures: Counter,
     /// Number of times the store tried to open its database again after a failure, whether or

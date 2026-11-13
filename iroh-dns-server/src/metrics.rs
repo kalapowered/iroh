@@ -48,6 +48,11 @@ pub struct Metrics {
     pub store_packets_expired: Counter,
     /// Current number of signed packets in the store.
     pub store_packets: Gauge,
+    /// Number of write batches that failed and were rolled back.
+    pub store_failures: Counter,
+    /// Number of times the store tried to open its database again after a failure, whether or
+    /// not it worked.
+    pub store_reopens: Counter,
     /// Current number of zones in the main cache
     pub cache_zones: Gauge,
     /// Current number of zones in the DHT cache

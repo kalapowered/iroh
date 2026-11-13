@@ -151,6 +151,24 @@ impl ZoneStore {
         Ok(Self::new(packet_store, cache, metrics))
     }
 
+    /// Create a store over a database file that a test controls.
+    #[cfg(test)]
+    pub(crate) fn with_backend(
+        backend: impl redb::StorageBackend + Clone,
+        options: Options,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self> {
+        let cache = new_cache(&metrics);
+        let packet_store = SignedPacketStore::with_backend(
+            backend,
+            options,
+            metrics.clone(),
+            invalidator(&cache),
+            false,
+        )?;
+        Ok(Self::new(packet_store, cache, metrics))
+    }
+
     /// Configure a mainline DHT client for resolution of packets as a fallback.
     ///
     /// This will be used only as a fallback if there is no local info available.
@@ -586,7 +604,7 @@ mod tests {
         InsertError, MAX_TIMESTAMP_AHEAD, Options, PacketSource, ZoneStore, check_timestamp_ahead,
     };
     use crate::{
-        testing::{DAY_MICROS, now_micros, signed_packet_at},
+        testing::{DAY_MICROS, Disk, FullDisk, now_micros, signed_packet_at},
         util::PublicKeyBytes,
     };
 
@@ -839,6 +857,78 @@ mod tests {
             lookup(&store, &endpoint).await?.as_deref(),
             Some("relay=current")
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn during_a_storage_failure_the_cache_answers_and_holds_nothing_the_store_lacks() -> Result
+    {
+        let disk = FullDisk::default();
+        // A batch is four messages, a lookup that reaches the store among them.
+        let store = ZoneStore::with_backend(
+            disk.clone(),
+            Options {
+                max_batch_size: 4,
+                max_batch_time: Duration::from_secs(3600),
+                reopen_pause: Duration::ZERO,
+                ..Options::default()
+            },
+            Default::default(),
+        )?;
+        let (replaced, unrelated, other) = (
+            SecretKey::generate(),
+            SecretKey::generate(),
+            SecretKey::generate(),
+        );
+        let now = now_micros();
+
+        // A batch that commits: two packets, and a lookup of each that fills the cache.
+        publish(&store, signed_packet_at(&replaced, now, "old")).await?;
+        publish(&store, signed_packet_at(&unrelated, now, "unrelated")).await?;
+        assert_eq!(
+            lookup(&store, &replaced).await?.as_deref(),
+            Some("relay=old")
+        );
+        assert_eq!(
+            lookup(&store, &unrelated).await?.as_deref(),
+            Some("relay=unrelated")
+        );
+
+        // A batch that fails at its commit: a replacement the writer applies and answers, and
+        // that a lookup caches from the open batch; a new packet, and a lookup of it.
+        publish(&store, signed_packet_at(&replaced, now + 1, "new")).await?;
+        disk.set(Disk::NoWrites);
+        assert_eq!(
+            lookup(&store, &replaced).await?.as_deref(),
+            Some("relay=new")
+        );
+        publish(&store, signed_packet_at(&other, now, "other")).await?;
+        assert_eq!(
+            lookup(&store, &other).await?.as_deref(),
+            Some("relay=other")
+        );
+        // The writer takes messages in order: this one is answered (or refused) after the failed
+        // batch is rolled back and the cache has been told.
+        let _ = store.get_signed_packet(&key(&other)).await;
+
+        // The batch is gone, and the cache was told about both of its keys, so it holds neither
+        // answer. Another endpoint's cached zone answers whatever the store does.
+        assert_eq!(
+            lookup(&store, &unrelated).await?.as_deref(),
+            Some("relay=unrelated")
+        );
+        if let Ok(found) = lookup(&store, &replaced).await {
+            assert_eq!(found.as_deref(), Some("relay=old"));
+        }
+        disk.set(Disk::Healthy);
+
+        // The store answers again from what it committed, and what was lost is gone.
+        assert_eq!(
+            lookup(&store, &replaced).await?.as_deref(),
+            Some("relay=old")
+        );
+        assert_eq!(lookup(&store, &other).await?, None);
+        assert!(store.get_signed_packet(&key(&other)).await?.is_none());
         Ok(())
     }
 

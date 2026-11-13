@@ -145,6 +145,7 @@ impl From<StoreConfig> for Options {
             eviction: value.eviction,
             eviction_interval: value.eviction_interval,
             max_packets: value.max_packets,
+            ..Options::default()
         }
     }
 }

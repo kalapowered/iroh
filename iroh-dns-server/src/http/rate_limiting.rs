@@ -22,10 +22,8 @@ pub enum RateLimitConfig {
     Disabled,
     /// Rate limits by the connection's peer IP address.
     ///
-    /// For publications the key is the peer address itself, see [`PeerIpKeyExtractor`]. For
-    /// lookups it is the peer address's network: an IPv4 address, or the /64 of an IPv6 address.
-    ///
-    /// [`PeerIpKeyExtractor`]: https://docs.rs/tower_governor/latest/tower_governor/key_extractor/struct.PeerIpKeyExtractor.html
+    /// For publications and lookups alike the key is the peer address's network: an IPv4 address
+    /// (an IPv4 address that arrives IPv6-mapped counts as IPv4), or the /64 of an IPv6 address.
     #[default]
     Simple,
     /// Rate limits by the client IP, extracted from reverse-proxy headers.
@@ -34,7 +32,7 @@ pub enum RateLimitConfig {
     /// `X-Forwarded-For`) to extract the original client IP, falling back to the connection's
     /// peer IP address, and then maps it to its network as `Simple` does. See
     /// [`SmartIpKeyExtractor`]. For publications the headers are not read and this keys on the
-    /// peer address, as `Simple` does.
+    /// peer address's network, as `Simple` does.
     ///
     /// [`SmartIpKeyExtractor`]: https://docs.rs/tower_governor/latest/tower_governor/key_extractor/struct.SmartIpKeyExtractor.html
     Smart,
@@ -76,13 +74,14 @@ pub(super) const LOOKUP_QUOTA: Quota = Quota {
     burst: 100,
 };
 
-/// Create the rate-limiting layer for publications, which keys on the connection's peer address.
+/// Create the rate-limiting layer for publications, which keys on the network of the connection's
+/// peer address and never reads forwarding headers.
 ///
 /// This spawns a background thread to clean up the rate limiting cache.
 pub(super) fn create<RespBody>(
     rate_limit_config: &RateLimitConfig,
     quota: Quota,
-) -> Option<GovernorLayer<PeerIpKeyExtractor, NoOpMiddleware<QuantaInstant>, RespBody>> {
+) -> Option<GovernorLayer<SourceNetwork, NoOpMiddleware<QuantaInstant>, RespBody>> {
     match rate_limit_config {
         RateLimitConfig::Disabled => {
             tracing::info!("Rate limiting disabled");
@@ -90,7 +89,12 @@ pub(super) fn create<RespBody>(
         }
         RateLimitConfig::Simple | RateLimitConfig::Smart => {
             tracing::info!("Rate limiting enabled ({rate_limit_config:?})");
-            Some(layer(PeerIpKeyExtractor, quota))
+            Some(layer(
+                SourceNetwork {
+                    trust_forwarding_headers: false,
+                },
+                quota,
+            ))
         }
     }
 }
@@ -156,7 +160,8 @@ where
 /// given. An IPv4 address that arrives IPv6-mapped, as it does on a dual-stack listener, is an
 /// IPv4 address.
 ///
-/// Keying on the full IPv6 address would let one subscriber use a fresh key for every request.
+/// Keying on the full IPv6 address would let one subscriber use a fresh key for every request,
+/// and so a fresh quota.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SourceNetwork {
     /// Take the client address from the headers a reverse proxy sets, when there are any, and

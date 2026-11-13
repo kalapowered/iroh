@@ -23,8 +23,10 @@ packet origin will be appended with the origin as configured by this server.
 
 ## Limits
 
-- **Publications** (`PUT /pkarr/{key}`) are limited per peer address by
-  `pkarr_put_rate_limit`: one request every four seconds, two at once.
+- **Publications** (`PUT /pkarr/{key}`) are limited by `pkarr_put_rate_limit`: one request every
+  four seconds, two at once, for each source network. A source network is the IPv4 address of
+  the connection or the IPv6 /64 of it, as for lookups (an IPv4 address that arrives IPv6-mapped
+  counts as IPv4). Forwarding headers are never read for publications.
 - **Lookups** (`GET /pkarr/{key}` and `/dns-query` by `GET` and `POST`) are limited by
   `lookup_rate_limit`: 50 a second, 100 at once, one quota per source shared by the three
   routes. With `simple`, a source is the IPv4 address of the connection, or the IPv6 /64 of it

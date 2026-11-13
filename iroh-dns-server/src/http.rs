@@ -499,6 +499,11 @@ mod tests {
     mod rate_limits {
         use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+        use axum::{
+            extract::{ConnectInfo, Request},
+            middleware::{self, Next},
+            response::Response,
+        };
         use http::StatusCode;
         use iroh::SecretKey;
         use n0_error::{Result, StdResultExt};
@@ -512,6 +517,21 @@ mod tests {
             state::AppState,
             store::{Options, ZoneStore},
         };
+
+        /// Let a test name the address a request comes from, in the `x-test-peer` header: a
+        /// local connection can only come from the loopback address, and the limits key on the
+        /// source address.
+        async fn peer_from_header(mut req: Request, next: Next) -> Response {
+            let peer = req
+                .headers()
+                .get("x-test-peer")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<SocketAddr>().ok());
+            if let Some(peer) = peer {
+                req.extensions_mut().insert(ConnectInfo(peer));
+            }
+            next.run(req).await
+        }
 
         /// A quota that replenishes so slowly that only how many requests came decides.
         fn quota(burst: u32) -> Quota {
@@ -579,7 +599,8 @@ mod tests {
                 quota(put_burst),
                 quota(lookup_burst),
                 revision,
-            );
+            )
+            .layer(middleware::from_fn(peer_from_header));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .anyerr()?;
@@ -695,6 +716,21 @@ mod tests {
                 Ok(res.status())
             }
 
+            /// [`Self::put_pkarr`] from the source address `peer`, which the server takes as
+            /// the address of the connection.
+            async fn put_pkarr_from(&self, peer: &str) -> Result<StatusCode> {
+                let key = SecretKey::generate().public().to_z32();
+                let res = self
+                    .client
+                    .put(format!("http://{}/pkarr/{key}", self.addr))
+                    .header("x-test-peer", peer)
+                    .body("not a packet")
+                    .send()
+                    .await
+                    .anyerr()?;
+                Ok(res.status())
+            }
+
             /// A publication whose body is not a packet: the handler refuses it with a 400, so
             /// any other status is the limit's.
             async fn put_pkarr(&self) -> Result<StatusCode> {
@@ -780,6 +816,65 @@ mod tests {
                 assert_ne!(served.get_pkarr().await?, StatusCode::TOO_MANY_REQUESTS);
             }
             assert_eq!(served.metrics.lookup_rate_limited.get(), 0);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn the_addresses_of_one_ipv6_network_share_one_publication_quota() -> Result {
+            let served = serve(
+                limits(RateLimitConfig::Simple, RateLimitConfig::Disabled),
+                2,
+                1,
+            )
+            .await?;
+
+            // Three addresses of one /64: the quota of two is spent by the first two.
+            assert_eq!(
+                served.put_pkarr_from("[2001:db8:1:2::1]:5000").await?,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                served
+                    .put_pkarr_from("[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:5000")
+                    .await?,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                served.put_pkarr_from("[2001:db8:1:2:ffff::7]:5000").await?,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+
+            // The next /64 has a quota of its own.
+            assert_eq!(
+                served.put_pkarr_from("[2001:db8:1:3::1]:5000").await?,
+                StatusCode::BAD_REQUEST
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn an_ipv4_address_has_its_own_publication_quota_whichever_way_it_arrives() -> Result
+        {
+            let served = serve(
+                limits(RateLimitConfig::Simple, RateLimitConfig::Disabled),
+                2,
+                1,
+            )
+            .await?;
+
+            // An IPv4 client on a dual-stack listener arrives IPv6-mapped. It is one source with
+            // the same address in its plain form, and another IPv4 address is another source.
+            for peer in ["[::ffff:203.0.113.7]:5000", "203.0.113.7:5000"] {
+                assert_eq!(served.put_pkarr_from(peer).await?, StatusCode::BAD_REQUEST);
+            }
+            assert_eq!(
+                served.put_pkarr_from("[::ffff:203.0.113.7]:5001").await?,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(
+                served.put_pkarr_from("203.0.113.8:5000").await?,
+                StatusCode::BAD_REQUEST
+            );
             Ok(())
         }
 

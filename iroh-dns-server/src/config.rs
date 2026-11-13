@@ -58,6 +58,9 @@ pub struct Config {
     pub zone_store: Option<StoreConfig>,
 
     /// Rate limit applied to `PUT /pkarr` requests.
+    ///
+    /// Each source gets one publication every four seconds, two at once. A source is the IPv4
+    /// address of the connection or its IPv6 /64; forwarding headers are never read here.
     #[serde(default)]
     pub pkarr_put_rate_limit: RateLimitConfig,
 

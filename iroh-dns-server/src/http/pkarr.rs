@@ -40,6 +40,9 @@ pub(super) async fn put(
                 StatusCode::BAD_REQUEST,
                 Some(format!("{err}; check the device's clock")),
             ),
+            InsertError::StoreFull { .. } => {
+                AppError::new(StatusCode::SERVICE_UNAVAILABLE, Some(&err))
+            }
             err => AppError::from(AnyError::from_stack(err)),
         })?;
     info!(key = %label, ?updated, "pkarr upsert");

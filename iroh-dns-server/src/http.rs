@@ -551,6 +551,18 @@ mod tests {
         ) -> Result<Served> {
             let metrics = Arc::new(Metrics::default());
             let store = ZoneStore::in_memory(Options::default(), metrics.clone())?;
+            serve_store(limits, put_burst, lookup_burst, revision, store, metrics).await
+        }
+
+        /// Serve a store that the caller made, with the metrics it was made with.
+        pub(super) async fn serve_store(
+            limits: RateLimits,
+            put_burst: u32,
+            lookup_burst: u32,
+            revision: Option<&'static str>,
+            store: ZoneStore,
+            metrics: Arc<Metrics>,
+        ) -> Result<Served> {
             let state_store = store.clone();
             let state = AppState {
                 dns_handler: DnsHandler::new(
@@ -851,14 +863,18 @@ mod tests {
 
     /// What a publication is checked against before it is stored.
     mod publication {
+        use std::{sync::Arc, time::Duration};
+
         use http::StatusCode;
         use iroh::SecretKey;
         use n0_error::Result;
 
-        use super::rate_limits::{limits, serve};
+        use super::rate_limits::{limits, serve, serve_store};
         use crate::{
             http::RateLimitConfig,
-            testing::{now_micros, signed_packet_at},
+            metrics::Metrics,
+            store::{Options, ZoneStore},
+            testing::{DAY_MICROS, now_micros, signed_packet_at},
             util::PublicKeyBytes,
         };
 
@@ -895,6 +911,66 @@ mod tests {
             assert_eq!(status, StatusCode::NO_CONTENT);
             let stored = served.store.get_signed_packet(&key).await?.expect("stored");
             assert_eq!(stored.as_bytes(), corrected.as_bytes());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn at_its_ceiling_a_new_endpoint_is_told_to_try_later_and_everything_else_goes_on()
+        -> Result {
+            let metrics = Arc::new(Metrics::default());
+            let store = ZoneStore::in_memory_manual_eviction(
+                Options {
+                    max_batch_size: 1,
+                    max_batch_time: Duration::from_secs(3600),
+                    eviction: Duration::from_secs(24 * 3600),
+                    max_packets: 2,
+                    ..Options::default()
+                },
+                metrics.clone(),
+            )?;
+            let served = serve_store(unlimited(), 100, 100, None, store, metrics).await?;
+            let now = now_micros();
+            let stale = SecretKey::generate();
+            let honest = SecretKey::generate();
+            let stale_packet = signed_packet_at(&stale, now - 2 * DAY_MICROS, "stale");
+            let honest_packet = signed_packet_at(&honest, now, "honest");
+            for packet in [&stale_packet, &honest_packet] {
+                let (status, _) = served.put_packet(packet).await?;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+            }
+
+            // A new endpoint is refused with a status that says to try later, and not stored.
+            let newcomer = SecretKey::generate();
+            let newcomer_packet = signed_packet_at(&newcomer, now, "newcomer");
+            let (status, body) = served.put_packet(&newcomer_packet).await?;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                body.contains("try again later"),
+                "the answer says so: {body}"
+            );
+            let newcomer_key = PublicKeyBytes::new_unchecked(*newcomer.public().as_bytes());
+            assert!(
+                served
+                    .store
+                    .get_signed_packet(&newcomer_key)
+                    .await?
+                    .is_none()
+            );
+
+            // A replacement is taken, a stored endpoint is read, and the refusal is not the
+            // rate limit's.
+            let replacement = signed_packet_at(&honest, now + SECOND, "replacement");
+            let (status, _) = served.put_packet(&replacement).await?;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let honest_key = PublicKeyBytes::new_unchecked(*honest.public().as_bytes());
+            let stored = served.store.get_signed_packet(&honest_key).await?;
+            assert_eq!(stored.expect("stored").as_bytes(), replacement.as_bytes());
+            assert_eq!(served.metrics.lookup_rate_limited.get(), 0);
+
+            // Once eviction has made room, the same endpoint is taken.
+            served.store.evict_expired().await?;
+            let (status, _) = served.put_packet(&newcomer_packet).await?;
+            assert_eq!(status, StatusCode::NO_CONTENT);
             Ok(())
         }
 

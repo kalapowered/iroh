@@ -15,7 +15,7 @@ use n0_error::{Result, StdResultExt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::store::Options;
+use crate::store::{DEFAULT_MAX_PACKETS, Options};
 pub use crate::{
     dns::DnsConfig,
     http::{CertMode, HttpConfig, HttpsConfig, RateLimitConfig},
@@ -100,6 +100,20 @@ pub struct StoreConfig {
     /// Interval between runs of the eviction task.
     #[serde(with = "humantime_serde")]
     pub eviction_interval: Duration,
+
+    /// The most signed packets the store holds, one for each endpoint.
+    ///
+    /// At that number a publication for an endpoint the store holds no packet for is refused with
+    /// `503` and not stored, while a publication that replaces a stored packet, lookups, DNS
+    /// answers and eviction go on as before. Nothing is evicted early to make room: the store
+    /// takes new endpoints again once eviction has removed packets. A store that already holds
+    /// more than this number keeps what it holds.
+    #[serde(default = "default_max_packets")]
+    pub max_packets: usize,
+}
+
+fn default_max_packets() -> usize {
+    DEFAULT_MAX_PACKETS
 }
 
 impl Default for StoreConfig {
@@ -115,6 +129,7 @@ impl From<Options> for StoreConfig {
             max_batch_time: value.max_batch_time,
             eviction: value.eviction,
             eviction_interval: value.eviction_interval,
+            max_packets: value.max_packets,
         }
     }
 }
@@ -126,6 +141,7 @@ impl From<StoreConfig> for Options {
             max_batch_time: value.max_batch_time,
             eviction: value.eviction,
             eviction_interval: value.eviction_interval,
+            max_packets: value.max_packets,
         }
     }
 }
@@ -329,5 +345,33 @@ mod tests {
         )
         .expect("a configuration");
         assert!(matches!(config.lookup_rate_limit, RateLimitConfig::Simple));
+    }
+
+    #[test]
+    fn the_store_ceiling_is_set_by_the_configuration_and_defaults_when_it_is_not() {
+        let with = |zone_store: &str| -> Config {
+            toml::from_str(&format!(
+                r#"
+                [dns]
+                port = 53
+                default_soa = "a b 0 1 1 1 1"
+                default_ttl = 30
+                origins = ["."]
+
+                [zone_store]
+                max_batch_size = 1024
+                max_batch_time = "1s"
+                eviction = "1day"
+                eviction_interval = "10min"
+                {zone_store}
+                "#
+            ))
+            .expect("a configuration")
+        };
+        let set = Options::from(with("max_packets = 2000000").zone_store.expect("a store"));
+        assert_eq!(set.max_packets, 2_000_000);
+        // A file written before the setting existed still parses.
+        let unset = Options::from(with("").zone_store.expect("a store"));
+        assert_eq!(unset.max_packets, DEFAULT_MAX_PACKETS);
     }
 }

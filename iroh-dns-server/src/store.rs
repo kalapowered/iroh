@@ -16,7 +16,7 @@ use iroh_dns::pkarr::{SignedPacket, SignedPacketVerifyError, Timestamp};
 use lru::LruCache;
 use n0_error::{AnyError, Result, StdResultExt, e, stack_error};
 use n0_mainline::{Dht, DhtBuilder, MutableItem};
-pub(crate) use signed_packets::Options;
+pub(crate) use signed_packets::{DEFAULT_MAX_PACKETS, Options, Upsert};
 use tracing::{debug, info, trace, warn};
 use ttl_cache::TtlCache;
 
@@ -55,6 +55,11 @@ pub(crate) enum InsertError {
         MAX_TIMESTAMP_AHEAD.as_secs()
     )]
     TimestampAhead { ahead: Duration },
+    /// The store holds the most packets it is set to hold and none for this endpoint.
+    #[error(
+        "the store holds its limit of {max_packets} packets and takes none for an endpoint it does not hold yet; try again later"
+    )]
+    StoreFull { max_packets: usize },
     /// The packet store failed.
     #[error("the packet store failed")]
     Store { source: AnyError },
@@ -299,17 +304,23 @@ impl ZoneStore {
             );
             return Err(err);
         }
-        let updated = self
+        let outcome = self
             .store
             .upsert(signed_packet)
             .await
             .map_err(|source| e!(InsertError::Store, source))?;
-        if updated {
-            self.metrics.pkarr_publish_update.inc();
-            Ok(true)
-        } else {
-            self.metrics.pkarr_publish_noop.inc();
-            Ok(false)
+        match outcome {
+            Upsert::Stored => {
+                self.metrics.pkarr_publish_update.inc();
+                Ok(true)
+            }
+            Upsert::Unchanged => {
+                self.metrics.pkarr_publish_noop.inc();
+                Ok(false)
+            }
+            Upsert::Full => Err(e!(InsertError::StoreFull {
+                max_packets: self.store.max_packets()
+            })),
         }
     }
 }
@@ -589,6 +600,7 @@ mod tests {
             max_batch_time: Duration::from_secs(3600),
             eviction: Duration::from_secs(24 * 3600),
             eviction_interval: Duration::from_secs(3600),
+            ..Options::default()
         };
         ZoneStore::in_memory_manual_eviction(options, Default::default())
     }
@@ -760,11 +772,12 @@ mod tests {
 
         // A request that is dropped after its packet reached the store never runs the code after
         // `ZoneStore::insert`'s store call. Applying the packet to the store alone stands for it.
-        assert!(
+        assert_eq!(
             store
                 .store
                 .upsert(signed_packet_at(&endpoint, now + 1, "newer"))
-                .await?
+                .await?,
+            super::Upsert::Stored
         );
 
         assert!(!store.cached(&key(&endpoint)));

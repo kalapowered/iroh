@@ -8,7 +8,10 @@ use std::{
 
 use iroh_dns::pkarr::{SignedPacket, Timestamp};
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr};
-use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
@@ -24,6 +27,22 @@ type SignedPacketsKey = [u8; 32];
 /// be quick and must not wait for the store.
 pub(super) type OnChange = Arc<dyn Fn(&PublicKeyBytes) + Send + Sync>;
 
+/// The ceiling on the number of stored packets when the configuration sets none: a million
+/// endpoints, about a gigabyte of packets.
+pub(crate) const DEFAULT_MAX_PACKETS: usize = 1_000_000;
+
+/// What the store did with a packet it was offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Upsert {
+    /// The packet is stored, as a new endpoint or as a replacement of an older packet.
+    Stored,
+    /// The store holds a packet for the endpoint that is at least as recent: nothing changed.
+    Unchanged,
+    /// The store holds [`Options::max_packets`] packets or more and none for this endpoint:
+    /// nothing changed.
+    Full,
+}
+
 const SIGNED_PACKETS_TABLE: TableDefinition<&SignedPacketsKey, &[u8]> =
     TableDefinition::new("signed-packets-1");
 const UPDATE_TIME_TABLE: MultimapTableDefinition<[u8; 8], SignedPacketsKey> =
@@ -33,6 +52,7 @@ const UPDATE_TIME_TABLE: MultimapTableDefinition<[u8; 8], SignedPacketsKey> =
 pub(super) struct SignedPacketStore {
     send: mpsc::Sender<Message>,
     cancel: CancellationToken,
+    max_packets: usize,
     #[cfg(test)]
     options: Options,
     _write_thread: IoThread,
@@ -51,7 +71,7 @@ impl Drop for SignedPacketStore {
 enum Message {
     Upsert {
         packet: SignedPacket,
-        res: oneshot::Sender<bool>,
+        res: oneshot::Sender<Upsert>,
     },
     Get {
         key: PublicKeyBytes,
@@ -95,6 +115,10 @@ pub(crate) struct Options {
     pub(crate) eviction: Duration,
     /// Pause between eviction checks.
     pub(crate) eviction_interval: Duration,
+    /// The most packets the store holds. At that number a packet for an endpoint the store holds
+    /// no packet for is refused, and a packet for a held endpoint is still taken. Nothing is
+    /// evicted early to make room.
+    pub(crate) max_packets: usize,
 }
 
 impl Default for Options {
@@ -108,6 +132,7 @@ impl Default for Options {
             eviction: Duration::from_secs(3600 * 24 * 7),
             // eviction can run frequently since it does not do a full scan
             eviction_interval: Duration::from_secs(10),
+            max_packets: DEFAULT_MAX_PACKETS,
         }
     }
 }
@@ -156,6 +181,17 @@ impl Actor {
         Ok(())
     }
 
+    /// Publish the number of packets the open transaction holds.
+    ///
+    /// The count is the table's own length, which redb keeps in the table's root and changes
+    /// with every insert and removal, so it is exact, costs no scan, and is committed or rolled
+    /// back with the rest of the transaction.
+    fn record_count(&self, tables: &Tables) -> Result<()> {
+        let count = tables.signed_packets.len().anyerr()?;
+        self.metrics.store_packets.set(count as i64);
+        Ok(())
+    }
+
     fn handle_message(&self, msg: Message, tables: &mut Tables) -> Result<()> {
         match msg {
             Message::Get { key, res } => match get_packet(&tables.signed_packets, &key) {
@@ -174,7 +210,7 @@ impl Actor {
                 let replaced = match get_packet(&tables.signed_packets, &key)? {
                     Some(existing) => {
                         if existing.more_recent_than(&packet) {
-                            res.send(false).ok();
+                            res.send(Upsert::Unchanged).ok();
                             return Ok(());
                         } else {
                             // remove the old packet from the update time index
@@ -185,7 +221,16 @@ impl Actor {
                             true
                         }
                     }
-                    _ => false,
+                    None => {
+                        // A packet for an endpoint the store holds none for adds a record.
+                        let held = tables.signed_packets.len().anyerr()?;
+                        if held >= self.options.max_packets as u64 {
+                            debug!("refused {key}: the store holds {held} packets");
+                            res.send(Upsert::Full).ok();
+                            return Ok(());
+                        }
+                        false
+                    }
                 };
                 let value = serialize(&packet);
                 tables
@@ -201,20 +246,27 @@ impl Actor {
                 } else {
                     self.metrics.store_packets_inserted.inc();
                 }
+                self.record_count(tables)?;
                 (self.on_change)(&key);
-                res.send(true).ok();
+                res.send(Upsert::Stored).ok();
             }
             #[cfg(test)]
             Message::Remove { key, res } => {
                 trace!("remove {}", key);
-                let updated = match tables.signed_packets.remove(key.as_bytes()).anyerr()? {
-                    Some(row) => {
-                        let packet = deserialize(row.value())?;
+                let removed = tables
+                    .signed_packets
+                    .remove(key.as_bytes())
+                    .anyerr()?
+                    .map(|row| deserialize(row.value()))
+                    .transpose()?;
+                let updated = match removed {
+                    Some(packet) => {
                         tables
                             .update_time
                             .remove(&packet.timestamp().to_be_bytes(), key.as_bytes())
                             .anyerr()?;
                         self.metrics.store_packets_removed.inc();
+                        self.record_count(tables)?;
                         (self.on_change)(&key);
                         true
                     }
@@ -241,6 +293,7 @@ impl Actor {
                                 .anyerr()?;
                             let _ = tables.signed_packets.remove(key.as_bytes()).anyerr()?;
                             self.metrics.store_packets_expired.inc();
+                            self.record_count(tables)?;
                             (self.on_change)(&key);
                             debug!("removed expired packet {key}");
                         } else {
@@ -363,8 +416,11 @@ impl SignedPacketStore {
     ) -> Result<Self> {
         // create tables
         let write_tx = db.begin_write().anyerr()?;
-        let _ = Tables::new(&write_tx).anyerr()?;
+        let tables = Tables::new(&write_tx).anyerr()?;
+        let stored = tables.signed_packets.len().anyerr()?;
+        drop(tables);
         write_tx.commit().anyerr()?;
+        metrics.store_packets.set(stored as i64);
         let (send, recv) = mpsc::channel(1024);
         let send2 = send.clone();
         let cancel = CancellationToken::new();
@@ -391,6 +447,7 @@ impl SignedPacketStore {
         Ok(Self {
             send,
             cancel,
+            max_packets: options.max_packets,
             #[cfg(test)]
             options,
             _write_thread,
@@ -421,7 +478,12 @@ impl SignedPacketStore {
         Ok(())
     }
 
-    pub(crate) async fn upsert(&self, packet: SignedPacket) -> Result<bool> {
+    /// The most packets the store holds.
+    pub(crate) fn max_packets(&self) -> usize {
+        self.max_packets
+    }
+
+    pub(crate) async fn upsert(&self, packet: SignedPacket) -> Result<Upsert> {
         let (tx, rx) = oneshot::channel();
         self.send
             .send(Message::Upsert { packet, res: tx })
@@ -642,7 +704,7 @@ mod tests {
     use iroh_base::SecretKey;
 
     use super::*;
-    use crate::testing::signed_packet_at;
+    use crate::testing::{DAY_MICROS, signed_packet_at};
 
     fn test_signed_packet() -> SignedPacket {
         let secret_key = SecretKey::generate();
@@ -692,7 +754,10 @@ mod tests {
         let packet = test_signed_packet();
         let key = PublicKeyBytes::from_signed_packet(&packet);
 
-        assert!(store.upsert(packet.clone()).await.expect("upsert"));
+        assert_eq!(
+            store.upsert(packet.clone()).await.expect("upsert"),
+            Upsert::Stored
+        );
         assert!(store.get(&key).await.expect("get").is_some());
 
         assert!(store.remove(&key).await.expect("remove existing"));
@@ -717,11 +782,17 @@ mod tests {
         let key = PublicKeyBytes::from_signed_packet(&newer);
         let count = || calls.lock().expect("calls").len();
 
-        assert!(store.upsert(newer.clone()).await.expect("first upsert"));
+        assert_eq!(
+            store.upsert(newer.clone()).await.expect("first upsert"),
+            Upsert::Stored
+        );
         assert_eq!(count(), 1, "a new packet is a change");
 
         // The store keeps the newer packet, so nothing changed and nobody is told.
-        assert!(!store.upsert(older).await.expect("older upsert"));
+        assert_eq!(
+            store.upsert(older).await.expect("older upsert"),
+            Upsert::Unchanged
+        );
         assert_eq!(count(), 1, "a refused upsert is not a change");
 
         assert!(store.remove(&key).await.expect("remove"));
@@ -746,6 +817,7 @@ mod tests {
             max_batch_time: Duration::from_secs(3600),
             eviction: Duration::from_secs(24 * 3600),
             eviction_interval: Duration::from_secs(3600),
+            ..Options::default()
         };
         let (hook, calls) = recording_hook();
         let store = SignedPacketStore::in_memory_manual_eviction(
@@ -758,7 +830,10 @@ mod tests {
         let signed = Timestamp::now().as_micros() - 2 * 24 * 3600 * 1_000_000;
         let packet = signed_packet_at(&secret_key, signed, "old");
         let key = PublicKeyBytes::from_signed_packet(&packet);
-        assert!(store.upsert(packet.clone()).await.expect("upsert"));
+        assert_eq!(
+            store.upsert(packet.clone()).await.expect("upsert"),
+            Upsert::Stored
+        );
         let before = calls.lock().expect("calls").len();
 
         store
@@ -790,7 +865,10 @@ mod tests {
         .expect("in-memory store");
         let packet = test_signed_packet();
         let key = PublicKeyBytes::from_signed_packet(&packet);
-        assert!(store.upsert(packet.clone()).await.expect("upsert"));
+        assert_eq!(
+            store.upsert(packet.clone()).await.expect("upsert"),
+            Upsert::Stored
+        );
         let before = calls.lock().expect("calls").len();
 
         store
@@ -804,5 +882,177 @@ mod tests {
         assert!(store.get(&key).await.expect("get").is_some());
 
         assert_eq!(calls.lock().expect("calls").len(), before);
+    }
+
+    /// A store that holds at most `max_packets` packets, evicts a packet a day after its signed
+    /// time and only when a test asks, and closes a write transaction after each packet.
+    fn ceiling_store(max_packets: usize) -> (SignedPacketStore, Arc<Metrics>) {
+        let metrics = Arc::new(Metrics::default());
+        let store = SignedPacketStore::in_memory_manual_eviction(
+            Options {
+                max_batch_size: 1,
+                max_batch_time: Duration::from_secs(3600),
+                eviction: Duration::from_secs(24 * 3600),
+                max_packets,
+                ..Options::default()
+            },
+            metrics.clone(),
+            no_hook(),
+        )
+        .expect("in-memory store");
+        (store, metrics)
+    }
+
+    fn endpoint_key(secret_key: &SecretKey) -> PublicKeyBytes {
+        PublicKeyBytes::new_unchecked(*secret_key.public().as_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_store_at_its_ceiling_takes_a_replacement_and_refuses_a_new_endpoint() {
+        let (store, metrics) = ceiling_store(3);
+        let endpoints: Vec<_> = (0..3).map(|_| SecretKey::generate()).collect();
+        let now = Timestamp::now().as_micros();
+        for endpoint in &endpoints {
+            let packet = signed_packet_at(endpoint, now, "first");
+            assert_eq!(store.upsert(packet).await.expect("upsert"), Upsert::Stored);
+        }
+        assert_eq!(metrics.store_packets.get(), 3);
+
+        // A packet that replaces a stored one adds no record, so it is taken.
+        let replacement = signed_packet_at(&endpoints[0], now + 1, "second");
+        assert_eq!(
+            store
+                .upsert(replacement.clone())
+                .await
+                .expect("replacement"),
+            Upsert::Stored
+        );
+        let kept = store.get(&endpoint_key(&endpoints[0])).await.expect("get");
+        assert_eq!(kept.expect("stored").as_bytes(), replacement.as_bytes());
+
+        // An older packet for a stored endpoint is not a refusal: the store keeps what it has.
+        let older = signed_packet_at(&endpoints[1], now - 1, "older");
+        assert_eq!(store.upsert(older).await.expect("older"), Upsert::Unchanged);
+
+        // An endpoint the store holds nothing for is refused, and not stored.
+        let newcomer = SecretKey::generate();
+        let packet = signed_packet_at(&newcomer, now, "newcomer");
+        assert_eq!(store.upsert(packet).await.expect("newcomer"), Upsert::Full);
+        assert!(
+            store
+                .get(&endpoint_key(&newcomer))
+                .await
+                .expect("get")
+                .is_none()
+        );
+        assert_eq!(metrics.store_packets.get(), 3);
+
+        // Every stored endpoint is still answered.
+        for endpoint in &endpoints {
+            let stored = store.get(&endpoint_key(endpoint)).await.expect("get");
+            assert!(stored.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_at_its_ceiling_takes_new_endpoints_again_once_eviction_made_room() {
+        let (store, metrics) = ceiling_store(3);
+        let now = Timestamp::now().as_micros();
+        let stale = [SecretKey::generate(), SecretKey::generate()];
+        let honest = SecretKey::generate();
+        for endpoint in &stale {
+            let packet = signed_packet_at(endpoint, now - 2 * DAY_MICROS, "stale");
+            assert_eq!(store.upsert(packet).await.expect("upsert"), Upsert::Stored);
+        }
+        let packet = signed_packet_at(&honest, now, "honest");
+        assert_eq!(store.upsert(packet).await.expect("upsert"), Upsert::Stored);
+
+        // The stale records are not evicted to make room: the new endpoint waits.
+        let first = SecretKey::generate();
+        let packet = signed_packet_at(&first, now, "first");
+        assert_eq!(
+            store.upsert(packet.clone()).await.expect("upsert"),
+            Upsert::Full
+        );
+        for endpoint in stale.iter().chain([&honest]) {
+            let stored = store.get(&endpoint_key(endpoint)).await.expect("get");
+            assert!(stored.is_some(), "a refusal removed a stored packet");
+        }
+        assert_eq!(metrics.store_packets.get(), 3);
+
+        // Eviction goes on at the ceiling and frees the room of the two it removes.
+        store.evict_expired().await.expect("eviction");
+        assert_eq!(metrics.store_packets.get(), 1);
+        assert!(
+            store
+                .get(&endpoint_key(&honest))
+                .await
+                .expect("get")
+                .is_some()
+        );
+        assert_eq!(store.upsert(packet).await.expect("upsert"), Upsert::Stored);
+        let second = SecretKey::generate();
+        let packet = signed_packet_at(&second, now, "second");
+        assert_eq!(
+            store.upsert(packet.clone()).await.expect("upsert"),
+            Upsert::Stored
+        );
+        // Room for exactly what eviction freed.
+        let third = SecretKey::generate();
+        let packet = signed_packet_at(&third, now, "third");
+        assert_eq!(store.upsert(packet).await.expect("upsert"), Upsert::Full);
+        assert_eq!(metrics.store_packets.get(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_count_and_the_ceiling_hold_after_a_restart() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("packets.db");
+        let now = Timestamp::now().as_micros();
+        let options = |max_packets| Options {
+            max_packets,
+            eviction_interval: Duration::from_secs(3600),
+            ..Options::default()
+        };
+        let endpoints: Vec<_> = (0..3).map(|_| SecretKey::generate()).collect();
+        {
+            let metrics = Arc::new(Metrics::default());
+            let store =
+                SignedPacketStore::persistent(&path, options(3), metrics.clone(), no_hook())
+                    .expect("a store");
+            for endpoint in &endpoints[..2] {
+                let packet = signed_packet_at(endpoint, now, "before");
+                assert_eq!(store.upsert(packet).await.expect("upsert"), Upsert::Stored);
+            }
+            assert_eq!(metrics.store_packets.get(), 2);
+        }
+
+        // The count is read from the file at the start, with no packet published since.
+        let metrics = Arc::new(Metrics::default());
+        let store = SignedPacketStore::persistent(&path, options(3), metrics.clone(), no_hook())
+            .expect("the store reopens");
+        assert_eq!(metrics.store_packets.get(), 2);
+        let packet = signed_packet_at(&endpoints[2], now, "after");
+        assert_eq!(store.upsert(packet).await.expect("upsert"), Upsert::Stored);
+        let extra = signed_packet_at(&SecretKey::generate(), now, "extra");
+        assert_eq!(store.upsert(extra).await.expect("upsert"), Upsert::Full);
+        drop(store);
+
+        // A ceiling set below what the file holds removes nothing and refuses what is new.
+        let metrics = Arc::new(Metrics::default());
+        let store = SignedPacketStore::persistent(&path, options(1), metrics.clone(), no_hook())
+            .expect("the store reopens");
+        assert_eq!(metrics.store_packets.get(), 3);
+        for endpoint in &endpoints {
+            let stored = store.get(&endpoint_key(endpoint)).await.expect("get");
+            assert!(stored.is_some());
+        }
+        let replacement = signed_packet_at(&endpoints[0], now + 1, "replaced");
+        assert_eq!(
+            store.upsert(replacement).await.expect("upsert"),
+            Upsert::Stored
+        );
+        let extra = signed_packet_at(&SecretKey::generate(), now, "extra");
+        assert_eq!(store.upsert(extra).await.expect("upsert"), Upsert::Full);
     }
 }

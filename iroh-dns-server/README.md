@@ -56,6 +56,14 @@ packet origin will be appended with the origin as configured by this server.
   that was already running can still answer with it once. With the mainline fallback on, DNS can
   answer the record from the DHT and cache it for 300 seconds, while `GET /pkarr/{key}` reads
   only the store and reports it absent.
+- **Store size.** The store holds at most `zone_store.max_packets` packets, one for each
+  endpoint (1,000,000 when the setting is absent). At that number a publication for an endpoint
+  the store holds no packet for is refused with `503` and not stored. A publication that
+  replaces a stored packet is taken, and lookups, DNS answers and eviction go on; once eviction
+  has removed packets, new endpoints are taken again. Nothing is evicted early to make room. A
+  store that already holds more than the setting keeps what it holds and takes no new endpoint
+  until it is below it. The count is the length of the store's packet table, which the database
+  commits with the packets themselves.
 
 `GET /healthz` reports `git_hash`: the revision in the `KR_FORK_REV` environment variable when
 the server was built, and `unknown` when it was built without one.

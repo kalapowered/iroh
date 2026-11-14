@@ -801,6 +801,7 @@ mod tests {
                 .await
                 .expect("a request within the budget was refused");
             answered += 1;
+            assert!(answered < 10_000, "the budget was never passed");
         }
         assert_eq!(answered, LIFETIME_READ_BOUND / 1_024 + 1);
 

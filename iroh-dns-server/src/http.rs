@@ -40,7 +40,7 @@ mod pkarr;
 mod rate_limiting;
 mod tls;
 
-use self::idle::IdleBound;
+use self::idle::{Connections, IdleBound};
 pub(crate) use self::rate_limiting::RateLimits;
 use self::rate_limiting::{LOOKUP_QUOTA, PUT_QUOTA, Quota};
 pub use self::{rate_limiting::RateLimitConfig, tls::CertMode};
@@ -97,6 +97,12 @@ fn set_header_read_timeout(builder: &mut auto::Builder<TokioExecutor>) {
         .timer(TokioTimer::new())
         .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
 }
+
+/// The most connections the HTTP and HTTPS listeners hold at once, together; the next is closed at
+/// once. A held connection costs the server about 26 KB, so this is about 0.4 GiB of the memory
+/// the service may use, which leaves the rest for the zone cache and for the DNS server that runs
+/// in the same process.
+pub(crate) const MAX_CONNECTIONS: usize = 16_384;
 
 /// How long a request may take from its headers to its answer, its body included.
 ///
@@ -166,11 +172,13 @@ impl HttpServer {
         rate_limits: RateLimits,
         state: AppState,
         cert_cache_dir: PathBuf,
+        max_connections: usize,
     ) -> Result<HttpServer> {
         if http_config.is_none() && https_config.is_none() {
             bail_any!("Either http or https config is required");
         }
 
+        let connections = Connections::new(max_connections, state.metrics.clone());
         let app = create_app(state, &rate_limits);
 
         let mut tasks = JoinSet::new();
@@ -186,8 +194,8 @@ impl HttpServer {
             let listener = bind_listener(bind_addr, backlog).anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
             set_keepalive(&listener).anyerr()?;
-            let mut server =
-                axum_server::from_tcp(listener)?.acceptor(IdleBound(DefaultAcceptor::new()));
+            let mut server = axum_server::from_tcp(listener)?
+                .acceptor(IdleBound::new(DefaultAcceptor::new(), connections.clone()));
             set_header_read_timeout(server.http_builder());
             let fut = server.serve(app.into_make_service_with_connect_info::<SocketAddr>());
             info!("HTTP server listening on {bind_addr}");
@@ -226,7 +234,8 @@ impl HttpServer {
             let listener = bind_listener(bind_addr, backlog).anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
             set_keepalive(&listener).anyerr()?;
-            let mut server = axum_server::from_tcp(listener)?.acceptor(IdleBound(acceptor));
+            let mut server =
+                axum_server::from_tcp(listener)?.acceptor(IdleBound::new(acceptor, connections));
             set_header_read_timeout(server.http_builder());
             let fut = server.serve(app.into_make_service_with_connect_info::<SocketAddr>());
             info!("HTTPS server listening on {bind_addr}");
@@ -745,6 +754,90 @@ mod tests {
                 Err(err) => panic!("expected the server to close the connection: {err:?}"),
             }
         }
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A connection that the server answers with a request, for as long as the connection stands.
+    async fn answers(stream: &mut TcpStream) -> n0_error::Result {
+        stream
+            .write_all(b"GET /healthcheck HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .anyerr()?;
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\nOK") {
+            let mut chunk = [0; 1024];
+            let n = tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut chunk))
+                .await
+                .std_context("no answer from server")?
+                .anyerr()?;
+            assert!(n > 0, "connection closed before the answer");
+            response.extend_from_slice(&chunk[..n]);
+        }
+        Ok(())
+    }
+
+    /// The connection past the most the server holds is closed at once, the ones held still
+    /// answer, a place comes free when one of them ends, and a refused connection leaves no task.
+    /// The figure of the deployment is 16,384; this case holds four, and the figure itself is
+    /// measured on a server with its real limits.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_connections_past_the_most_are_closed_at_once() -> n0_error::Result {
+        const MOST: usize = 4;
+        let dir = tempfile::tempdir()?;
+        let server =
+            Server::spawn_for_tests_with_connection_cap(dir.path(), None, None, None, MOST).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        let mut held = Vec::new();
+        for _ in 0..MOST {
+            let mut stream = TcpStream::connect(addr).await.anyerr()?;
+            answers(&mut stream).await?;
+            held.push(stream);
+        }
+
+        let tasks = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        for _ in 0..20 {
+            let mut refused = TcpStream::connect(addr).await.anyerr()?;
+            let mut buf = [0; 1];
+            let read = tokio::time::timeout(CLOSE_DEADLINE, refused.read(&mut buf))
+                .await
+                .std_context("a connection past the most was not closed")?;
+            assert!(
+                matches!(read, Ok(0))
+                    || read.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+                "a connection past the most was answered"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            tasks,
+            "a refused connection left a task"
+        );
+
+        for stream in &mut held {
+            answers(stream).await?;
+        }
+
+        // A place comes free once the server has seen a held connection close.
+        drop(held.pop());
+        let mut freed = false;
+        for _ in 0..40 {
+            let mut stream = TcpStream::connect(addr).await.anyerr()?;
+            if answers(&mut stream).await.is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "no place came free after a held connection closed");
 
         server.shutdown().await?;
         Ok(())

@@ -49,7 +49,7 @@ impl Server {
             info!("mainline fallback enabled");
             store = store.with_mainline_fallback(bootstrap);
         };
-        Self::bind_with_store(config, store, metrics).await
+        Self::bind_with_store(config, store, metrics, crate::http::MAX_CONNECTIONS).await
     }
 
     /// Spawn the server.
@@ -62,6 +62,7 @@ impl Server {
         config: Config,
         store: ZoneStore,
         metrics: Arc<Metrics>,
+        max_connections: usize,
     ) -> Result<Self> {
         let cert_cache_dir = config.data_dir()?.join("cert_cache");
         let dns_handler = DnsHandler::new(store.clone(), &config.dns, metrics.clone())?;
@@ -91,6 +92,7 @@ impl Server {
             },
             state.clone(),
             cert_cache_dir,
+            max_connections,
         )
         .await?;
         let dns_server = DnsServer::spawn(config.dns, state.dns_handler.clone()).await?;
@@ -154,6 +156,25 @@ impl Server {
         options: Option<crate::store::Options>,
         https: Option<HttpsConfig>,
     ) -> Result<Self> {
+        Self::spawn_for_tests_with_connection_cap(
+            dir,
+            mainline,
+            options,
+            https,
+            crate::http::MAX_CONNECTIONS,
+        )
+        .await
+    }
+
+    /// The server of a test, with its own most connections for the HTTP listeners.
+    #[cfg(test)]
+    pub(crate) async fn spawn_for_tests_with_connection_cap(
+        dir: impl AsRef<Path>,
+        mainline: Option<crate::config::BootstrapOption>,
+        options: Option<crate::store::Options>,
+        https: Option<HttpsConfig>,
+        max_connections: usize,
+    ) -> Result<Self> {
         use std::net::{IpAddr, Ipv4Addr};
 
         use crate::config::MetricsConfig;
@@ -172,7 +193,8 @@ impl Server {
             info!("mainline fallback enabled");
             store = store.with_mainline_fallback(bootstrap);
         }
-        let server = Self::bind_with_store(config, store, Default::default()).await?;
+        let server =
+            Self::bind_with_store(config, store, Default::default(), max_connections).await?;
         Ok(server)
     }
 

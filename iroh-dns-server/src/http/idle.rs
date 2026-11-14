@@ -26,8 +26,58 @@ use tokio::{
 };
 use tower_service::Service;
 
+use crate::metrics::Metrics;
+
 /// How long a connection may stand with no request in progress.
 pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The connections that the server holds at once, from the accept to the close, across its
+/// listeners. A connection that would be one more than `max` is closed at once.
+#[derive(Debug)]
+pub(super) struct Connections {
+    held: AtomicUsize,
+    max: usize,
+    metrics: Arc<Metrics>,
+}
+
+impl Connections {
+    pub(super) fn new(max: usize, metrics: Arc<Metrics>) -> Arc<Self> {
+        Arc::new(Self {
+            held: AtomicUsize::new(0),
+            max,
+            metrics,
+        })
+    }
+
+    /// A place for one more connection, or `None` if the server already holds `max`. The count
+    /// guards no other data, so only its atomicity matters; the update is one compare and swap, so
+    /// it can never pass `max`.
+    fn take(self: &Arc<Self>) -> Option<Slot> {
+        self.held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                (held < self.max).then_some(held + 1)
+            })
+            .ok()?;
+        Some(Slot(self.clone()))
+    }
+
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
+    }
+}
+
+/// A connection's place among the connections the server holds. It is given back when this is
+/// dropped, whichever way the connection ends: its handshake fails or is cancelled, its task
+/// panics, or it closes.
+#[derive(Debug)]
+struct Slot(Arc<Connections>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.held.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// What a connection's stream and its service both see.
 #[derive(Debug)]
@@ -86,9 +136,19 @@ impl Drop for InFlight {
     }
 }
 
-/// An acceptor that closes connections which stand with no request in progress.
+/// An acceptor that closes connections which stand with no request in progress, and the ones
+/// that would pass the most the server holds.
 #[derive(Clone, Debug)]
-pub(super) struct IdleBound<A>(pub(super) A);
+pub(super) struct IdleBound<A> {
+    inner: A,
+    connections: Arc<Connections>,
+}
+
+impl<A> IdleBound<A> {
+    pub(super) fn new(inner: A, connections: Arc<Connections>) -> Self {
+        Self { inner, connections }
+    }
+}
 
 impl<A, I, S> Accept<I, S> for IdleBound<A>
 where
@@ -104,8 +164,18 @@ where
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
-        let accepted = self.0.accept(stream, service);
+        let Some(slot) = self.connections.take() else {
+            self.connections.metrics.http_connections_refused.inc();
+            // The connection is closed as the stream is dropped here, before any handshake, and
+            // no task is left behind.
+            return Box::pin(std::future::ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the server holds the most connections it allows",
+            ))));
+        };
+        let accepted = self.inner.accept(stream, service);
         Box::pin(async move {
+            // The slot is held through the handshake, and by the stream after it.
             let (stream, service) = accepted.await?;
             let shared = Shared::new();
             Ok((
@@ -114,6 +184,7 @@ where
                     shared: shared.clone(),
                     timer: Box::pin(tokio::time::sleep_until(Instant::now() + IDLE_TIMEOUT)),
                     armed: None,
+                    _slot: slot,
                 },
                 Tracked {
                     inner: service,
@@ -163,6 +234,8 @@ pub(super) struct IdleStream<T> {
     timer: Pin<Box<Sleep>>,
     /// The deadline the timer is set to, or `None` while a request is in progress.
     armed: Option<Instant>,
+    /// The connection's place among the connections the server holds.
+    _slot: Slot,
 }
 
 impl<T> IdleStream<T> {
@@ -285,7 +358,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(1024);
         let gate = Arc::new(Notify::new());
         let (stream, service): (IdleStream<DuplexStream>, Tracked<Gated>) =
-            IdleBound(DefaultAcceptor)
+            IdleBound::new(DefaultAcceptor, Connections::new(1_000, Default::default()))
                 .accept(server, Gated(gate.clone()))
                 .await
                 .expect("the acceptor passes the connection on");
@@ -399,5 +472,103 @@ mod tests {
             .await
             .expect_err("the write succeeded after the bound");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// An acceptor whose handshake never ends.
+    #[derive(Clone)]
+    struct Stalled;
+
+    impl<I: Send + 'static, S: Send + 'static> Accept<I, S> for Stalled {
+        type Stream = DuplexStream;
+        type Service = S;
+        type Future = Pin<Box<dyn Future<Output = io::Result<(DuplexStream, S)>> + Send>>;
+
+        fn accept(&self, _stream: I, _service: S) -> Self::Future {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// An acceptor whose handshake fails.
+    #[derive(Clone)]
+    struct Failing;
+
+    impl<I: Send + 'static, S: Send + 'static> Accept<I, S> for Failing {
+        type Stream = DuplexStream;
+        type Service = S;
+        type Future = Pin<Box<dyn Future<Output = io::Result<(DuplexStream, S)>> + Send>>;
+
+        fn accept(&self, _stream: I, _service: S) -> Self::Future {
+            Box::pin(std::future::ready(Err(io::Error::other(
+                "handshake failed",
+            ))))
+        }
+    }
+
+    fn connections(most: usize) -> (Arc<Connections>, Arc<Metrics>) {
+        let metrics = Arc::new(Metrics::default());
+        (Connections::new(most, metrics.clone()), metrics)
+    }
+
+    #[tokio::test]
+    async fn the_connection_past_the_most_is_refused_and_the_others_stay() {
+        let (connections, metrics) = connections(2);
+        let bound = IdleBound::new(DefaultAcceptor, connections.clone());
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = tokio::io::duplex(64);
+            let accepted = bound.accept(server, ()).await;
+            assert!(accepted.is_ok(), "a connection under the most was refused");
+            held.push((client, accepted));
+        }
+        let (mut client, server) = tokio::io::duplex(64);
+        let refused = bound.accept(server, ()).await;
+        assert_eq!(
+            refused.err().map(|error| error.kind()),
+            Some(io::ErrorKind::ConnectionRefused)
+        );
+        assert_eq!(connections.held(), 2);
+        assert_eq!(metrics.http_connections_refused.get(), 1);
+
+        // The refused connection is closed: its peer reads the end of the stream.
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.expect("read"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_slot_comes_free_when_a_held_connection_ends() {
+        let (connections, metrics) = connections(1);
+        let bound = IdleBound::new(DefaultAcceptor, connections.clone());
+
+        let (_client, server) = tokio::io::duplex(64);
+        let first = bound.accept(server, ()).await.expect("the first");
+        let (_client, server) = tokio::io::duplex(64);
+        assert!(bound.accept(server, ()).await.is_err());
+
+        drop(first);
+        assert_eq!(connections.held(), 0);
+        let (_client, server) = tokio::io::duplex(64);
+        assert!(bound.accept(server, ()).await.is_ok());
+        assert_eq!(metrics.http_connections_refused.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_handshake_that_fails_or_is_cancelled_gives_its_slot_back() {
+        let (connections, _metrics) = connections(1);
+
+        let (_client, server) = tokio::io::duplex(64);
+        let failed = IdleBound::new(Failing, connections.clone()).accept(server, ());
+        assert_eq!(connections.held(), 1, "the handshake holds a slot");
+        assert!(failed.await.is_err());
+        assert_eq!(connections.held(), 0, "a failed handshake kept its slot");
+
+        let (_client, server) = tokio::io::duplex(64);
+        let stalled = tokio::spawn(IdleBound::new(Stalled, connections.clone()).accept(server, ()));
+        tokio::task::yield_now().await;
+        assert_eq!(connections.held(), 1, "the handshake holds a slot");
+        stalled.abort();
+        let ended = stalled.await.err().expect("the task was aborted");
+        assert!(ended.is_cancelled());
+        assert_eq!(connections.held(), 0, "a cancelled handshake kept its slot");
     }
 }

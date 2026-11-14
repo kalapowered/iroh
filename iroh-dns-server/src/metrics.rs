@@ -17,6 +17,9 @@ pub struct Metrics {
     /// Number of pkarr relay puts refused because the packet was signed too far ahead of the
     /// server's clock.
     pub pkarr_publish_timestamp_ahead: Counter,
+    /// Number of HTTP and HTTPS connections closed at once because the server already held its
+    /// largest number of connections.
+    pub http_connections_refused: Counter,
     /// Total number of DNS requests across all transports.
     pub dns_requests: Counter,
     /// Number of DNS requests received over UDP.

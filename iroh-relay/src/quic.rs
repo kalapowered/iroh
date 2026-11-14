@@ -367,13 +367,19 @@ impl QuicClient {
 mod tests {
     use std::{net::Ipv4Addr, sync::Arc};
 
+    use bytes::Bytes;
     use n0_error::{Result, StdResultExt};
     use n0_future::{
+        StreamExt,
         task::AbortOnDropHandle,
         time::{self, Instant},
     };
     use n0_tracing_test::traced_test;
-    use noq::crypto::rustls::QuicServerConfig;
+    use noq::{
+        ConnectionError, SendDatagramError, TransportErrorCode, crypto,
+        crypto::rustls::QuicServerConfig,
+    };
+    use noq_proto::{TransportError, coding::Decodable, transport_parameters::TransportParameters};
     use tracing::{Instrument, debug, info, info_span};
     use webpki_types::PrivatePkcs8KeyDer;
 
@@ -554,5 +560,232 @@ mod tests {
             .std_context("server task")??;
 
         Ok(())
+    }
+
+    /// How long a case waits for an event it expects before it fails. A passing case
+    /// decides by the event and never waits this long.
+    const EVENT_LIMIT: Duration = Duration::from_secs(10);
+
+    /// The address-discovery listener as the relay starts it, on the loopback address.
+    fn loopback_listener() -> Result<super::server::QuicServer> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .std_context("self signed")?;
+        let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .std_context("crypto provider")?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.into()], key.into())
+        .std_context("tls")?;
+        let bind_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        Ok(super::server::QuicServer::spawn(
+            bind_addr,
+            tls,
+            Default::default(),
+        )?)
+    }
+
+    fn loopback_client_endpoint() -> Result<noq::Endpoint> {
+        noq::Endpoint::client(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).std_context("client")
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn the_listener_reports_the_address_and_offers_no_datagram_support() -> Result {
+        let quic_server = loopback_listener()?;
+        let client_endpoint = loopback_client_endpoint()?;
+        let client_addr = client_endpoint.local_addr().std_context("local addr")?;
+
+        // The client's configuration is the library's default for datagrams: allowed.
+        let quic_client = QuicClient::new(
+            client_endpoint.clone(),
+            crate::tls::make_dangerous_client_config(),
+        );
+        let conn = quic_client
+            .create_conn(quic_server.bind_addr(), "localhost")
+            .await?;
+
+        let mut reports = conn.observed_external_addr();
+        let Ok(Some(reported)) = time::timeout(EVENT_LIMIT, reports.next()).await else {
+            panic!("the listener sent no address report");
+        };
+        assert_eq!(
+            SocketAddr::new(reported.ip().to_canonical(), reported.port()),
+            client_addr
+        );
+
+        // The listener never offers DATAGRAM frames, so the client library will not send one.
+        assert_eq!(
+            conn.max_datagram_size(),
+            None,
+            "the listener offered DATAGRAM frames"
+        );
+        assert!(matches!(
+            conn.send_datagram(Bytes::new()),
+            Err(SendDatagramError::UnsupportedByPeer)
+        ));
+
+        conn.close(QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON);
+        client_endpoint.wait_idle().await;
+        quic_server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_datagram_the_listener_never_offered_ends_the_connection() -> Result {
+        let quic_server = loopback_listener()?;
+        let client_endpoint = loopback_client_endpoint()?;
+
+        // A peer that does not honour what the listener offered: its library reads the
+        // server's transport parameters as if they allowed DATAGRAM frames.
+        let mut tls = crate::tls::make_dangerous_client_config();
+        tls.alpn_protocols = vec![ALPN_QUIC_ADDR_DISC.into()];
+        let mut client_config = noq::ClientConfig::new(Arc::new(ForgedDatagramOffer(
+            QuicClientConfig::try_from(tls).std_context("client tls")?,
+        )));
+        let mut transport = noq_proto::TransportConfig::default();
+        transport.receive_observed_address_reports(true);
+        client_config.transport_config(Arc::new(transport));
+
+        let conn = client_endpoint
+            .connect_with(client_config, quic_server.bind_addr(), "localhost")
+            .std_context("connect")?
+            .await
+            .std_context("handshake")?;
+        assert!(
+            conn.max_datagram_size().is_some(),
+            "the peer's library does not believe that datagrams are allowed"
+        );
+
+        // One DATAGRAM frame with no payload, through the library's own call.
+        conn.send_datagram(Bytes::new()).std_context("send")?;
+
+        let Ok(error) = time::timeout(EVENT_LIMIT, conn.closed()).await else {
+            panic!("the listener kept the connection open after a DATAGRAM frame it never offered");
+        };
+        let ConnectionError::ConnectionClosed(close) = error else {
+            panic!("the listener did not close the connection with an error code: {error:?}");
+        };
+        assert_eq!(close.error_code, TransportErrorCode::PROTOCOL_VIOLATION);
+
+        client_endpoint.wait_idle().await;
+        quic_server.shutdown().await;
+        Ok(())
+    }
+
+    /// The id of the transport parameter that offers DATAGRAM frames.
+    const MAX_DATAGRAM_FRAME_SIZE_ID: u64 = 0x20;
+
+    /// Whether encoded transport parameters hold the parameter with this id.
+    fn holds_parameter(mut encoded: &[u8], id: u64) -> bool {
+        while !encoded.is_empty() {
+            let (Ok(found), Ok(len)) = (VarInt::decode(&mut encoded), VarInt::decode(&mut encoded))
+            else {
+                return false;
+            };
+            if found.into_inner() == id {
+                return true;
+            }
+            let Some(rest) = encoded.get(len.into_inner() as usize..) else {
+                return false;
+            };
+            encoded = rest;
+        }
+        false
+    }
+
+    /// A client crypto configuration whose sessions read the server's transport
+    /// parameters with an offer of DATAGRAM frames added when the server made none.
+    struct ForgedDatagramOffer(QuicClientConfig);
+
+    impl crypto::ClientConfig for ForgedDatagramOffer {
+        fn start_session(
+            &self,
+            version: u32,
+            server_name: &str,
+            params: &TransportParameters,
+        ) -> std::result::Result<Box<dyn crypto::Session>, noq::ConnectError> {
+            let inner = self.0.start_session(version, server_name, params)?;
+            Ok(Box::new(ForgedDatagramOfferSession(inner)))
+        }
+    }
+
+    struct ForgedDatagramOfferSession(Box<dyn crypto::Session>);
+
+    impl crypto::Session for ForgedDatagramOfferSession {
+        fn initial_keys(&self, dst_cid: noq::ConnectionId, side: noq::Side) -> crypto::Keys {
+            self.0.initial_keys(dst_cid, side)
+        }
+
+        fn handshake_data(&self) -> Option<Box<dyn std::any::Any>> {
+            self.0.handshake_data()
+        }
+
+        fn peer_identity(&self) -> Option<Box<dyn std::any::Any>> {
+            self.0.peer_identity()
+        }
+
+        fn early_crypto(&self) -> Option<(Box<dyn crypto::HeaderKey>, Box<dyn crypto::PacketKey>)> {
+            self.0.early_crypto()
+        }
+
+        fn early_data_accepted(&self) -> Option<bool> {
+            self.0.early_data_accepted()
+        }
+
+        fn is_handshaking(&self) -> bool {
+            self.0.is_handshaking()
+        }
+
+        fn read_handshake(&mut self, buf: &[u8]) -> std::result::Result<bool, TransportError> {
+            self.0.read_handshake(buf)
+        }
+
+        fn transport_parameters(
+            &self,
+        ) -> std::result::Result<Option<TransportParameters>, TransportError> {
+            let Some(offered) = self.0.transport_parameters()? else {
+                return Ok(None);
+            };
+            let mut encoded = Vec::new();
+            offered.write(&mut encoded);
+            if !holds_parameter(&encoded, MAX_DATAGRAM_FRAME_SIZE_ID) {
+                // The parameter's id, a length of two and the value 1200 as a two-byte varint.
+                encoded.extend_from_slice(&[0x20, 0x02, 0x44, 0xb0]);
+            }
+            Ok(Some(TransportParameters::read(
+                noq::Side::Client,
+                &mut encoded.as_slice(),
+            )?))
+        }
+
+        fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<crypto::Keys> {
+            self.0.write_handshake(buf)
+        }
+
+        fn next_1rtt_keys(&mut self) -> Option<crypto::KeyPair<Box<dyn crypto::PacketKey>>> {
+            self.0.next_1rtt_keys()
+        }
+
+        fn is_valid_retry(
+            &self,
+            orig_dst_cid: noq::ConnectionId,
+            header: &[u8],
+            payload: &[u8],
+        ) -> bool {
+            self.0.is_valid_retry(orig_dst_cid, header, payload)
+        }
+
+        fn export_keying_material(
+            &self,
+            output: &mut [u8],
+            label: &[u8],
+            context: &[u8],
+        ) -> std::result::Result<(), crypto::ExportKeyingMaterialError> {
+            self.0.export_keying_material(output, label, context)
+        }
     }
 }

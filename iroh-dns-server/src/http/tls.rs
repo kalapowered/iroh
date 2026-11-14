@@ -67,15 +67,16 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// full TLS record of plaintext. The TLS library keeps a handshake message that it is sent in
 /// pieces until the message ends, up to 64 KiB of raw bytes, and the time limit above alone lets
 /// every connection that stands in its handshake hold that for as long as the limit runs. An honest
-/// handshake sends far less: the largest `ClientHello` that common clients send, with key shares
-/// for X25519 and ML-KEM-768 together, extensions, a pre-shared key and the encrypted-hello
-/// extension, is under 2.5 kB; with a second one after a `HelloRetryRequest`, the client's
-/// `Finished` and a first request that comes in the same read, a handshake stays under 8 kB, half
-/// of the figure. A connection that sends more is closed. The count is of the bytes read from the
-/// socket, record headers included, and stops when the handshake ends; the bytes after it are
-/// bounded by `READ_BOUND` in the idle bound, as plain bytes. As with `READ_BOUND`, it is a
-/// threshold at which the connection is closed: the read that crosses it has been made, and one
-/// read is at most 4 KiB while no message is being joined.
+/// handshake sends far less. A client on OpenSSL 3.5, with key shares for X25519 and ML-KEM-768,
+/// sends a `ClientHello` of 1,546 bytes and 1,631 raw bytes before its own handshake is done; with
+/// every cipher suite, five ALPN names and a server name of 253 characters, 1,950 and 2,035. A
+/// second `ClientHello`, after a `HelloRetryRequest`, doubles the first, so a handshake stays under
+/// 4.5 kB, about a quarter of the figure, which is also the size of one full TLS record. A
+/// connection that sends more is closed. The count is of the bytes read from the socket, record
+/// headers included, and stops when the handshake ends; the bytes after it are counted by
+/// `READ_BOUND` in the idle bound, as plain bytes. As with `READ_BOUND`, it is a threshold at which
+/// the connection is closed: the read that crosses it has been made, and while no message is being
+/// joined one read is at most 4 KiB.
 pub(super) const HANDSHAKE_READ_BOUND: usize = 16_384;
 
 /// A connection's socket as the TLS acceptor reads it: it counts the raw bytes read until the

@@ -6,7 +6,7 @@
 //! for [`IDLE_TIMEOUT`], counted from the end of the handshake or from the end of the last
 //! request. Bytes that arrive without starting a request, such as the pings of an idle HTTP/2
 //! connection, do not extend it. A request in progress is bounded by its own deadline. A connection
-//! may also read only [`READ_BOUND`] bytes between two request starts.
+//! may also read only [`READ_BOUND`] bytes between two request starts, counted after its handshake.
 
 use std::{
     future::Future,
@@ -33,16 +33,31 @@ use crate::metrics::Metrics;
 pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most bytes a connection may read between two request starts, and before its first, whatever
-/// requests are in progress: 24,576, three times the head allowance. A request starts when the
-/// service is called, which is when its whole head has been read, and the count begins again
-/// there. Between two starts an honest client sends the rest of the body of the request before (at
-/// most 4,096 bytes), the head of the next request (at most 8,192) and HTTP/2's own frames
-/// (settings, window updates, pings), about 12.5 kB at the largest sizes, so the figure leaves
-/// room for twice that. What it bounds is what hyper holds for a request that has not started:
-/// HTTP/2 keeps a header block as it arrives until its last frame, up to 6 frames of 16,384
-/// bytes, and the block is not a stream, so the limit on streams and the header list limit do not
-/// count it. A connection that reads more is closed, and its client meets a connection that ends
-/// with no status, as with the idle bound.
+/// requests are in progress: 24,576, three times the head allowance. The bytes are those that the
+/// connection reads after its handshake, decrypted ones on a TLS listener; the handshake has a
+/// figure of its own, `tls::HANDSHAKE_READ_BOUND`. A request starts when the service is first
+/// polled, which for HTTP/2 is after hyper has spawned the task of the stream, and the count begins
+/// again there. So the bytes that hyper has read ahead of a start count towards the interval before
+/// it: the body of the same request, and the heads of the next two requests, which HTTP/2 allows
+/// open at once.
+///
+/// An honest interval at the largest sizes is two HTTP/2 heads of 8,192 bytes read ahead (16,400),
+/// the tail of the body before them (4,096 and its frame headers, about 4,100) and the first
+/// settings and window frames, about 20.6 kB, so the figure leaves about 4 kB over; on HTTP/1 it is
+/// at most 4,096 + 8,192 + 4,096, about 16.4 kB, and ordinary traffic is near 13 to 16 kB. A legal
+/// shape does not fit: two POSTs at once, each with a head near 8,191 bytes and a body of 4,096,
+/// come to about 24.6 kB, and the connection that sends them is closed, as a POST's head is a few
+/// hundred bytes in practice.
+///
+/// It is a threshold at which the connection is closed, not a ceiling on what the server holds.
+/// Bytes read before a start stay in what hyper has buffered for the other requests; the read that
+/// crosses the threshold has been made when the count sees it; and the socket's buffers and those
+/// of the TLS and HTTP libraries lie outside it. What it bounds is what hyper keeps raw for a
+/// request that has not started: HTTP/2 keeps a header block as it arrives until its last frame,
+/// and `HEADERS` with five `CONTINUATION` frames of 16,384 bytes that do not end the block is not
+/// a stream, so the limit on streams and the header list limit do not count it. A connection that
+/// reads more is closed, and its client meets a connection that ends with no status, as with the
+/// idle bound.
 pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 
 /// The connections that the server holds at once, from the accept to the close, across its
@@ -93,9 +108,10 @@ impl Drop for Slot {
     }
 }
 
-/// What a connection's stream and its service both see. The count of requests in progress and the
-/// time the connection last had none change together, under one lock, so that a reader never sees
-/// the count at zero with the time from before the request.
+/// What a connection's stream and its service both see. The count of requests in progress, the
+/// time the connection last had none and the bytes read since a request last started change
+/// together, under one lock, so that a reader never sees the count at zero with the time from
+/// before the request, or a count of bytes that a start has not yet cleared.
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
@@ -340,7 +356,8 @@ impl<T: AsyncRead + Unpin> AsyncRead for IdleStream<T> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
-            this.shared.count_read(buf.filled().len() - before)?;
+            this.shared
+                .count_read(buf.filled().len().saturating_sub(before))?;
         }
         polled
     }

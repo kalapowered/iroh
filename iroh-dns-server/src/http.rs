@@ -127,10 +127,10 @@ const HTTP1_MAX_BUFFER_SIZE: usize = REQUEST_HEAD_LIMIT;
 /// The most streams an HTTP/2 connection has open at once: 2 (hyper's default is 200; it has no
 /// lowest value). An open request with a full header list and a body of 4 kB measured about 15 kB
 /// more than the same connection without it on the build box: the peak less the memory of the
-/// connections before their streams opened (see `MAX_CONNECTIONS`). So the figure sets how much an
-/// open connection holds for requests that are not complete. The server announces it in its
-/// settings: a client that has read them waits for a stream to end before it opens another, and
-/// one that opens a third stream before they arrive has that stream refused with
+/// connections before their streams opened (the table of shapes in `FORK.md`). So the figure sets
+/// how much an open connection holds for requests that are not complete. The server announces it
+/// in its settings: a client that has read them waits for a stream to end before it opens
+/// another, and one that opens a third stream before they arrive has that stream refused with
 /// `REFUSED_STREAM`, which it may retry.
 const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 2;
 
@@ -183,14 +183,13 @@ fn bounded_server<A>(
 /// The most connections the HTTP and HTTPS listeners hold at once, together: 8,192. A connection
 /// past it is closed at once, before its handshake, and its request is not queued; the
 /// connections already held stay usable. The figure was taken from what a connection costs in the
-/// heaviest shape that the limits permit, measured on the build box inside a control group: two
-/// HTTP/2 streams open, each with a header list of 8,191 bytes and 4,090 body bytes, and, 2.5
-/// seconds after the second, a header block of 20,000 bytes that does not end, which stays under
-/// `READ_BOUND`. 16,384 connections in that shape held 1,642 MiB at the group's peak, 102.1 kB
-/// each, and 8,192 held 857 MiB, 106 kB each; with an empty server of 9 MB, 8,192 times 102.1 kB
-/// is 826 MiB, from which the figure was taken. The same connections each sending a request every
-/// 20 seconds held 227 MiB. Each figure measures its own workload, and no heavier shape has been
-/// measured.
+/// heaviest shape measured, on the build box inside a control group: two HTTP/2 streams open, each
+/// with a header list of 8,191 bytes and 4,090 body bytes, and, 2.5 seconds after the second, a
+/// header block of 20,000 bytes that does not end, which stays under `READ_BOUND`. 16,384
+/// connections in that shape held 1,642 MiB at the group's peak, 102.1 KiB each, and 8,192 held
+/// 857 MiB, 106 KiB each; with an empty server of 9 MiB, 8,192 times 102.1 KiB is 826 MiB, from
+/// which the figure was taken. The same connections each sending a request every 20 seconds held
+/// 227 MiB. Each figure measures its own workload, and no heavier shape has been measured.
 pub(crate) const MAX_CONNECTIONS: usize = 8_192;
 
 /// How long a request may take from its headers until the server has made its answer, its body

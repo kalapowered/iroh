@@ -17,6 +17,7 @@ pub(super) const HEADERS: u8 = 1;
 pub(super) const RST_STREAM: u8 = 3;
 pub(super) const SETTINGS: u8 = 4;
 pub(super) const PING: u8 = 6;
+pub(super) const GOAWAY: u8 = 7;
 pub(super) const WINDOW_UPDATE: u8 = 8;
 pub(super) const CONTINUATION: u8 = 9;
 /// A frame type that the protocol does not define, which a receiver has to discard.
@@ -26,6 +27,7 @@ pub(super) const END_STREAM: u8 = 0x1;
 pub(super) const ACK: u8 = 0x1;
 pub(super) const END_HEADERS: u8 = 0x4;
 
+pub(super) const NO_ERROR: u32 = 0;
 pub(super) const FLOW_CONTROL_ERROR: u32 = 3;
 pub(super) const REFUSED_STREAM: u32 = 7;
 
@@ -81,6 +83,33 @@ impl Frame {
         None
     }
 
+    /// The last stream id of a `GOAWAY` frame.
+    pub(super) fn last_stream(&self) -> Option<u32> {
+        (self.kind == GOAWAY)
+            .then(|| {
+                self.payload
+                    .get(..4)?
+                    .try_into()
+                    .ok()
+                    .map(u32::from_be_bytes)
+            })
+            .flatten()
+            .map(|id| id & 0x7fff_ffff)
+    }
+
+    /// The error code of a `GOAWAY` frame.
+    pub(super) fn goaway_code(&self) -> Option<u32> {
+        (self.kind == GOAWAY)
+            .then(|| {
+                self.payload
+                    .get(4..8)?
+                    .try_into()
+                    .ok()
+                    .map(u32::from_be_bytes)
+            })
+            .flatten()
+    }
+
     /// The error code of an `RST_STREAM` frame.
     pub(super) fn reset_code(&self) -> Option<u32> {
         (self.kind == RST_STREAM)
@@ -102,6 +131,8 @@ pub(super) struct Peer<S = TcpStream> {
     next_stream: u32,
     /// What has been read from the connection and is not yet a whole frame.
     pending: Vec<u8>,
+    /// The bytes written to the connection so far, the preface included.
+    sent: usize,
 }
 
 impl Peer<TcpStream> {
@@ -128,6 +159,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
             stream,
             next_stream: 5,
             pending: Vec::new(),
+            sent: 0,
         }
     }
 
@@ -143,6 +175,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
             stream,
             next_stream: 1,
             pending: Vec::new(),
+            sent: PREFACE.len(),
         };
         peer.send(SETTINGS, 0, 0, settings).await?;
         // The server's settings come first; they are acknowledged as a client does.
@@ -156,9 +189,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         Ok(peer)
     }
 
+    /// The bytes written to the connection so far, which are the bytes the server has read or
+    /// will read.
+    pub(super) fn sent(&self) -> usize {
+        self.sent
+    }
+
     /// Writes `bytes` as they are, which are not a frame.
     pub(super) async fn send_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        self.sent += bytes.len();
         self.stream.write_all(bytes).await.anyerr()
+    }
+
+    /// Announces `size` as the initial window of the streams that the server answers on
+    /// (`SETTINGS_INITIAL_WINDOW_SIZE`), which applies to the streams open now as well.
+    pub(super) async fn set_initial_window(&mut self, size: u32) -> Result<()> {
+        let mut setting = 4u16.to_be_bytes().to_vec();
+        setting.extend(size.to_be_bytes());
+        self.send(SETTINGS, 0, 0, &setting).await
+    }
+
+    /// Acknowledges the `PING` in `ping`.
+    pub(super) async fn ack_ping(&mut self, ping: &Frame) -> Result<()> {
+        self.send(PING, ACK, 0, &ping.payload).await
+    }
+
+    /// Opens the window of `stream` (0 for the connection) by `increment` bytes.
+    pub(super) async fn window_update(&mut self, stream: u32, increment: u32) -> Result<()> {
+        self.send(WINDOW_UPDATE, 0, stream, &increment.to_be_bytes())
+            .await
     }
 
     pub(super) async fn send(
@@ -168,10 +227,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         stream: u32,
         payload: &[u8],
     ) -> Result<()> {
-        self.stream
-            .write_all(&frame(kind, flags, stream, payload))
-            .await
-            .anyerr()
+        let frame = frame(kind, flags, stream, payload);
+        self.sent += frame.len();
+        self.stream.write_all(&frame).await.anyerr()
     }
 
     /// The next frame from the server, which must come whole within a short stretch of real time.

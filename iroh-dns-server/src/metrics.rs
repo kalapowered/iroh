@@ -20,6 +20,11 @@ pub struct Metrics {
     /// Number of HTTP and HTTPS connections closed at once because the server already held its
     /// largest number of connections.
     pub http_connections_refused: Counter,
+    /// Number of HTTP and HTTPS connections that were still open when the drain time ended,
+    /// whatever the cause: an answer that the client did not take in time, a request accepted late
+    /// in the drain, a request head that did not end, or a client that did not acknowledge the
+    /// shutdown. The server ends each of them. The stop on bytes read is not counted here.
+    pub http_connections_drain_timeouts: Counter,
     /// Total number of DNS requests across all transports.
     pub dns_requests: Counter,
     /// Number of DNS requests received over UDP.

@@ -205,10 +205,12 @@ fn bounded_server<A>(
     set_header_read_timeout(&mut builder);
     set_protocol_limits(&mut builder);
     let listener = TcpListener::from_std(listener).anyerr()?;
+    let metrics = connections.metrics().clone();
     Ok(serve::Server::new(
         listener,
         IdleBound::new(acceptor, connections),
         builder,
+        metrics,
     ))
 }
 
@@ -2010,78 +2012,95 @@ mod tests {
         Ok(())
     }
 
-    /// The same over HTTP/2: the connection answers until its budget is passed and then ends, and
-    /// the figure counts what the peer sent from its first byte, the preface and its settings
-    /// included.
-    #[tokio::test]
-    #[traced_test]
-    async fn test_http2_connection_is_answered_up_to_its_lifetime_budget() -> n0_error::Result {
-        let dir = tempfile::tempdir()?;
-        let server = Server::spawn_for_tests(dir.path()).await?;
-        let addr = server.http_addr().expect("http is bound");
-        let sent = |count: usize| {
-            // the preface, the peer's settings and the acknowledgement of the server's, then the requests
-            raw_h2::PREFACE.len()
-                + 18
-                + count
-                    * raw_h2::frame(
-                        raw_h2::HEADERS,
-                        5,
-                        1,
-                        &raw_h2::request_block("GET", "/healthcheck", &[]),
-                    )
-                    .len()
-        };
+    type Ran = Arc<std::sync::Mutex<Vec<(String, SocketAddr)>>>;
 
-        let mut peer = raw_h2::Peer::connect(addr).await?;
-        let mut count = 0;
-        'requests: loop {
-            let stream = peer.request("GET", "/healthcheck", &[], true).await?;
-            loop {
-                let Ok(frame) = peer.next_frame().await else {
-                    break 'requests;
-                };
-                if frame.kind == raw_h2::HEADERS && frame.stream == stream {
-                    assert_eq!(frame.status(), Some(200));
-                    break;
-                }
-            }
-            count += 1;
-            assert!(count < 10_000, "the connection was never closed");
-        }
-        assert!(
-            sent(count) > super::idle::LIFETIME_READ_BOUND,
-            "the connection ended after {count} requests, before its budget"
-        );
-        assert!(
-            sent(count - 1) <= super::idle::LIFETIME_READ_BOUND,
-            "the connection answered {count} requests, past its budget"
-        );
-        let mut peer = raw_h2::Peer::connect(addr).await?;
-        let stream = peer.request("GET", "/healthcheck", &[], true).await?;
-        loop {
-            let frame = peer.next_frame().await?;
-            if frame.kind == raw_h2::HEADERS && frame.stream == stream {
-                assert_eq!(frame.status(), Some(200), "a new connection");
-                break;
-            }
-        }
-
-        server.shutdown().await?;
-        Ok(())
-    }
-
-    /// The server's own listener, bounded as the server's are, with two routes that record the
-    /// requests that run and the peer that sent each: `GET /n/{id}`, and `POST /hold`, which runs
-    /// once its body is whole.
+    /// The server's own listener, bounded as the server's are, with routes that record the
+    /// requests that run and the peer that sent each: `GET /n/{id}`, `GET /big/{id}` with an
+    /// answer of 3,000 bytes, `POST /hold`, which runs once its body is whole, and `GET
+    /// /wait/{id}`, whose handler runs on only when the case releases it.
     struct Recording {
         addr: SocketAddr,
-        ran: Arc<std::sync::Mutex<Vec<(String, SocketAddr)>>>,
+        ran: Ran,
+        /// One permit for each handler of `/wait/{id}` that has started.
+        started: Arc<tokio::sync::Semaphore>,
+        /// A handler of `/wait/{id}` goes on when it takes a permit.
+        release: Arc<tokio::sync::Semaphore>,
+        metrics: Arc<crate::metrics::Metrics>,
         task: tokio::task::JoinHandle<std::io::Result<()>>,
+        _dir: Option<tempfile::TempDir>,
     }
 
     impl Recording {
         fn start() -> n0_error::Result<Self> {
+            let metrics: Arc<crate::metrics::Metrics> = Arc::default();
+            let (app, ran, started, release) = Self::routes();
+            let (listener, addr) = Self::listener()?;
+            let server = super::bounded_server(
+                listener,
+                axum_server::accept::DefaultAcceptor::new(),
+                super::idle::Connections::new(64, metrics.clone()),
+            )?;
+            let task =
+                tokio::spawn(server.serve(app.into_make_service_with_connect_info::<SocketAddr>()));
+            Ok(Self {
+                addr,
+                ran,
+                started,
+                release,
+                metrics,
+                task,
+                _dir: None,
+            })
+        }
+
+        /// The same listener with TLS and a certificate of its own.
+        async fn start_tls() -> n0_error::Result<Self> {
+            let dir = tempfile::tempdir()?;
+            let acceptor = crate::http::CertMode::SelfSigned
+                .build(
+                    vec!["localhost".to_string()],
+                    dir.path().to_owned(),
+                    None,
+                    false,
+                )
+                .await?;
+            let metrics: Arc<crate::metrics::Metrics> = Arc::default();
+            let (app, ran, started, release) = Self::routes();
+            let (listener, addr) = Self::listener()?;
+            let server = super::bounded_server(
+                listener,
+                acceptor,
+                super::idle::Connections::new(64, metrics.clone()),
+            )?;
+            let task =
+                tokio::spawn(server.serve(app.into_make_service_with_connect_info::<SocketAddr>()));
+            Ok(Self {
+                addr,
+                ran,
+                started,
+                release,
+                metrics,
+                task,
+                _dir: Some(dir),
+            })
+        }
+
+        fn listener() -> n0_error::Result<(std::net::TcpListener, SocketAddr)> {
+            let listener = super::bind_listener(
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+                super::DEFAULT_LISTEN_BACKLOG,
+            )
+            .anyerr()?;
+            let addr = listener.local_addr().anyerr()?;
+            Ok((listener, addr))
+        }
+
+        fn routes() -> (
+            axum::Router,
+            Ran,
+            Arc<tokio::sync::Semaphore>,
+            Arc<tokio::sync::Semaphore>,
+        ) {
             use axum::{
                 Router,
                 body::Bytes,
@@ -2089,12 +2108,21 @@ mod tests {
                 routing::{get, post},
             };
 
-            let ran: Arc<std::sync::Mutex<Vec<(String, SocketAddr)>>> = Arc::default();
+            let ran: Ran = Arc::default();
+            let started = Arc::new(tokio::sync::Semaphore::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
             let recorder = ran.clone();
             let numbered = get(
                 move |ConnectInfo(peer): ConnectInfo<SocketAddr>, Path(id): Path<String>| async move {
                     recorder.lock().unwrap().push((id, peer));
                     "OK"
+                },
+            );
+            let recorder = ran.clone();
+            let big = get(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>, Path(id): Path<String>| async move {
+                    recorder.lock().unwrap().push((id, peer));
+                    "x".repeat(BIG_ANSWER)
                 },
             );
             let recorder = ran.clone();
@@ -2104,27 +2132,48 @@ mod tests {
                     "OK"
                 },
             );
+            let recorder = ran.clone();
+            let (signal, gate) = (started.clone(), release.clone());
+            let waiting = get(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>, Path(id): Path<String>| async move {
+                    recorder.lock().unwrap().push((id, peer));
+                    signal.add_permits(1);
+                    if let Ok(permit) = gate.acquire().await {
+                        permit.forget();
+                    }
+                    "OK"
+                },
+            );
             let app = Router::new()
                 .route("/n/{id}", numbered)
-                .route("/hold", held);
-            let listener = super::bind_listener(
-                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-                super::DEFAULT_LISTEN_BACKLOG,
-            )
-            .anyerr()?;
-            let addr = listener.local_addr().anyerr()?;
-            let server = super::bounded_server(
-                listener,
-                axum_server::accept::DefaultAcceptor::new(),
-                super::idle::Connections::new(64, Default::default()),
-            )?;
-            let task =
-                tokio::spawn(server.serve(app.into_make_service_with_connect_info::<SocketAddr>()));
-            Ok(Self { addr, ran, task })
+                .route("/big/{id}", big)
+                .route("/hold", held)
+                .route("/wait/{id}", waiting);
+            (app, ran, started, release)
         }
 
         fn ran(&self) -> Vec<(String, SocketAddr)> {
             self.ran.lock().unwrap().clone()
+        }
+
+        /// Waits until one more handler of `/wait/{id}` has started.
+        async fn handler_started(&self) -> n0_error::Result {
+            let permit = tokio::time::timeout(CLOSE_DEADLINE, self.started.acquire())
+                .await
+                .std_context("no handler started")?
+                .anyerr()?;
+            permit.forget();
+            Ok(())
+        }
+
+        /// Lets `count` handlers of `/wait/{id}` go on.
+        fn release(&self, count: usize) {
+            self.release.add_permits(count);
+        }
+
+        /// How many connections the drain time has cut.
+        fn drain_timeouts(&self) -> u64 {
+            self.metrics.http_connections_drain_timeouts.get()
         }
     }
 
@@ -2134,20 +2183,43 @@ mod tests {
         }
     }
 
+    /// The length of the body of `GET /big/{id}`.
+    const BIG_ANSWER: usize = 3_000;
+
+    /// The highest stream id that a first `GOAWAY` names: no stream is excluded by it.
+    const NO_LIMIT: u32 = 0x7fff_ffff;
+
+    /// How many bytes the peer can still send before the one that passes the lifetime figure.
+    fn left_to_the_figure(peer: &raw_h2::Peer) -> usize {
+        (super::idle::LIFETIME_READ_BOUND + 1).saturating_sub(peer.sent())
+    }
+
     /// A raw HTTP/2 connection to `addr` that has sent requests until it is at most 6,000 bytes
-    /// short of its budget, and the number of bytes that pass the budget when sent.
-    async fn h2_peer_near_the_budget(addr: SocketAddr) -> n0_error::Result<(raw_h2::Peer, usize)> {
+    /// short of the lifetime figure.
+    async fn h2_peer_near_the_figure(addr: SocketAddr) -> n0_error::Result<raw_h2::Peer> {
         let mut peer = raw_h2::Peer::connect(addr).await?;
-        // the preface, the peer's settings and the acknowledgement of the server's
-        let mut sent = raw_h2::PREFACE.len() + 18;
         let extra = [("x-pad", "a".repeat(3_000))];
-        let block = raw_h2::request_block("GET", "/n/p", &extra);
-        while super::idle::LIFETIME_READ_BOUND + 1 - sent > 6_000 {
+        while left_to_the_figure(&peer) > 6_000 {
             let stream = peer.request("GET", "/n/p", &extra, true).await?;
-            sent += raw_h2::frame(raw_h2::HEADERS, 5, stream, &block).len();
             h2_answer(&mut peer, stream).await?;
         }
-        Ok((peer, super::idle::LIFETIME_READ_BOUND + 1 - sent))
+        Ok(peer)
+    }
+
+    /// A request on a new stream whose head passes the lifetime figure.
+    async fn h2_request_that_passes_the_figure(
+        peer: &mut raw_h2::Peer,
+        path: &str,
+    ) -> n0_error::Result<u32> {
+        let extra = [("x-pad", "a".repeat(left_to_the_figure(peer) + 50))];
+        peer.request("GET", path, &extra, true).await
+    }
+
+    /// Bytes that start no request and pass the lifetime figure: a frame of a type that the
+    /// protocol does not define.
+    async fn h2_pass_the_figure_with_no_request(peer: &mut raw_h2::Peer) -> n0_error::Result {
+        let padding = vec![0; left_to_the_figure(peer) + 10];
+        peer.send(raw_h2::UNDEFINED, 0, 0, &padding).await
     }
 
     /// The frames of the answer on `stream`, up to the one that ends it. A reset is an error.
@@ -2172,6 +2244,76 @@ mod tests {
         }
     }
 
+    /// The frames from the server until one satisfies `done`: those read, that one last. An error
+    /// if the connection ends or nothing comes for a while first.
+    async fn frames_until(
+        peer: &mut raw_h2::Peer,
+        done: impl Fn(&raw_h2::Frame) -> bool,
+    ) -> n0_error::Result<Vec<raw_h2::Frame>> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = peer.next_frame().await?;
+            let found = done(&frame);
+            frames.push(frame);
+            if found {
+                return Ok(frames);
+            }
+        }
+    }
+
+    /// The `PING` that the server sends to start its shutdown, and not an acknowledgement.
+    fn is_ping(frame: &raw_h2::Frame) -> bool {
+        frame.kind == raw_h2::PING && frame.flags & raw_h2::ACK == 0
+    }
+
+    /// The first `GOAWAY` of a graceful shutdown, which excludes no stream.
+    fn is_first_goaway(frame: &raw_h2::Frame) -> bool {
+        frame.kind == raw_h2::GOAWAY && frame.last_stream() == Some(NO_LIMIT)
+    }
+
+    /// The `GOAWAY` that names the last stream the server takes.
+    fn is_cutoff(frame: &raw_h2::Frame) -> bool {
+        frame.kind == raw_h2::GOAWAY && frame.last_stream().is_some_and(|id| id != NO_LIMIT)
+    }
+
+    /// The frames to the end of the connection, whose shutdown `PING` is acknowledged when it
+    /// comes. An error if the connection stands on.
+    async fn frames_to_the_end(peer: &mut raw_h2::Peer) -> n0_error::Result<Vec<raw_h2::Frame>> {
+        let mut frames = Vec::new();
+        loop {
+            match peer.frame_within(CLOSE_DEADLINE).await {
+                Ok(Some(frame)) => {
+                    if is_ping(&frame) {
+                        let _ = peer.ack_ping(&frame).await;
+                    }
+                    frames.push(frame);
+                }
+                Ok(None) => n0_error::bail_any!("the connection stood on after {frames:?}"),
+                Err(_) => return Ok(frames),
+            }
+        }
+    }
+
+    /// The status and the body length of the answer to `stream` in `frames`, if the answer is
+    /// whole: the last frame of the stream ends it, and no frame of it is a reset.
+    fn whole_answer(frames: &[raw_h2::Frame], stream: u32) -> Option<(u16, usize)> {
+        let of: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.stream == stream)
+            .collect();
+        if of.iter().any(|frame| frame.kind == raw_h2::RST_STREAM) {
+            return None;
+        }
+        let status = of.iter().find_map(|frame| frame.status())?;
+        let ends = of.last()?.flags & raw_h2::END_STREAM != 0;
+        let body = of
+            .iter()
+            .filter(|frame| frame.kind == raw_h2::DATA)
+            .map(|frame| frame.payload.len())
+            .sum();
+        ends.then_some((status, body))
+    }
+
     /// The answer to one request on a raw HTTP/1 connection, up to its body `OK`.
     async fn h1_answer(stream: &mut TcpStream) -> n0_error::Result<String> {
         let mut answer = Vec::new();
@@ -2189,97 +2331,26 @@ mod tests {
         Ok(String::from_utf8_lossy(&answer).into_owned())
     }
 
-    /// A request in progress when the next request is refused is answered whole, its body and its
-    /// end included, and the refused request's handler does not run: it is reset as refused.
-    #[tokio::test]
-    #[traced_test]
-    async fn test_http2_request_in_progress_is_answered_whole_when_the_next_is_refused()
-    -> n0_error::Result {
-        let server = Recording::start()?;
-        let (mut peer, left) = h2_peer_near_the_budget(server.addr).await?;
-
-        // The head of the first request passes the budget, and its body is still to come.
-        let first = peer
-            .request(
-                "POST",
-                "/hold",
-                &[
-                    ("content-length", "4".to_string()),
-                    ("x-pad", "a".repeat(left + 50)),
-                ],
-                false,
-            )
-            .await?;
-        let second = peer.request("GET", "/n/refused", &[], true).await?;
-        loop {
-            let frame = peer.next_frame().await?;
-            if frame.stream == second {
-                assert_eq!(
-                    frame.kind,
-                    raw_h2::RST_STREAM,
-                    "the second request was answered"
-                );
-                assert_eq!(frame.reset_code(), Some(raw_h2::REFUSED_STREAM));
-                break;
-            }
-        }
-        peer.data(first, b"abcd", true).await?;
-        let frames = h2_answer(&mut peer, first).await?;
-        assert_eq!(frames[0].kind, raw_h2::HEADERS);
-        assert_eq!(frames[0].status(), Some(200));
-        let last = frames.last().expect("the answer has frames");
-        assert_eq!(last.kind, raw_h2::DATA, "the answer has no body");
-        assert_eq!(last.payload, b"OK");
-
-        // The connection ends at the allowance after the request in progress.
-        advance(super::idle::SPENT_IDLE_TIMEOUT + Duration::from_secs(1)).await;
-        assert!(
-            peer.ended_within(CLOSE_DEADLINE).await,
-            "the connection stood on"
-        );
-        let ran = server.ran();
-        assert!(
-            ran.iter().all(|(id, _)| id != "refused"),
-            "the handler of the refused request ran"
-        );
-        assert_eq!(ran.iter().filter(|(id, _)| id == "hold").count(), 1);
-        Ok(())
+    /// Whether an answer says that its connection closes after it.
+    fn says_close(answer: &str) -> bool {
+        answer.to_ascii_lowercase().contains("connection: close")
     }
 
-    /// A head whose first part passes the budget and whose rest comes two seconds later is
-    /// answered: the connection stands under the ordinary idle time while the head is in transit.
-    #[tokio::test]
-    #[traced_test]
-    async fn test_http2_head_in_transit_when_the_budget_is_passed_is_answered() -> n0_error::Result
-    {
-        let server = Recording::start()?;
-        let (mut peer, left) = h2_peer_near_the_budget(server.addr).await?;
-
-        let extra = [("x-pad", "a".repeat(left + 50))];
-        let (stream, rest) = peer
-            .request_in_parts("GET", "/n/slow", &extra, left + 20)
-            .await?;
-        // The server reads the first part, which passes the budget, before the clock moves.
-        while peer
-            .frame_within(Duration::from_millis(50))
-            .await?
-            .is_some()
-        {}
-        advance(Duration::from_secs(2)).await;
-        peer.finish_block(stream, &rest).await?;
-        let frames = h2_answer(&mut peer, stream).await?;
-        assert_eq!(frames[0].status(), Some(200));
-        Ok(())
+    /// Whether the server has ended the connection: a read gives the end or an error within a
+    /// short stretch of real time.
+    async fn h1_ended(stream: &mut TcpStream) -> bool {
+        let mut buf = [0u8; 64];
+        matches!(
+            tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut buf)).await,
+            Ok(Ok(0) | Err(_))
+        )
     }
 
-    /// The same over HTTP/1, where the answer to the request whose head passed the budget says
-    /// that the connection closes, and an answer before it does not.
-    #[tokio::test]
-    #[traced_test]
-    async fn test_http1_head_in_transit_when_the_budget_is_passed_is_answered() -> n0_error::Result
-    {
-        let server = Recording::start()?;
-        let mut stream = TcpStream::connect(server.addr).await.anyerr()?;
+    /// A raw HTTP/1 connection on which small requests have been sent and answered until at most
+    /// 6,000 bytes are short of the lifetime figure, and the number of bytes that are left to the
+    /// byte that passes it.
+    async fn h1_near_the_figure(addr: SocketAddr) -> n0_error::Result<(TcpStream, usize)> {
+        let mut stream = TcpStream::connect(addr).await.anyerr()?;
         let request = format!(
             "GET /n/p HTTP/1.1\r\nhost: localhost\r\nx-pad: {}\r\n\r\n",
             "a".repeat(3_000)
@@ -2289,18 +2360,438 @@ mod tests {
             stream.write_all(request.as_bytes()).await.anyerr()?;
             let answer = h1_answer(&mut stream).await?;
             assert!(
-                !answer.to_ascii_lowercase().contains("connection: close"),
-                "an answer under the budget says that the connection closes"
+                !says_close(&answer),
+                "an answer under the figure says that the connection closes"
             );
             sent += request.len();
         }
-        let left = super::idle::LIFETIME_READ_BOUND + 1 - sent;
+        Ok((stream, super::idle::LIFETIME_READ_BOUND + 1 - sent))
+    }
+
+    /// C1. An answer whose handler has returned and that the peer's window blocks is delivered
+    /// whole after the figure is passed by a request that starts later: every `DATA` frame and
+    /// its end arrive, then the connection ends.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_answer_blocked_by_the_window_is_delivered_whole_in_the_drain()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        peer.set_initial_window(0).await?;
+        let a = peer.request("GET", "/big/a", &[], true).await?;
+        let mut seen = frames_until(&mut peer, |frame| {
+            frame.stream == a && frame.status().is_some()
+        })
+        .await?;
+        let b = h2_request_that_passes_the_figure(&mut peer, "/n/b").await?;
+        seen.extend(frames_until(&mut peer, is_first_goaway).await?);
+        let ping = frames_until(&mut peer, is_ping).await?;
+        peer.ack_ping(ping.last().expect("a ping")).await?;
+        seen.extend(ping);
+        peer.window_update(a, 65_535).await?;
+        peer.window_update(b, 65_535).await?;
+        seen.extend(frames_to_the_end(&mut peer).await?);
+        assert_eq!(whole_answer(&seen, a), Some((200, BIG_ANSWER)));
+        assert_eq!(whole_answer(&seen, b), Some((200, 2)));
+        Ok(())
+    }
+
+    /// C2. The figure falls inside the header block of a request while another is held: the first
+    /// `GOAWAY` comes before the block is finished, the block is finished before the peer
+    /// acknowledges the `PING` (a compliant peer cannot do otherwise), and both requests are
+    /// answered whole, the final stream id being the second request's or later.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_head_in_transit_when_the_figure_is_passed_is_answered() -> n0_error::Result
+    {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        let a = peer.request("GET", "/wait/a", &[], true).await?;
+        server.handler_started().await?;
+        let left = left_to_the_figure(&peer);
+        let extra = [("x-pad", "a".repeat(left + 50))];
+        let (b, rest) = peer
+            .request_in_parts("GET", "/n/b", &extra, left + 20)
+            .await?;
+        let mut seen = frames_until(&mut peer, is_first_goaway).await?;
+        let goaway = seen.last().expect("a goaway");
+        assert_eq!(goaway.goaway_code(), Some(raw_h2::NO_ERROR));
+        let ping = frames_until(&mut peer, is_ping).await?;
+        peer.finish_block(b, &rest).await?;
+        peer.ack_ping(ping.last().expect("a ping")).await?;
+        seen.extend(ping);
+        server.release(1);
+        seen.extend(frames_to_the_end(&mut peer).await?);
+        assert_eq!(whole_answer(&seen, a), Some((200, 2)));
+        assert_eq!(whole_answer(&seen, b), Some((200, 2)));
+        let cutoff = seen
+            .iter()
+            .rfind(|frame| is_cutoff(frame))
+            .expect("a cutoff");
+        assert!(cutoff.last_stream() >= Some(b), "{cutoff:?}");
+        Ok(())
+    }
+
+    /// C3. The shutdown's frames come in order: a `GOAWAY` that excludes no stream, a `PING`, and
+    /// after its acknowledgement a `GOAWAY` that names the last stream, the connection ending
+    /// after the answer is whole, with no reset. The request that passes the figure is the last
+    /// one named.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_shutdown_frames_come_in_order_and_no_stream_is_reset() -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        assert!(peer.sent() <= super::idle::LIFETIME_READ_BOUND);
+        let last = h2_request_that_passes_the_figure(&mut peer, "/n/last").await?;
+        assert!(peer.sent() > super::idle::LIFETIME_READ_BOUND);
+        let frames = frames_to_the_end(&mut peer).await?;
+        let control: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.kind == raw_h2::GOAWAY || is_ping(frame))
+            .collect();
+        assert_eq!(control.len(), 3, "{control:?}");
+        assert!(is_first_goaway(control[0]), "{control:?}");
+        assert_eq!(control[0].goaway_code(), Some(raw_h2::NO_ERROR));
+        assert!(
+            is_ping(control[1]) && control[1].payload.len() == 8,
+            "{control:?}"
+        );
+        assert!(is_cutoff(control[2]), "{control:?}");
+        assert_eq!(control[2].last_stream(), Some(last));
+        assert_eq!(control[2].goaway_code(), Some(raw_h2::NO_ERROR));
+        assert!(
+            frames.iter().all(|frame| frame.kind != raw_h2::RST_STREAM),
+            "{frames:?}"
+        );
+        assert_eq!(whole_answer(&frames, last), Some((200, 2)));
+        Ok(())
+    }
+
+    /// C3, the deliberate case. A peer that sends a window update and the `PING`'s
+    /// acknowledgement at once and then reads nothing, while the server finishes and closes,
+    /// still reads the answer's last data with its end and the last `GOAWAY` before any reset.
+    /// The case waits until its own writes fail, which is when the server's close has come back
+    /// to it as a reset.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_peer_with_unread_input_at_the_close_reads_the_whole_answer()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        let last = h2_request_that_passes_the_figure(&mut peer, "/big/last").await?;
+        let mut seen = frames_until(&mut peer, is_ping).await?;
+        peer.ack_ping(seen.last().expect("a ping")).await?;
+        peer.window_update(0, 1).await?;
+        peer.window_update(last, 1).await?;
+        let mut probes = 0;
+        while peer.send(raw_h2::PING, 0, 0, &[0; 8]).await.is_ok() {
+            probes += 1;
+            assert!(probes < 1_000, "the server did not close the connection");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        while let Ok(Some(frame)) = peer.frame_within(CLOSE_DEADLINE).await {
+            seen.push(frame);
+        }
+        assert_eq!(
+            whole_answer(&seen, last),
+            Some((200, BIG_ANSWER)),
+            "{seen:?}"
+        );
+        assert!(seen.iter().any(is_cutoff), "{seen:?}");
+        Ok(())
+    }
+
+    /// C4. A stream that opens after the second `GOAWAY` runs no handler and gets no frame, while
+    /// an accepted request keeps the connection open.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_stream_after_the_cutoff_runs_no_handler_and_gets_no_frame()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        let a = peer.request("GET", "/wait/a", &[], true).await?;
+        server.handler_started().await?;
+        let b = h2_request_that_passes_the_figure(&mut peer, "/n/b").await?;
+        let mut seen = frames_until(&mut peer, is_first_goaway).await?;
+        let ping = frames_until(&mut peer, is_ping).await?;
+        peer.ack_ping(ping.last().expect("a ping")).await?;
+        seen.extend(ping);
+        seen.extend(frames_until(&mut peer, is_cutoff).await?);
+        let c = peer.request("GET", "/n/c", &[], true).await?;
+        while let Some(frame) = peer.frame_within(Duration::from_millis(300)).await? {
+            assert_ne!(
+                frame.stream, c,
+                "a frame on the stream after the cutoff: {frame:?}"
+            );
+            seen.push(frame);
+        }
+        assert!(
+            server.ran().iter().all(|(id, _)| id != "c"),
+            "{:?}",
+            server.ran()
+        );
+        server.release(1);
+        seen.extend(frames_to_the_end(&mut peer).await?);
+        assert_eq!(whole_answer(&seen, a), Some((200, 2)));
+        assert_eq!(whole_answer(&seen, b), Some((200, 2)));
+        assert!(seen.iter().all(|frame| frame.stream != c), "{seen:?}");
+        Ok(())
+    }
+
+    /// C5. Two streams in progress when the figure is passed are both answered whole.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_two_streams_in_progress_at_the_figure_are_both_answered() -> n0_error::Result
+    {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        let a = peer.request("GET", "/wait/a", &[], true).await?;
+        let b = peer.request("GET", "/wait/b", &[], true).await?;
+        server.handler_started().await?;
+        server.handler_started().await?;
+        h2_pass_the_figure_with_no_request(&mut peer).await?;
+        let mut seen = frames_until(&mut peer, is_first_goaway).await?;
+        server.release(2);
+        seen.extend(frames_to_the_end(&mut peer).await?);
+        assert_eq!(whole_answer(&seen, a), Some((200, 2)));
+        assert_eq!(whole_answer(&seen, b), Some((200, 2)));
+        Ok(())
+    }
+
+    /// C6. A connection that has passed the figure with no request in progress begins its
+    /// shutdown when the next request starts, from the task of that request: the first `GOAWAY`
+    /// comes while the handler is held, with nothing more from the peer.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_request_after_the_figure_starts_the_shutdown_while_it_is_held()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        h2_pass_the_figure_with_no_request(&mut peer).await?;
+        let a = peer.request("GET", "/wait/a", &[], true).await?;
+        server.handler_started().await?;
+        let mut seen = frames_until(&mut peer, is_first_goaway).await?;
+        server.release(1);
+        seen.extend(frames_to_the_end(&mut peer).await?);
+        assert_eq!(whole_answer(&seen, a), Some((200, 2)));
+        Ok(())
+    }
+
+    /// C13. The peer withholds its window: the answer to an accepted request cannot go out, and
+    /// the connection ends 20 seconds after the call of the shutdown, not before, and the counter
+    /// counts one. The `PING` is acknowledged, so that the window is the only cause.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_answer_that_the_window_blocks_ends_with_the_drain_time() -> n0_error::Result
+    {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        peer.set_initial_window(0).await?;
+        let a = peer.request("GET", "/big/a", &[], true).await?;
+        frames_until(&mut peer, |frame| {
+            frame.stream == a && frame.status().is_some()
+        })
+        .await?;
+        h2_request_that_passes_the_figure(&mut peer, "/n/b").await?;
+        frames_until(&mut peer, is_first_goaway).await?;
+        let ping = frames_until(&mut peer, is_ping).await?;
+        peer.ack_ping(ping.last().expect("a ping")).await?;
+        advance(super::idle::DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+        while peer
+            .frame_within(Duration::from_millis(50))
+            .await?
+            .is_some()
+        {}
+        assert_eq!(server.drain_timeouts(), 0);
+        advance(Duration::from_secs(2)).await;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "the connection stood on"
+        );
+        assert_eq!(server.drain_timeouts(), 1);
+        Ok(())
+    }
+
+    /// C13, the late request. A request that reaches the service 15 seconds after the call, before
+    /// the shutdown is acknowledged, is accepted, and the drain time cuts it at 20 seconds
+    /// whatever its own deadline: the counter counts one and no answer arrives.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_request_accepted_late_in_the_drain_is_cut_at_the_drain_time()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        let a = peer.request("GET", "/wait/a", &[], true).await?;
+        server.handler_started().await?;
+        h2_request_that_passes_the_figure(&mut peer, "/n/b").await?;
+        frames_until(&mut peer, is_first_goaway).await?;
+        advance(Duration::from_secs(15)).await;
+        let late = peer.request("GET", "/wait/late", &[], true).await?;
+        server.handler_started().await?;
+        advance(Duration::from_secs(6)).await;
+        let mut seen = Vec::new();
+        loop {
+            match peer.frame_within(CLOSE_DEADLINE).await {
+                Ok(Some(frame)) => seen.push(frame),
+                Ok(None) => n0_error::bail_any!("the connection stood on after {seen:?}"),
+                Err(_) => break,
+            }
+        }
+        assert!(seen.iter().all(|frame| frame.stream != late), "{seen:?}");
+        assert_eq!(server.drain_timeouts(), 1);
+        assert!(server.ran().iter().any(|(id, _)| id == "late"));
+        let _ = a;
+        Ok(())
+    }
+
+    /// C13, the `PING` that is never acknowledged. The going-away id stays at the highest stream,
+    /// so the connection does not close when its answers are out; the drain time ends it.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_ping_that_is_never_acknowledged_ends_with_the_drain_time()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        let a = peer.request("GET", "/wait/a", &[], true).await?;
+        server.handler_started().await?;
+        let b = h2_request_that_passes_the_figure(&mut peer, "/n/b").await?;
+        let mut seen = frames_until(&mut peer, is_first_goaway).await?;
+        seen.extend(frames_until(&mut peer, is_ping).await?);
+        server.release(1);
+        seen.extend(
+            frames_until(&mut peer, |frame| {
+                frame.stream == a && frame.flags & raw_h2::END_STREAM != 0
+            })
+            .await?,
+        );
+        advance(super::idle::DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+        while peer
+            .frame_within(Duration::from_millis(50))
+            .await?
+            .is_some()
+        {}
+        assert_eq!(server.drain_timeouts(), 0);
+        advance(Duration::from_secs(2)).await;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "the connection stood on"
+        );
+        assert_eq!(server.drain_timeouts(), 1);
+        let _ = b;
+        Ok(())
+    }
+
+    /// C14. A request head that stays in transit more than 20 seconds after the call, beside a
+    /// request in progress, ends with the drain time: the connection has ended at 20 seconds, and
+    /// the counter counts one.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_head_that_stays_in_transit_ends_with_the_drain_time() -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        peer.request("GET", "/wait/a", &[], true).await?;
+        server.handler_started().await?;
+        let left = left_to_the_figure(&peer);
+        let extra = [("x-pad", "a".repeat(left + 50))];
+        peer.request_in_parts("GET", "/n/b", &extra, left + 20)
+            .await?;
+        frames_until(&mut peer, is_first_goaway).await?;
+        advance(super::idle::DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+        while peer
+            .frame_within(Duration::from_millis(50))
+            .await?
+            .is_some()
+        {}
+        assert_eq!(server.drain_timeouts(), 0);
+        advance(Duration::from_secs(2)).await;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "the connection stood on"
+        );
+        assert_eq!(server.drain_timeouts(), 1);
+        Ok(())
+    }
+
+    /// C15, on the wire. Control frames that the peer sends after the first `GOAWAY` count
+    /// toward the bytes: a flood of window updates that a compliant peer may send ends the
+    /// connection at the hard stop, which is not a cut by the drain time and is not counted.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_control_frames_after_the_first_goaway_spend_the_bytes() -> n0_error::Result
+    {
+        let server = Recording::start()?;
+        let mut peer = h2_peer_near_the_figure(server.addr).await?;
+        peer.request("GET", "/wait/a", &[], true).await?;
+        server.handler_started().await?;
+        h2_request_that_passes_the_figure(&mut peer, "/n/b").await?;
+        frames_until(&mut peer, is_first_goaway).await?;
+        let ping = frames_until(&mut peer, is_ping).await?;
+        peer.ack_ping(ping.last().expect("a ping")).await?;
+        let mut frames = 0;
+        while frames < 3_000 && peer.window_update(0, 1).await.is_ok() {
+            frames += 1;
+        }
+        assert!(peer.sent() > super::idle::HARD_READ_BOUND);
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "the connection stood on"
+        );
+        assert_eq!(server.drain_timeouts(), 0);
+        Ok(())
+    }
+
+    /// C11. A request in progress when the figure is passed is answered whole with
+    /// `Connection: close`, and the connection ends; a request pipelined behind it is not answered
+    /// and its handler does not run. A request that starts and ends in one poll, after the figure,
+    /// says close too.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http1_request_in_progress_at_the_figure_is_answered_with_close()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+
+        let (mut stream, left) = h1_near_the_figure(server.addr).await?;
+        let head = format!(
+            "GET /n/trivial HTTP/1.1\r\nhost: localhost\r\nx-pad: {}\r\n\r\n",
+            "a".repeat(left + 50)
+        );
+        stream.write_all(head.as_bytes()).await.anyerr()?;
+        let answer = h1_answer(&mut stream).await?;
+        assert!(says_close(&answer), "{answer}");
+        assert!(h1_ended(&mut stream).await, "the connection stood on");
+
+        let (mut stream, left) = h1_near_the_figure(server.addr).await?;
+        let mut requests = format!(
+            "POST /hold HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4\r\nx-pad: {}\r\n\r\n",
+            "a".repeat(left + 50)
+        );
+        requests.push_str("GET /n/second HTTP/1.1\r\nhost: localhost\r\n\r\n");
+        stream.write_all(requests.as_bytes()).await.anyerr()?;
+        stream.write_all(b"abcd").await.anyerr()?;
+        let answer = h1_answer(&mut stream).await?;
+        assert!(says_close(&answer), "{answer}");
+        assert!(h1_ended(&mut stream).await, "the connection stood on");
+        let ran = server.ran();
+        assert_eq!(ran.iter().filter(|(id, _)| id == "hold").count(), 1);
+        assert!(ran.iter().all(|(id, _)| id != "second"), "{ran:?}");
+        Ok(())
+    }
+
+    /// C12. A head whose first part passes the figure on an idle connection and whose rest comes
+    /// 20 seconds later is answered, with `Connection: close`, and not cut: the shutdown begins
+    /// when the request starts, not when the figure is passed.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http1_head_in_transit_when_the_figure_is_passed_is_answered() -> n0_error::Result
+    {
+        let server = Recording::start()?;
+        let (mut stream, left) = h1_near_the_figure(server.addr).await?;
         let head = format!(
             "GET /n/slow HTTP/1.1\r\nhost: localhost\r\nx-pad: {}",
             "a".repeat(left + 50)
         );
         stream.write_all(head.as_bytes()).await.anyerr()?;
-        // The server reads the first part, which passes the budget, before the clock moves.
+        // The server reads the first part, which passes the figure, before the clock moves.
         let mut buf = [0u8; 64];
         assert!(
             tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf))
@@ -2308,75 +2799,294 @@ mod tests {
                 .is_err(),
             "the server answered a head that is not whole"
         );
-        advance(Duration::from_secs(2)).await;
+        advance(Duration::from_secs(20)).await;
         stream.write_all(b"\r\n\r\n").await.anyerr()?;
         let answer = h1_answer(&mut stream).await?;
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(says_close(&answer), "{answer}");
+        Ok(())
+    }
+
+    /// The pad of a request: a header value that differs from request to request, so that no
+    /// protocol compresses it away.
+    fn pad_of(id: usize) -> String {
+        use rand_chacha::ChaCha8Rng;
+
+        const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let mut rng = ChaCha8Rng::seed_from_u64(id as u64);
+        (0..PAD)
+            .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
+            .collect()
+    }
+
+    /// The size of the pad of each request, and the least of the bytes that a request takes on the
+    /// wire, in either protocol: HTTP/2's Huffman code spends at least 5 bits for each of these
+    /// characters.
+    const PAD: usize = 1_500;
+    const LEAST_BYTES_PER_REQUEST: usize = PAD * 5 / 8;
+
+    /// What each request of an ordinary client came back with: its id, the protocol of the answer
+    /// and whether the answer says that the connection closes.
+    type Answered = Vec<(usize, reqwest::Version, bool)>;
+
+    /// Eight tasks on four threads send 400 requests in all through `client`, each request with a
+    /// pad of its own, across the lifetime figure several times: no caller sees an error, every
+    /// body is whole, no handler runs twice, and more connections serve them than the figure
+    /// alone makes necessary. The server cuts none of them by the drain time.
+    async fn ordinary_clients_cross_the_figure(
+        server: &Recording,
+        scheme: &str,
+        make_client: impl Fn() -> reqwest::Client,
+    ) -> n0_error::Result<Answered> {
+        const REQUESTS: usize = 400;
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (client, next, addr) = (make_client(), next.clone(), server.addr);
+                let scheme = scheme.to_string();
+                tokio::spawn(async move {
+                    let mut answered = Vec::new();
+                    loop {
+                        let id = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if id >= REQUESTS {
+                            return n0_error::Ok(answered);
+                        }
+                        let response = client
+                            .get(format!("{scheme}://{addr}/n/{id}"))
+                            .header("x-pad", pad_of(id))
+                            .send()
+                            .await
+                            .anyerr()?;
+                        assert_eq!(response.status(), 200, "request {id}");
+                        let version = response.version();
+                        let closes = response
+                            .headers()
+                            .get("connection")
+                            .is_some_and(|value| value == "close");
+                        assert_eq!(response.text().await.anyerr()?, "OK", "request {id}");
+                        answered.push((id, version, closes));
+                    }
+                })
+            })
+            .collect();
+        let mut answered = Vec::new();
+        for task in tasks {
+            answered.extend(task.await.anyerr()??);
+        }
+        let ran = server.ran();
+        let mut ids: Vec<usize> = ran
+            .iter()
+            .map(|(id, _)| id.parse().expect("an id"))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..REQUESTS).collect::<Vec<_>>(),
+            "each request runs once"
+        );
+        let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
+        let crossings = REQUESTS * LEAST_BYTES_PER_REQUEST / super::idle::HARD_READ_BOUND;
+        assert!(crossings >= 3, "the case sends too little: {crossings}");
         assert!(
-            answer.to_ascii_lowercase().contains("connection: close"),
-            "the answer does not say that the connection closes: {answer}"
+            peers.len() > crossings,
+            "{} connections for at least {crossings} crossings",
+            peers.len()
+        );
+        assert_eq!(server.drain_timeouts(), 0);
+        Ok(answered)
+    }
+
+    /// C8. Over HTTP/2 without TLS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[traced_test]
+    async fn test_http2_ordinary_clients_are_served_across_the_figure() -> n0_error::Result {
+        let server = Recording::start()?;
+        let client = || {
+            reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .use_preconfigured_tls(self::tls::insecure_tls_config())
+                .build()
+                .expect("a client")
+        };
+        let answered = ordinary_clients_cross_the_figure(&server, "http", client).await?;
+        assert!(
+            answered
+                .iter()
+                .all(|(_, version, _)| *version == reqwest::Version::HTTP_2)
         );
         Ok(())
     }
 
-    /// An ordinary client that keeps its connections sends requests across the budget three
-    /// times: its caller sees no error, no request runs twice, and the request that meets a spent
-    /// connection is answered on a new one.
-    async fn an_ordinary_client_is_served_across_the_budget(
-        client: reqwest::Client,
-    ) -> n0_error::Result {
-        let server = Recording::start()?;
-        let mut requests = 0;
-        let mut reached = None;
-        loop {
-            let url = format!("http://{}/n/{requests}", server.addr);
-            let response = client.get(url).send().await.anyerr()?;
-            assert_eq!(response.status(), 200, "request {requests}");
-            assert_eq!(response.text().await.anyerr()?, "OK");
-            requests += 1;
-            let ran = server.ran();
-            let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
-            if peers.len() == 4 && reached.is_none() {
-                reached = Some(requests);
-            }
-            if reached.is_some_and(|at| requests >= at + 5) {
-                break;
-            }
-            assert!(
-                requests < 20_000,
-                "{} connections in {requests} requests",
-                peers.len()
-            );
-        }
-        let ran = server.ran();
-        let ids: Vec<_> = ran.iter().map(|(id, _)| id.clone()).collect();
-        let expected: Vec<_> = (0..requests).map(|n| n.to_string()).collect();
-        assert_eq!(ids, expected, "each request runs once, in order");
-        let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
-        assert_eq!(peers.len(), 4, "connections that served the requests");
+    /// C9. Over HTTP/2 with TLS, which is the one the deployment serves; the answers prove that
+    /// HTTP/2 was negotiated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[traced_test]
+    async fn test_http2_over_tls_ordinary_clients_are_served_across_the_figure() -> n0_error::Result
+    {
+        let server = Recording::start_tls().await?;
+        let client = || {
+            reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .use_preconfigured_tls(self::tls::insecure_tls_config())
+                .build()
+                .expect("a client")
+        };
+        let answered = ordinary_clients_cross_the_figure(&server, "https", client).await?;
+        assert!(
+            answered
+                .iter()
+                .all(|(_, version, _)| *version == reqwest::Version::HTTP_2)
+        );
         Ok(())
     }
 
-    #[tokio::test]
+    /// C10. Over HTTP/1 only, which is what the product's own client speaks: `Connection: close`
+    /// is on the answers that cross the figure, and each of those is the last that its connection
+    /// carried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[traced_test]
-    async fn test_http1_ordinary_client_is_served_across_the_lifetime_budget() -> n0_error::Result {
-        let client = reqwest::Client::builder()
-            .http1_only()
-            .use_preconfigured_tls(self::tls::insecure_tls_config())
-            .build()
-            .anyerr()?;
-        an_ordinary_client_is_served_across_the_budget(client).await
+    async fn test_http1_ordinary_clients_are_served_across_the_figure() -> n0_error::Result {
+        let server = Recording::start()?;
+        let client = || {
+            reqwest::Client::builder()
+                .http1_only()
+                .use_preconfigured_tls(self::tls::insecure_tls_config())
+                .build()
+                .expect("a client")
+        };
+        let answered = ordinary_clients_cross_the_figure(&server, "http", client).await?;
+        let ran = server.ran();
+        let peer_of = |id: usize| {
+            ran.iter()
+                .find(|(ran_id, _)| ran_id == &id.to_string())
+                .map(|(_, peer)| *peer)
+                .expect("a handler ran")
+        };
+        let closing: Vec<usize> = answered
+            .iter()
+            .filter(|(_, _, closes)| *closes)
+            .map(|(id, _, _)| *id)
+            .collect();
+        assert!(
+            !closing.is_empty(),
+            "no answer says that its connection closes"
+        );
+        for id in &closing {
+            let peer = peer_of(*id);
+            let last = ran
+                .iter()
+                .rfind(|(_, ran_peer)| *ran_peer == peer)
+                .expect("a request");
+            assert_eq!(
+                last.0,
+                id.to_string(),
+                "a request followed the answer that says close"
+            );
+        }
+        let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
+        assert!(
+            peers.len() - closing.len() <= 8,
+            "{} connections, {} answers that close",
+            peers.len(),
+            closing.len()
+        );
+        Ok(())
     }
 
-    #[tokio::test]
+    /// The text of an error and of every error that caused it.
+    fn error_chain(error: &dyn std::error::Error) -> String {
+        let mut text = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            text.push_str(" | ");
+            text.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        text
+    }
+
+    /// C8, the named limit. Eight tasks share ONE HTTP/2 client across the figure, so more requests
+    /// wait than the connection's 2 streams take. A request that waits can get an error when the
+    /// connection reaches its figure, and the error is the one that the client library gives for a
+    /// request that it dropped; the request sent again on the same client is answered. No answer
+    /// is cut short, and no handler runs more often than its request was sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[traced_test]
-    async fn test_http2_ordinary_client_is_served_across_the_lifetime_budget() -> n0_error::Result {
+    async fn test_http2_requests_waiting_on_one_client_meet_at_most_one_error_at_the_figure()
+    -> n0_error::Result {
+        const REQUESTS: usize = 400;
+        let server = Recording::start()?;
         let client = reqwest::Client::builder()
             .http2_prior_knowledge()
             .use_preconfigured_tls(self::tls::insecure_tls_config())
             .build()
             .anyerr()?;
-        an_ordinary_client_is_served_across_the_budget(client).await
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (client, next, addr) = (client.clone(), next.clone(), server.addr);
+                tokio::spawn(async move {
+                    let mut sent = Vec::new();
+                    loop {
+                        let id = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if id >= REQUESTS {
+                            return n0_error::Ok(sent);
+                        }
+                        let mut attempts = 0;
+                        loop {
+                            attempts += 1;
+                            let sent_now = client
+                                .get(format!("http://{addr}/n/{id}"))
+                                .header("x-pad", pad_of(id))
+                                .send()
+                                .await;
+                            match sent_now {
+                                Ok(response) => {
+                                    assert_eq!(response.status(), 200, "request {id}");
+                                    assert_eq!(
+                                        response.text().await.anyerr()?,
+                                        "OK",
+                                        "an answer to request {id} was cut short"
+                                    );
+                                    break;
+                                }
+                                Err(error) => {
+                                    let chain = error_chain(&error);
+                                    assert!(
+                                        chain.contains("dispatch task is gone"),
+                                        "request {id} met another error: {chain}"
+                                    );
+                                    assert_eq!(attempts, 1, "request {id} failed when sent again");
+                                }
+                            }
+                        }
+                        sent.push((id, attempts));
+                    }
+                })
+            })
+            .collect();
+        let mut sent = Vec::new();
+        for task in tasks {
+            sent.extend(task.await.anyerr()??);
+        }
+        let ran = server.ran();
+        for (id, attempts) in &sent {
+            let runs = ran
+                .iter()
+                .filter(|(ran_id, _)| ran_id == &id.to_string())
+                .count();
+            assert!(
+                (1..=*attempts).contains(&runs),
+                "request {id} was sent {attempts} times and its handler ran {runs}"
+            );
+        }
+        assert_eq!(sent.len(), REQUESTS);
+        let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
+        assert!(peers.len() > 1, "the figure was never passed");
+        assert_eq!(server.drain_timeouts(), 0);
+        let resent = sent.iter().filter(|(_, attempts)| *attempts > 1).count();
+        eprintln!("{} connections, {resent} requests sent again", peers.len());
+        Ok(())
     }
 
     /// A DNS query as large as the stream's window is read and answered `200`, and one frame past

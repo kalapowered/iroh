@@ -7,7 +7,8 @@
 //! request. Bytes that arrive without starting a request, such as the pings of an idle HTTP/2
 //! connection, do not extend it. A request in progress is bounded by its own deadline. A connection
 //! may also read only [`READ_BOUND`] bytes between two request starts, counted after its handshake,
-//! and [`LIFETIME_READ_BOUND`] in its life, after which it takes no further request.
+//! and [`LIFETIME_READ_BOUND`] in its life, after which it is shut down gracefully and ended within
+//! [`DRAIN_TIMEOUT`].
 
 use std::{
     future::Future,
@@ -28,6 +29,7 @@ use http::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::Notify,
     time::{Instant, Sleep},
 };
 use tower_service::Service;
@@ -65,54 +67,75 @@ pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// idle bound.
 pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 
-/// The most bytes a connection may read in its life, counted as [`READ_BOUND`] counts them:
-/// 65,536. It bounds what a connection may send in its life, so that nothing that a connection
-/// makes the server keep can grow with the connection's age: what the server keeps for a
-/// connection came in the bytes that the peer sent, and the peer may send this many, and the
-/// bytes after it that the rules below allow. The figure was taken from the group's peak with the
-/// cap of connections, each of them in the shapes that held the most (the table in `FORK.md`).
+/// The most bytes a connection may read in its life before it is shut down gracefully: 65,536,
+/// counted as [`READ_BOUND`] counts them. It bounds what a connection may send in its life, so that
+/// nothing that a connection makes the server keep can grow with the connection's age: what the
+/// server keeps for a connection came in the bytes that the peer sent, and the peer may send this
+/// many, and the bytes after it that the rules below allow. The figure was taken from the group's
+/// peak with the cap of connections, each of them in the shapes that held the most (the table in
+/// `FORK.md`).
 ///
-/// When the count passes this figure the connection serves the requests that are in progress at
-/// that moment or, when none is, the first request that starts, and refuses every request that
-/// starts after those. The bytes that carried the figure make no difference: it may be passed in
-/// the head of a request, in its body, or in bytes that start no request.
+/// When the count passes this figure the connection's own task calls the graceful shutdown of the
+/// HTTP library (`serve::drive`) at the first moment a request is in progress: at the crossing if
+/// one is, otherwise when the next request starts. The library tells the client and ends the
+/// connection once the answers are out: over HTTP/2 with a `GOAWAY`, a `PING` and a second
+/// `GOAWAY` that names the last stream it accepted, over HTTP/1 with `Connection: close` on the
+/// answer, which [`Tracked`] adds. The requests in progress, and those that start before the client
+/// has read the news, are served and their answers sent; none is refused. A head in transit when
+/// the figure is passed, with no request in progress, is not cut: it completes under the ordinary
+/// times and is the first request after the figure. The bytes that carried the figure make no
+/// difference: it may be passed in the head of a request, in its body, or in bytes that start no
+/// request.
 ///
-/// - **Refusal.** A refused request does not reach its handler. Over HTTP/2 its stream is reset
-///   with `REFUSED_STREAM`, which tells the client that the request was not processed and may be
-///   sent again; over HTTP/1 the answer to the last request served says `Connection: close`, so
-///   the client opens a new connection for its next request. A connection that refuses a request
-///   with no other in progress ends at the first flush that follows the next write after the
-///   refusal. That write is usually the reset, but the state does not tell it from another
-///   write, and a client whose reset did not come first meets a closed connection. With others
-///   in progress the connection stands until they have ended, and a request sent again before
-///   then is refused again.
-/// - **Time.** A connection that takes no further request stands for [`SPENT_IDLE_TIMEOUT`] at
-///   most when it has no request in progress, in place of [`IDLE_TIMEOUT`]. The allowance is not
-///   zero, because an answer is written after the request that made it has ended. Until then, a
-///   connection that passed the figure with no request in progress stands under the ordinary
-///   times, as one whose head is in transit does: the stream cannot tell a head from other bytes.
-///   So a connection ends at most [`IDLE_TIMEOUT`], then the request deadline (10 seconds), then
-///   [`SPENT_IDLE_TIMEOUT`] after the figure is passed, 41 seconds, and gives back its place among
-///   the connections.
-/// - **Bytes.** The bound between starts ([`READ_BOUND`]) holds as before, counted from the last
-///   request served, and no read takes more than the byte that passes it. After the figure a
-///   connection reads at most `2 * (READ_BOUND + 1)`, 49,154 bytes: the interval in which the
-///   figure was passed, and, when no request was in progress then, the interval of the last
-///   request served.
-/// - **Limits.** A request counts as in progress until its handler has returned the response,
-///   not until the response has been sent whole, so a refusal that comes between the two can end
-///   the connection first. A head in transit beside a request in progress when the figure is
-///   passed has the ordinary times only until that request ends, and then the allowance. The
-///   server sends no `GOAWAY` of its own at the figure.
+/// - **Time.** The call starts a timer of [`DRAIN_TIMEOUT`]. A connection that is still open when
+///   it ends is dropped, with no `close_notify`, and is counted in
+///   `http_connections_drain_timeouts`. The counter holds the connections that reached the 20
+///   seconds, whatever the cause: an answer that the client holds back through its flow-control
+///   window or a slow link, a body or a handler that runs on, a request accepted late in the
+///   drain, a head that stays in transit, and a client that never acknowledges the `PING`, which
+///   leaves the connection standing until the timer. The byte stop below is not counted.
+/// - **Bytes.** The read that carries the figure ends at the byte that passes it, the 65,537th of
+///   the connection's life, and the connection reads at most [`READ_BOUND`] bytes in all from the
+///   figure's first byte: 24,575 more, and the 90,113th byte ends it with no further notice. The
+///   count is that of the connection's life, so a request start does not begin it again. Every byte
+///   that the wrapper reads counts, control frames after the first `GOAWAY` included.
+/// - **Time after the figure.** A connection that passed the figure with no request in progress
+///   stands under the ordinary idle time, [`IDLE_TIMEOUT`] from its last request, until a request
+///   starts, and then for [`DRAIN_TIMEOUT`] from the call.
 ///
-/// A client that keeps one connection for many requests meets a refusal after about this many
-/// bytes of requests. Whether it then reaches a new connection without an error depends on its
-/// library and on the order of its requests.
+/// What the rules do not promise, each with a case in `http.rs`:
+///
+/// - **Requests that cannot finish in the 20 seconds.** A request that the service accepted and
+///   that is not finished by then is cut with its connection. That holds for an answer that the
+///   client's window or a slow link holds back, a body or a handler that runs on, and a request
+///   accepted late in the drain, with its body and its handler. Over HTTP/2 the library goes on
+///   accepting streams until the client has acknowledged the `PING`. The client meets a connection
+///   that ends with no `close_notify`. A `GOAWAY` that the protocol sends is not a promise about the
+///   result of such a request: a replay that the protocol authorises is one thing, and an
+///   application's retry after an uncertain result is another, and it depends on whether the
+///   operation tolerates being repeated. The byte stop can leave an uncertain result in the same way.
+/// - **A head in transit.** A head that stays in transit for more than 20 seconds after the call,
+///   beside a request in progress, is cut with the connection.
+/// - **Bytes after the figure.** More than 24,575 bytes after the byte that passes the figure end
+///   the connection, whatever they carry, including control frames after the first `GOAWAY`.
+/// - **Two cuts that are not new.** An answer that the client's window blocks and that is not
+///   delivered ends at the idle bound of 30 seconds after its handler has returned. Over HTTP/1 a
+///   request that the client pipelined behind the closing answer is not answered.
+///
+/// A client that keeps one connection for many requests is told, after about this many bytes of
+/// requests, to continue on a new one. A client that has more requests waiting than a connection's
+/// 2 streams can get an error for a waiting request when the connection reaches the figure, and it
+/// sends the request again. The product's own client speaks HTTP/1 and reads `Connection: close`.
 pub(super) const LIFETIME_READ_BOUND: usize = 64 * 1024;
 
-/// How long a connection that takes no further request may stand with no request in progress, in
-/// place of [`IDLE_TIMEOUT`]. An answer is written after the request that made it has ended.
-pub(super) const SPENT_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a connection may stand after its graceful shutdown has begun: 20 seconds from the
+/// call. A request that starts just before the client reads the shutdown has its own deadline of
+/// 10 seconds, and 10 seconds remain for the acknowledgement and the delivery.
+pub(super) const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The most bytes a connection may read in its life: [`LIFETIME_READ_BOUND`] and the interval
+/// that follows it.
+pub(super) const HARD_READ_BOUND: usize = LIFETIME_READ_BOUND + READ_BOUND;
 
 /// The connections that the server holds at once, from the accept to the close, across its
 /// listeners. A connection that would be one more than `max` is closed at once.
@@ -144,6 +167,11 @@ impl Connections {
         Some(Slot(self.clone()))
     }
 
+    /// The server's metrics, which the connections of this cap report to.
+    pub(super) fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     #[cfg(test)]
     fn held(&self) -> usize {
         self.held.load(Ordering::SeqCst)
@@ -163,12 +191,17 @@ impl Drop for Slot {
 }
 
 /// What a connection's stream and its service both see. The count of requests in progress, the
-/// time the connection last had none and the bytes read since a request last started change
-/// together, under one lock, so that a reader never sees the count at zero with the time from
-/// before the request, or a count of bytes that a start has not yet cleared.
+/// time the connection last had none, the bytes read since a request last started and the note that
+/// the drain signal was raised change together, under one lock, so that a reader never sees the
+/// count at zero with the time from before the request, or a count of bytes that a start has not
+/// yet cleared.
 #[derive(Debug)]
-struct Shared {
+pub(super) struct Shared {
     state: Mutex<State>,
+    /// Raised once, when the connection is to begin its graceful shutdown. It is raised after the
+    /// state's lock is released, and `notify_one` leaves a permit if the connection's task has not
+    /// parked on it yet.
+    pub(super) drain: Notify,
 }
 
 #[derive(Debug)]
@@ -177,41 +210,15 @@ struct State {
     in_flight: usize,
     /// When the connection last had no request in progress.
     idle_since: Instant,
-    /// The bytes read since the last request that was served started, or since the connection
-    /// began.
+    /// The bytes read since the last request started, or since the connection began.
     read: usize,
     /// The bytes read in the connection's life.
     lifetime: usize,
-    /// The connection takes no further request: the requests in progress when the budget was
-    /// passed are the last ones served, or, if none was in progress, the first one that started
-    /// after it is.
-    closing: bool,
-    /// Where a request that was refused stands, from its answer to the end of the connection.
-    refusal: Refusal,
+    /// The drain signal has been raised: once, at the crossing of [`LIFETIME_READ_BOUND`] with a
+    /// request in progress, or at the first request that starts after it.
+    drain_raised: bool,
     /// The task that waits for the connection's last request to end.
     waker: Option<Waker>,
-}
-
-/// Where a refusal that was made with no other request in progress leads: the connection ends at
-/// the first flush that follows the next write after the refusal.
-///
-/// The state counts that write and that flush, not the reset's own write. The reset is made by
-/// the HTTP library from the error that the service returns, and the connection's task writes it
-/// after the refusal, so the next write is usually the reset. Any other write that comes first, a
-/// response or a control frame, moves the state in its place, and the connection can then end
-/// before the reset is written, so that its client meets a closed connection. If no write
-/// follows, the connection ends at its allowance. A refusal with other requests in progress does
-/// not enter the state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
-    /// No request was refused with none other in progress.
-    None,
-    /// A request was refused and no write has been made since.
-    Refused,
-    /// A write has been made since.
-    Written,
-    /// That write has been flushed: the connection ends at its next operation.
-    Flushed,
 }
 
 impl State {
@@ -221,27 +228,30 @@ impl State {
     }
 
     /// When the connection ends if no request starts: after [`IDLE_TIMEOUT`] of having none in
-    /// progress, or after [`SPENT_IDLE_TIMEOUT`] once it takes no further request.
+    /// progress.
     fn deadline(&self) -> Instant {
-        self.idle_since
-            + if self.closing {
-                SPENT_IDLE_TIMEOUT
-            } else {
-                IDLE_TIMEOUT
-            }
+        self.idle_since + IDLE_TIMEOUT
+    }
+
+    /// Whether the signal is due and has not been raised, and notes it as raised if so. The caller
+    /// raises it once it has released the lock.
+    fn take_raise(&mut self) -> bool {
+        let due = self.spent() && self.in_flight > 0 && !self.drain_raised;
+        self.drain_raised |= due;
+        due
     }
 }
 
 impl Shared {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
+            drain: Notify::new(),
             state: Mutex::new(State {
                 in_flight: 0,
                 idle_since: Instant::now(),
                 read: 0,
                 lifetime: 0,
-                closing: false,
-                refusal: Refusal::None,
+                drain_raised: false,
                 waker: None,
             }),
         })
@@ -251,83 +261,64 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// How many bytes the next read may take: one past [`READ_BOUND`] since the last start, which
-    /// is the byte that ends the connection.
+    /// How many bytes the next read may take: up to the byte that passes [`READ_BOUND`] since the
+    /// last start, and up to the byte that passes the stop of the connection's life, which is
+    /// [`LIFETIME_READ_BOUND`] until it is passed and [`HARD_READ_BOUND`] after. The byte that
+    /// passes either is the one that ends the connection, so a read that carries the figure ends
+    /// at it. At least one, so that a read always makes progress towards the end.
     fn read_room(&self) -> usize {
-        (READ_BOUND + 1).saturating_sub(self.state().read).max(1)
-    }
-
-    /// Notes that `bytes` were written: the first write after a refusal moves the state, whatever
-    /// it carries. It is usually the refusal's reset.
-    fn wrote(&self, bytes: usize) {
-        let mut state = self.state();
-        if bytes > 0 && state.refusal == Refusal::Refused {
-            state.refusal = Refusal::Written;
-        }
-    }
-
-    /// Notes a flush that has completed. One that follows that write ends the connection at its
-    /// next operation, so the task is woken to make one.
-    fn flushed(&self, cx: &Context<'_>) {
-        let mut state = self.state();
-        if state.refusal == Refusal::Written {
-            state.refusal = Refusal::Flushed;
-            cx.waker().wake_by_ref();
-        }
+        let state = self.state();
+        let stop = if state.spent() {
+            HARD_READ_BOUND
+        } else {
+            LIFETIME_READ_BOUND
+        };
+        (READ_BOUND + 1)
+            .saturating_sub(state.read)
+            .min((stop + 1).saturating_sub(state.lifetime))
+            .max(1)
     }
 
     /// Counts `bytes` read, and fails once more than [`READ_BOUND`] have been read since the last
-    /// request started. The read that takes the connection past [`LIFETIME_READ_BOUND`] while
-    /// requests are in progress makes them the last ones served.
+    /// request started or more than [`HARD_READ_BOUND`] in the connection's life. The read that
+    /// takes the connection past [`LIFETIME_READ_BOUND`] while requests are in progress raises the
+    /// drain signal, after the lock is released.
     fn count_read(&self, bytes: usize) -> io::Result<()> {
         let mut state = self.state();
         state.read = state.read.saturating_add(bytes);
-        let spent = state.spent();
         state.lifetime = state.lifetime.saturating_add(bytes);
-        if !spent && state.spent() && state.in_flight > 0 {
-            state.closing = true;
+        let raise = state.take_raise();
+        let over = state.read > READ_BOUND || state.lifetime > HARD_READ_BOUND;
+        drop(state);
+        if raise {
+            self.drain.notify_one();
         }
-        if state.read > READ_BOUND {
+        if over {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "connection read more than it may between two requests",
+                "connection read more than it may",
             ));
         }
         Ok(())
     }
 }
 
-/// What the connection does with a request that starts.
-enum Start {
-    /// The request is served: the connection counts as busy until the guard is dropped.
-    Served(InFlight),
-    /// The request is refused.
-    Refused(Refused),
-}
-
 /// A request in progress. The connection counts as busy until this is dropped.
 struct InFlight(Arc<Shared>);
 
 impl InFlight {
-    /// Serves the request that starts now, or refuses it once the connection takes no further
-    /// request. The request that starts with the budget passed is the last one served.
-    fn begin(shared: &Arc<Shared>) -> Start {
+    /// Counts the request that starts now. The first request that starts once the figure has been
+    /// passed raises the drain signal, after the lock is released; the request is served.
+    fn begin(shared: &Arc<Shared>) -> Self {
         let mut state = shared.state();
-        if state.closing {
-            let alone = state.in_flight == 0;
-            drop(state);
-            return Start::Refused(Refused {
-                shared: shared.clone(),
-                alone,
-            });
-        }
         state.in_flight += 1;
         state.read = 0;
-        if state.spent() {
-            state.closing = true;
-        }
+        let raise = state.take_raise();
         drop(state);
-        Start::Served(Self(shared.clone()))
+        if raise {
+            shared.drain.notify_one();
+        }
+        Self(shared.clone())
     }
 }
 
@@ -343,25 +334,6 @@ impl Drop for InFlight {
                 drop(state);
                 waker.wake();
             }
-        }
-    }
-}
-
-/// A request that was refused. It is not in progress and does not hold the connection open. It is
-/// dropped when the service's future returns its error, which is before the HTTP library makes
-/// the reset from that error. When no other request is in progress then, the connection ends at
-/// the first flush that follows the next write.
-struct Refused {
-    shared: Arc<Shared>,
-    /// No other request was in progress when it was refused.
-    alone: bool,
-}
-
-impl Drop for Refused {
-    fn drop(&mut self) {
-        let mut state = self.shared.state();
-        if self.alone && state.in_flight == 0 && state.refusal == Refusal::None {
-            state.refusal = Refusal::Refused;
         }
     }
 }
@@ -427,19 +399,13 @@ where
     }
 }
 
-/// The error of a service that refuses a request.
-pub(super) type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// A connection's service, which tells the connection's stream when a request starts and ends,
-/// and refuses the requests that start once the connection has used its budget
-/// ([`LIFETIME_READ_BOUND`]).
-///
-/// A request that is refused does not reach the handlers. Over HTTP/2 the stream is reset with
-/// `REFUSED_STREAM`: the client is told that the request was not processed, and it may send it
-/// again. The spent connection ends by the rules of [`LIFETIME_READ_BOUND`], so the retry can meet
-/// it again. Over HTTP/1 a request is never refused in practice: the answer of
-/// the last request served says `Connection: close`, so the client does not send another on that
-/// connection.
+/// A connection's service, which tells the connection's stream when a request starts and ends, and
+/// starts the drain when a request starts after the connection has read its
+/// [`LIFETIME_READ_BOUND`]. It refuses no request: the library's graceful shutdown tells the client.
+/// Over HTTP/1 it adds `Connection: close` to the answer of a request that is answered once the
+/// figure is passed, because a connection with no request in progress is closed by the library at
+/// once, and an answer that starts and ends before that call would not carry it. HTTP/2 has no
+/// connection header: the `GOAWAY` frames of the shutdown carry the news.
 #[derive(Clone, Debug)]
 pub(super) struct Tracked<S> {
     inner: S,
@@ -450,41 +416,32 @@ impl<S, B, ResBody> Service<Request<B>> for Tracked<S>
 where
     S: Service<Request<B>, Response = Response<ResBody>>,
     S::Future: Send + 'static,
-    S::Error: Into<BoxError>,
+    S::Error: Send + 'static,
     ResBody: Send + 'static,
 {
     type Response = Response<ResBody>;
-    type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output = Result<Response<ResBody>, BoxError>> + Send>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Response<ResBody>, S::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
+        self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        match InFlight::begin(&self.shared) {
-            Start::Served(in_flight) => {
-                // HTTP/2 has no connection header: the server's library drops it, and the
-                // refused streams that follow carry the news.
-                let says_close = request.version() != Version::HTTP_2;
-                let shared = self.shared.clone();
-                let answer = self.inner.call(request);
-                Box::pin(async move {
-                    let _in_flight = in_flight;
-                    let mut response = answer.await.map_err(Into::into)?;
-                    if says_close && shared.state().closing {
-                        response
-                            .headers_mut()
-                            .insert(CONNECTION, HeaderValue::from_static("close"));
-                    }
-                    Ok(response)
-                })
+        let in_flight = InFlight::begin(&self.shared);
+        let says_close = request.version() != Version::HTTP_2;
+        let shared = self.shared.clone();
+        let answer = self.inner.call(request);
+        Box::pin(async move {
+            let _in_flight = in_flight;
+            let mut response = answer.await?;
+            if says_close && shared.state().spent() {
+                response
+                    .headers_mut()
+                    .insert(CONNECTION, HeaderValue::from_static("close"));
             }
-            Start::Refused(refused) => Box::pin(async move {
-                let _refused = refused;
-                Err(h2::Error::from(h2::Reason::REFUSED_STREAM).into())
-            }),
-        }
+            Ok(response)
+        })
     }
 }
 
@@ -520,12 +477,6 @@ impl<T> IdleStream<T> {
         loop {
             let deadline = {
                 let mut state = self.shared.state();
-                if state.refusal == Refusal::Flushed && state.in_flight == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "connection refused a request and its reset has been written",
-                    ));
-                }
                 if state.in_flight > 0 {
                     // The waker is in place before the request can end, since the end takes the
                     // lock.
@@ -554,6 +505,18 @@ impl<T> IdleStream<T> {
                 ));
             }
         }
+    }
+}
+
+/// A stream that shares its connection's state with the connection's service, so that whoever
+/// drives the connection can wait for the signal to begin its graceful shutdown.
+pub(super) trait Watched {
+    fn shared(&self) -> Arc<Shared>;
+}
+
+impl<T> Watched for IdleStream<T> {
+    fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 }
 
@@ -587,11 +550,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for IdleStream<T> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         this.check(cx)?;
-        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(written)) = &polled {
-            this.shared.wrote(*written);
-        }
-        polled
+        Pin::new(&mut this.inner).poll_write(cx, buf)
     }
 
     fn poll_write_vectored(
@@ -601,11 +560,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for IdleStream<T> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         this.check(cx)?;
-        let polled = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
-        if let Poll::Ready(Ok(written)) = &polled {
-            this.shared.wrote(*written);
-        }
-        polled
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -615,11 +570,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for IdleStream<T> {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         this.check(cx)?;
-        let polled = Pin::new(&mut this.inner).poll_flush(cx);
-        if let Poll::Ready(Ok(())) = polled {
-            this.shared.flushed(cx);
-        }
-        polled
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -931,11 +882,11 @@ mod tests {
     }
 
     /// The count begins again when a request starts: a connection may read the bound's worth of
-    /// bytes before each start, however many bytes it has read in all.
+    /// bytes before each start, so long as it stays under the figure of its life.
     #[tokio::test]
     async fn the_count_of_bytes_begins_again_at_each_request_start() {
         let (mut client, mut stream, mut service, _gate) = accepted().await;
-        for _ in 0..4 {
+        for _ in 0..2 {
             read_bytes(&mut client, &mut stream, READ_BOUND)
                 .await
                 .expect("the bytes before a start were refused");
@@ -969,7 +920,7 @@ mod tests {
         Ok(answer
             .await
             .expect("the answer task ends")
-            .expect("the request was refused"))
+            .expect("the request was not answered"))
     }
 
     /// Whether an answer tells its client that the connection closes after it.
@@ -989,44 +940,43 @@ mod tests {
         service.inner.calls.load(Ordering::SeqCst)
     }
 
-    /// Small requests one after another across the connection's budget: the request that starts
-    /// once the budget is passed is answered with the note that the connection closes, the ones
-    /// before it are not, and the next request is refused without its handler running.
+    /// Small requests one after another across the connection's figure: the answers to the
+    /// requests that start once the figure is passed say that the connection closes, the ones
+    /// before it do not, and every request is served, the handler of each run once.
     #[tokio::test]
-    async fn the_last_request_served_says_that_the_connection_closes() {
+    async fn the_answers_after_the_figure_say_that_the_connection_closes() {
         let (mut client, mut stream, mut service, gate) = accepted().await;
         let mut answered = 0;
         loop {
             let answer = small_request(&mut client, &mut stream, &mut service, &gate)
                 .await
-                .expect("a request before the last one was refused");
+                .expect("a request was not answered");
             answered += 1;
             let spent = stream.shared.state().spent();
             assert_eq!(
                 closes(&answer),
                 spent,
-                "answer {answered}, with the budget passed: {spent}"
+                "answer {answered}, with the figure passed: {spent}"
             );
             if spent {
                 break;
             }
-            assert!(answered < 10_000, "the budget was never passed");
+            assert!(answered < 10_000, "the figure was never passed");
         }
         assert_eq!(answered, LIFETIME_READ_BOUND / 1_024 + 1);
 
+        // A request after the figure is served too: nothing is refused, and its answer says so.
         read_bytes(&mut client, &mut stream, 1_024)
             .await
             .expect("the bytes of the next request were refused");
-        let refused = service.call(a_request());
-        assert_eq!(
-            calls(&service),
-            answered,
-            "the handler of a refused request ran"
-        );
-        assert!(
-            refused.await.is_err(),
-            "a request after the last one was answered"
-        );
+        let next = tokio::spawn(service.call(a_request()));
+        gate.notify_one();
+        let answer = next
+            .await
+            .expect("the answer task ends")
+            .expect("a request after the figure was not answered");
+        assert!(closes(&answer));
+        assert_eq!(calls(&service), answered + 1, "a handler did not run");
 
         let (mut client, mut stream, mut service, gate) = accepted().await;
         small_request(&mut client, &mut stream, &mut service, &gate)
@@ -1034,206 +984,38 @@ mod tests {
             .expect("a new connection refused its first request");
     }
 
-    /// The head that passes the budget starts a request that is still in progress when the next
-    /// request starts and is refused. The first is answered whole: the connection takes reads and
-    /// writes while it is in progress, and ends at the allowance after it.
+    /// A connection that has passed its figure, whose last request has ended and that sends
+    /// nothing more stands under the ordinary idle time, and gives back its place when it ends.
     #[tokio::test(start_paused = true)]
-    async fn a_request_in_progress_is_not_cut_by_the_refusal_of_a_later_one() {
-        let (mut client, mut stream, mut service, gate) = accepted().await;
+    async fn a_silent_connection_that_has_passed_its_figure_ends_at_the_idle_time() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let connections = Connections::new(1, Default::default());
+        let bound = IdleBound::new(DefaultAcceptor, connections.clone());
+        let gate = Arc::new(Notify::new());
+        let (mut stream, mut service): (IdleStream<DuplexStream>, Tracked<Gated>) = bound
+            .accept(server, Gated::new(gate.clone()))
+            .await
+            .expect("the acceptor passes the connection on");
         near_the_budget(&stream);
         read_bytes(&mut client, &mut stream, 200)
             .await
-            .expect("the head that passes the budget was refused");
-        assert!(stream.shared.state().spent());
+            .expect("the head that passes the figure was refused");
         let first = tokio::spawn(service.call(a_request()));
-        let second = service.call(a_request());
-        assert_eq!(calls(&service), 1, "the handler of a refused request ran");
-        assert!(second.await.is_err(), "the second request was not refused");
-
-        read_bytes(&mut client, &mut stream, 100)
-            .await
-            .expect("a read while a request is in progress was refused");
-        stream
-            .write_all(b"headers")
-            .await
-            .expect("a write while a request is in progress was refused");
         gate.notify_one();
-        let answer = first
+        first
             .await
             .expect("the answer task ends")
-            .expect("the request in progress was not answered");
-        assert!(closes(&answer));
-        stream
-            .write_all(b"body")
-            .await
-            .expect("the write of the answer's body was refused");
-        stream.flush().await.expect("the flush of the answer");
-        assert!(read_ends(&mut stream).await.is_none(), "closed at once");
-        advance(SPENT_IDLE_TIMEOUT + Duration::from_secs(1)).await;
-        let error = read_ends(&mut stream).await.expect("not closed");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    }
+            .expect("the request that passes the figure was refused");
 
-    /// The budget is passed in the body of the request in progress, which is answered. The request
-    /// that starts after that is refused: the last request served is the one in progress when the
-    /// budget is passed.
-    #[tokio::test(start_paused = true)]
-    async fn a_request_that_starts_after_the_budget_was_passed_in_a_body_is_refused() {
-        let (mut client, mut stream, mut service, gate) = accepted().await;
-        near_the_budget(&stream);
-        let first = tokio::spawn(service.call(a_request()));
-        read_bytes(&mut client, &mut stream, 200)
-            .await
-            .expect("the body that passes the budget was refused");
-        assert!(stream.shared.state().spent());
-        let second = service.call(a_request());
-        assert_eq!(calls(&service), 1, "the handler of a refused request ran");
-        assert!(second.await.is_err(), "the second request was not refused");
-        gate.notify_one();
-        let answer = first
-            .await
-            .expect("the answer task ends")
-            .expect("the request in progress was not answered");
-        assert!(closes(&answer));
-    }
-
-    /// A head whose first bytes pass the budget has no request in progress and may be partly
-    /// read: the connection stands under the ordinary idle time, not the allowance of one that has
-    /// used its budget, and the request is answered when the rest of the head comes.
-    #[tokio::test(start_paused = true)]
-    async fn a_head_in_transit_when_the_budget_is_passed_completes_under_the_ordinary_idle_time() {
-        let (mut client, mut stream, mut service, gate) = accepted().await;
-        near_the_budget(&stream);
-        read_bytes(&mut client, &mut stream, 200)
-            .await
-            .expect("the first part of the head was refused");
-        assert!(stream.shared.state().spent());
-        advance(Duration::from_secs(2)).await;
+        advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
         assert!(
             read_ends(&mut stream).await.is_none(),
-            "a head in transit was cut"
+            "closed before the idle time"
         );
-        read_bytes(&mut client, &mut stream, 50)
-            .await
-            .expect("the rest of the head was refused");
-        let answer = tokio::spawn(service.call(a_request()));
-        gate.notify_one();
-        let answer = answer
-            .await
-            .expect("the answer task ends")
-            .expect("the request whose head passed the budget was not answered");
-        assert!(closes(&answer));
-        assert!(read_ends(&mut stream).await.is_none(), "closed at once");
-        advance(SPENT_IDLE_TIMEOUT + Duration::from_secs(1)).await;
-        let error = read_ends(&mut stream).await.expect("not closed");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    }
-
-    /// Two requests in progress when the budget is passed are both answered, and the connection
-    /// ends at the idle time of one that has used its budget, from the end of the last of them.
-    #[tokio::test(start_paused = true)]
-    async fn requests_in_progress_when_the_lifetime_budget_is_passed_are_answered() {
-        let (mut client, mut stream, mut service, gate) = accepted().await;
-        near_the_budget(&stream);
-        let first = tokio::spawn(service.call(a_request()));
-        let second = tokio::spawn(service.call(a_request()));
-        read_bytes(&mut client, &mut stream, 2_048)
-            .await
-            .expect("the bytes that pass the budget were refused");
-        assert!(stream.shared.state().spent());
-        // Let the two tasks reach the gate, then open it for both.
-        tokio::task::yield_now().await;
-        gate.notify_waiters();
-        for answer in [first, second] {
-            let answer = answer
-                .await
-                .expect("the answer task ends")
-                .expect("a request in progress when the budget was passed was not answered");
-            assert!(closes(&answer));
-        }
-        assert!(read_ends(&mut stream).await.is_none(), "closed at once");
-        advance(SPENT_IDLE_TIMEOUT + Duration::from_secs(1)).await;
-        let error = read_ends(&mut stream).await.expect("not closed");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    }
-
-    /// A request refused with no other request in progress ends the connection at the first flush
-    /// that follows the next write, which here is the reset that answers it, without the
-    /// allowance, and the place comes back.
-    #[tokio::test(start_paused = true)]
-    async fn a_refused_request_ends_the_connection_once_the_reset_has_been_written() {
-        let (mut client, server) = tokio::io::duplex(1024);
-        let connections = Connections::new(1, Default::default());
-        let bound = IdleBound::new(DefaultAcceptor, connections.clone());
-        let gate = Arc::new(Notify::new());
-        let (mut stream, mut service): (IdleStream<DuplexStream>, Tracked<Gated>) = bound
-            .accept(server, Gated::new(gate.clone()))
-            .await
-            .expect("the acceptor passes the connection on");
-        near_the_budget(&stream);
-        read_bytes(&mut client, &mut stream, 200)
-            .await
-            .expect("the head that passes the budget was refused");
-        let first = tokio::spawn(service.call(a_request()));
-        gate.notify_one();
-        first
-            .await
-            .expect("the answer task ends")
-            .expect("the last request served was refused");
-        stream
-            .write_all(b"answer")
-            .await
-            .expect("the answer's write");
-        stream.flush().await.expect("the answer's flush");
-        assert!(read_ends(&mut stream).await.is_none(), "closed at once");
-
-        // The next request is refused, and the reset that says so is the next thing written.
-        let second = service.call(a_request());
-        assert_eq!(calls(&service), 1, "the handler of a refused request ran");
-        assert!(second.await.is_err(), "the second request was not refused");
-        stream.write_all(b"reset").await.expect("the reset's write");
-        stream.flush().await.expect("the reset's flush");
-        assert!(
-            read_ends(&mut stream).await.is_some(),
-            "the connection stood on after the reset was written"
-        );
-        drop((stream, client));
-        assert_eq!(connections.held(), 0);
-        let (_client, server) = tokio::io::duplex(1024);
-        bound
-            .accept(server, Gated::new(Arc::new(Notify::new())))
-            .await
-            .expect("the place was not given back");
-    }
-
-    /// A connection that has used its budget, whose last request has ended and that sends nothing
-    /// more is closed at the allowance, and gives back its place.
-    #[tokio::test(start_paused = true)]
-    async fn a_silent_connection_that_has_used_its_budget_is_closed_and_gives_back_its_place() {
-        let (mut client, server) = tokio::io::duplex(1024);
-        let connections = Connections::new(1, Default::default());
-        let bound = IdleBound::new(DefaultAcceptor, connections.clone());
-        let gate = Arc::new(Notify::new());
-        let (mut stream, mut service): (IdleStream<DuplexStream>, Tracked<Gated>) = bound
-            .accept(server, Gated::new(gate.clone()))
-            .await
-            .expect("the acceptor passes the connection on");
-        near_the_budget(&stream);
-        read_bytes(&mut client, &mut stream, 200)
-            .await
-            .expect("the head that passes the budget was refused");
-        let first = tokio::spawn(service.call(a_request()));
-        gate.notify_one();
-        first
-            .await
-            .expect("the answer task ends")
-            .expect("the last request served was refused");
-        assert!(read_ends(&mut stream).await.is_none(), "closed at once");
-
-        advance(SPENT_IDLE_TIMEOUT).await;
+        advance(Duration::from_secs(2)).await;
         let error = read_ends(&mut stream)
             .await
-            .expect("not closed at the allowance");
+            .expect("not closed at the idle time");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         drop((stream, client));
         assert_eq!(connections.held(), 0);
@@ -1479,5 +1261,127 @@ mod tests {
         let ended = stalled.await.err().expect("the task was aborted");
         assert!(ended.is_cancelled());
         assert_eq!(connections.held(), 0, "a cancelled handshake kept its slot");
+    }
+
+    /// Whether the connection's drain signal has been raised, taking it if so.
+    async fn drain_raised(shared: &Shared) -> bool {
+        tokio::select! {
+            biased;
+            () = shared.drain.notified() => true,
+            () = std::future::ready(()) => false,
+        }
+    }
+
+    /// The read that carries the lifetime figure ends at the byte that passes it, and from there a
+    /// connection reads at most [`READ_BOUND`] bytes in all, 24,575 more than that byte, however
+    /// many requests start meanwhile.
+    #[tokio::test]
+    async fn the_read_that_carries_the_figure_ends_at_it_and_the_hard_bound_holds_across_starts() {
+        let (mut client, mut stream, mut service, _gate) = accepted().await;
+        stream.shared.state().lifetime = LIFETIME_READ_BOUND - 100;
+        client
+            .write_all(&[0; 1_024])
+            .await
+            .expect("the client writes");
+        let mut buf = [0u8; 1_024];
+        let taken = stream.read(&mut buf).await.expect("the crossing read");
+        assert_eq!(
+            taken, 101,
+            "the read that carries the figure ends at the byte that passes it"
+        );
+        let mut left = HARD_READ_BOUND - (LIFETIME_READ_BOUND + 1);
+        assert_eq!(left, 24_575);
+        // The rest of what the client wrote is in the pipe, and counts as well.
+        stream
+            .read_exact(&mut vec![0; 1_024 - 101])
+            .await
+            .expect("the rest of the crossing write was refused");
+        left -= 1_024 - 101;
+        while left > 0 {
+            let chunk = left.min(8_191);
+            read_bytes(&mut client, &mut stream, chunk)
+                .await
+                .expect("a byte within the hard bound was refused");
+            drop(service.call(a_request()));
+            left -= chunk;
+        }
+        let error = read_bytes(&mut client, &mut stream, 1)
+            .await
+            .expect_err("a byte past the hard bound was read");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A crossing with a request in progress raises the drain signal at the crossing, and not
+    /// before it.
+    #[tokio::test]
+    async fn a_crossing_with_a_request_in_progress_raises_the_drain_signal_at_the_crossing() {
+        let (mut client, mut stream, mut service, _gate) = accepted().await;
+        stream.shared.state().lifetime = LIFETIME_READ_BOUND - 10;
+        let held = service.call(a_request());
+        let shared = stream.shared.clone();
+        assert!(!drain_raised(&shared).await);
+        read_bytes(&mut client, &mut stream, 10)
+            .await
+            .expect("bytes under the figure");
+        assert!(
+            !drain_raised(&shared).await,
+            "raised before the figure was passed"
+        );
+        read_bytes(&mut client, &mut stream, 1)
+            .await
+            .expect("the byte that passes the figure");
+        assert!(drain_raised(&shared).await, "not raised at the crossing");
+        drop(held);
+    }
+
+    /// A crossing with no request in progress raises it at the next start.
+    #[tokio::test]
+    async fn a_crossing_with_no_request_in_progress_raises_the_drain_signal_at_the_next_start() {
+        let (mut client, mut stream, mut service, _gate) = accepted().await;
+        stream.shared.state().lifetime = LIFETIME_READ_BOUND - 10;
+        read_bytes(&mut client, &mut stream, 11)
+            .await
+            .expect("bytes across the figure");
+        let shared = stream.shared.clone();
+        assert!(!drain_raised(&shared).await, "raised with no request");
+        let held = service.call(a_request());
+        assert!(
+            drain_raised(&shared).await,
+            "not raised at the start after the crossing"
+        );
+        drop(held);
+    }
+
+    /// Bytes that start no request never raise it.
+    #[tokio::test]
+    async fn bytes_that_start_no_request_never_raise_the_drain_signal() {
+        let (mut client, mut stream, _service, _gate) = accepted().await;
+        stream.shared.state().lifetime = LIFETIME_READ_BOUND - 10;
+        let shared = stream.shared.clone();
+        for _ in 0..3 {
+            read_bytes(&mut client, &mut stream, 3_000)
+                .await
+                .expect("bytes");
+            assert!(!drain_raised(&shared).await, "raised with no request");
+        }
+    }
+
+    /// It is raised once, whatever starts after it.
+    #[tokio::test]
+    async fn the_drain_signal_is_raised_once() {
+        let (mut client, mut stream, mut service, _gate) = accepted().await;
+        stream.shared.state().lifetime = LIFETIME_READ_BOUND - 10;
+        let held = service.call(a_request());
+        let shared = stream.shared.clone();
+        read_bytes(&mut client, &mut stream, 11)
+            .await
+            .expect("bytes across the figure");
+        assert!(drain_raised(&shared).await, "not raised at the crossing");
+        let second = service.call(a_request());
+        assert!(
+            !drain_raised(&shared).await,
+            "raised again by a later start"
+        );
+        drop((held, second));
     }
 }

@@ -63,28 +63,39 @@ impl CertMode {
 /// Generous, so that clients on lossy high-latency links still get through.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The most raw bytes that a connection may send before its TLS handshake has ended: 16,384, one
-/// full TLS record of plaintext. The TLS library keeps a handshake message that it is sent in
-/// pieces until the message ends, up to 64 KiB of raw bytes, and the time limit above alone lets
-/// every connection that stands in its handshake hold that for as long as the limit runs. An honest
-/// handshake sends far less. A client on OpenSSL 3.5, with key shares for X25519 and ML-KEM-768,
-/// sends a `ClientHello` of 1,546 bytes and 1,631 raw bytes before its own handshake is done; with
-/// every cipher suite, five ALPN names and a server name of 253 characters, 1,950 and 2,035. A
-/// second `ClientHello`, after a `HelloRetryRequest`, doubles the first, so a handshake stays under
-/// 4.5 kB, about a quarter of the figure, which is also the size of one full TLS record. A
-/// connection that sends more is closed. The count is of the bytes read from the socket, record
-/// headers included, and stops when the handshake ends; the bytes after it are counted by
-/// `READ_BOUND` in the idle bound, as plain bytes. As with `READ_BOUND`, it is a threshold at which
-/// the connection is closed: the read that crosses it has been made, and while no message is being
-/// joined one read is at most 4 KiB.
-pub(super) const HANDSHAKE_READ_BOUND: usize = 16_384;
+/// The most raw bytes that a connection may send before the TLS acceptor returns: 32,768. A
+/// connection that sends more is closed. The TLS library keeps a handshake message that it is sent
+/// in pieces until the message ends, up to 64 KiB of raw bytes, and the time limit above alone
+/// lets every connection that stands in its handshake hold that for as long as the limit runs.
+///
+/// The count is of the bytes read from the socket, record headers included, and it ends when the
+/// acceptor returns, not at the client's `Finished`: the acceptor goes on reading until it has
+/// decrypted one application record, so the first bytes of a client's first requests, when they
+/// arrive in the flight of its `Finished`, are counted here and not by `READ_BOUND`. What the
+/// acceptor reads before it returns is the client's handshake flight and what its last read took
+/// with the first application record.
+///
+/// The figure, by arithmetic. An honest flight is far under 4,096 bytes: a client on OpenSSL 3.5,
+/// with key shares for X25519 and ML-KEM-768, sends a `ClientHello` of 1,546 bytes and 1,631 raw
+/// bytes before its own handshake is done; with every cipher suite, five ALPN names and a server
+/// name of 247 characters, 1,950 and 2,035; a second `ClientHello` after a `HelloRetryRequest`
+/// doubles the first, 4,070. After it comes at most one application record that the acceptor
+/// decrypts, 16,406 bytes at the largest (16,384 of plaintext and 22 of overhead), and the rest of
+/// its last read. A read takes what the TLS library's buffer has free, and that buffer holds at
+/// most 18,437 bytes (a record of 16,384 bytes with the library's allowance of 2,048 for its
+/// encryption, and a record header) of what has not been taken in: 4,096 and 18,437 are 22,533,
+/// and the figure leaves 10,235 over. A valid first batch of requests that fills the record, two
+/// HTTP/2 heads of 8,191 bytes and a body of 4,096, is read by the acceptor and counted here. As
+/// with `READ_BOUND`, it is a threshold at which the connection is closed: the read that crosses
+/// it has been made.
+pub(super) const HANDSHAKE_READ_BOUND: usize = 32_768;
 
 /// A connection's socket as the TLS acceptor reads it: it counts the raw bytes read until the
-/// handshake has ended, and fails once more than [`HANDSHAKE_READ_BOUND`] have been read.
+/// acceptor returns, and fails once more than [`HANDSHAKE_READ_BOUND`] have been read.
 #[derive(Debug)]
 pub(crate) struct Handshaking<I> {
     inner: I,
-    /// The bytes read so far, or `None` once the handshake has ended.
+    /// The bytes read so far, or `None` once the acceptor has returned.
     read: Option<usize>,
 }
 
@@ -96,7 +107,8 @@ impl<I> Handshaking<I> {
         }
     }
 
-    /// Ends the count: the bytes read from now on are the connection's own.
+    /// Ends the count, when the acceptor has returned: the bytes read from now on are the
+    /// connection's own.
     fn end_handshake(&mut self) {
         self.read = None;
     }
@@ -296,15 +308,27 @@ fn escape_hostname(hostname: &str) -> Cow<'_, str> {
     regex.replace_all(hostname, "")
 }
 
-/// The start of a `ClientHello` of `raw` bytes in all, the record's header included: one record
-/// whose handshake header declares the largest message, 65,535 bytes, so that the TLS library
-/// keeps what it is sent while it waits for the rest.
+/// The start of a `ClientHello` of `raw` bytes in all, the record headers included: records of at
+/// most 16,384 bytes of payload, the first with a handshake header that declares the largest
+/// message, 65,535 bytes, so that the TLS library keeps what it is sent while it waits for the
+/// rest.
 #[cfg(test)]
 pub(super) fn partial_client_hello(raw: usize) -> Vec<u8> {
-    let mut bytes = vec![0x16, 0x03, 0x01];
-    bytes.extend_from_slice(&u16::try_from(raw - 5).expect("one record").to_be_bytes());
-    bytes.extend_from_slice(&[0x01, 0x00, 0xff, 0xff]);
-    bytes.resize(raw, 0);
+    const RECORD_HEADER: usize = 5;
+    const RECORD_PAYLOAD: usize = 16_384;
+    let mut bytes = Vec::with_capacity(raw);
+    while bytes.len() < raw {
+        let payload = (raw - bytes.len() - RECORD_HEADER).min(RECORD_PAYLOAD);
+        bytes.extend_from_slice(&[0x16, 0x03, 0x01]);
+        bytes.extend_from_slice(&u16::try_from(payload).expect("one record").to_be_bytes());
+        if bytes.len() == RECORD_HEADER {
+            bytes.extend_from_slice(&[0x01, 0x00, 0xff, 0xff]);
+            bytes.resize(RECORD_HEADER + payload, 0);
+        } else {
+            bytes.resize(bytes.len() + payload, 0);
+        }
+    }
+    assert_eq!(bytes.len(), raw);
     bytes
 }
 
@@ -354,7 +378,7 @@ mod tests {
         ))
     }
 
-    /// A connection in its handshake may send 16,384 raw bytes and is closed by the next byte,
+    /// A connection in its handshake may send 32,768 raw bytes and is closed by the next byte,
     /// in both modes. The figure is written out here so that a change of it fails this case.
     #[tokio::test(start_paused = true)]
     async fn a_handshake_may_send_the_bound_and_no_more() {
@@ -364,7 +388,7 @@ mod tests {
             let mut accept = acceptor.accept(server_io, ());
 
             client
-                .write_all(&partial_client_hello(16_384))
+                .write_all(&partial_client_hello(32_768))
                 .await
                 .unwrap();
             // The acceptor reads all of it and waits for the rest, while the clock runs on.
@@ -381,7 +405,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("{mode}: not closed past the bound"))
                 .err()
-                .unwrap_or_else(|| panic!("{mode}: a handshake of 16,385 bytes succeeded"));
+                .unwrap_or_else(|| panic!("{mode}: a handshake of 32,769 bytes succeeded"));
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{mode}");
         }
     }

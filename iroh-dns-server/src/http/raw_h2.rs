@@ -91,12 +91,20 @@ impl Peer<TcpStream> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
+    /// A peer on `stream` that has sent the preface, its settings and requests on the streams 1
+    /// and 3 already, as one write before the connection was open. It has read nothing, and it
+    /// does not acknowledge the settings that the server sends.
+    pub(super) fn resumed(stream: S) -> Self {
+        Self {
+            stream,
+            next_stream: 5,
+            pending: Vec::new(),
+        }
+    }
+
     /// A peer on `stream`, which is open already: a connection after a TLS handshake, for one.
     pub(super) async fn over(mut stream: S) -> Result<Self> {
-        stream
-            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-            .await
-            .anyerr()?;
+        stream.write_all(PREFACE).await.anyerr()?;
         let mut peer = Self {
             stream,
             next_stream: 1,
@@ -126,12 +134,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         stream: u32,
         payload: &[u8],
     ) -> Result<()> {
-        let mut frame = Vec::with_capacity(9 + payload.len());
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
-        frame.extend([kind, flags]);
-        frame.extend_from_slice(&stream.to_be_bytes());
-        frame.extend_from_slice(payload);
-        self.stream.write_all(&frame).await.anyerr()
+        self.stream
+            .write_all(&frame(kind, flags, stream, payload))
+            .await
+            .anyerr()
     }
 
     /// The next frame from the server, which must come whole within a short stretch of real time.
@@ -214,10 +220,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
     ) -> Result<u32> {
         let stream = self.next_stream;
         self.next_stream += 2;
-        let mut block = Vec::new();
-        for (name, value) in fields(method, path, extra) {
-            literal(&mut block, name, value);
-        }
+        let block = request_block(method, path, extra);
         let flags = END_HEADERS | if end_stream { END_STREAM } else { 0 };
         self.send(HEADERS, flags, stream, &block).await?;
         Ok(stream)
@@ -240,6 +243,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         let flags = if end_stream { END_STREAM } else { 0 };
         self.send(DATA, flags, stream, body).await
     }
+}
+
+/// The connection preface that a client sends first.
+pub(super) const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// The bytes of a frame: its header, then `payload`.
+pub(super) fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(9 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+    frame.extend([kind, flags]);
+    frame.extend_from_slice(&stream.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The header block of a request: the fields of `fields`, each a literal.
+pub(super) fn request_block(method: &str, path: &str, extra: &[(&str, String)]) -> Vec<u8> {
+    let mut block = Vec::new();
+    for (name, value) in fields(method, path, extra) {
+        literal(&mut block, name, value);
+    }
+    block
 }
 
 /// The fields of a request that `Peer::request` sends: the four pseudo-header fields, then `extra`.

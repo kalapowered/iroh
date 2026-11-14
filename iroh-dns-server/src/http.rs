@@ -839,18 +839,41 @@ mod tests {
         }
     }
 
+    /// The configuration of a TLS client that takes any certificate.
+    fn tls_client_config() -> n0_error::Result<Arc<rustls::ClientConfig>> {
+        Ok(Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .anyerr()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+            .with_no_client_auth(),
+        ))
+    }
+
+    /// A client of the HTTPS listener at `addr` whose first requests, `batch`, leave in the
+    /// flight of its last handshake message with no wait between: the TLS library holds what is
+    /// written before the handshake is done and sends it after the `Finished` message.
+    async fn tls_client_with_first_batch(
+        addr: SocketAddr,
+        batch: &[u8],
+    ) -> n0_error::Result<TlsStream<TcpStream>> {
+        let tcp = TcpStream::connect(addr).await.anyerr()?;
+        tokio_rustls::TlsConnector::from(tls_client_config()?)
+            .connect_with(ServerName::try_from("localhost").anyerr()?, tcp, |client| {
+                std::io::Write::write_all(&mut client.writer(), batch)
+                    .expect("the library buffers what is written before the handshake is done");
+            })
+            .await
+            .anyerr()
+    }
+
     /// A client of the HTTPS listener at `addr` that has finished the TLS handshake.
     async fn tls_client(addr: SocketAddr) -> n0_error::Result<TlsStream<TcpStream>> {
-        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .anyerr()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
-        .with_no_client_auth();
         let tcp = TcpStream::connect(addr).await.anyerr()?;
-        let stream = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+        let stream = tokio_rustls::TlsConnector::from(tls_client_config()?)
             .connect(ServerName::try_from("localhost").anyerr()?, tcp)
             .await
             .anyerr()?;
@@ -892,7 +915,7 @@ mod tests {
         Ok(())
     }
 
-    /// A connection that is still in its TLS handshake may send 16,384 bytes and no more: the
+    /// A connection that is still in its TLS handshake may send 32,768 bytes and no more: the
     /// TLS library holds a message that it is sent in pieces, up to 64 KiB, until the message
     /// ends, and the handshake's time limit alone would let every held connection hold that for 30
     /// seconds. With the figure sent the connection stays open; one byte more and it is closed.
@@ -907,7 +930,7 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).await.anyerr()?;
         stream
-            .write_all(&partial_client_hello(16_384))
+            .write_all(&partial_client_hello(32_768))
             .await
             .anyerr()?;
         assert_open(&mut stream).await;
@@ -924,6 +947,97 @@ mod tests {
                     .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
             "expected the server to close the connection: {read:?}"
         );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A client whose first requests arrive in the flight of its last handshake message, with no
+    /// wait between them, is answered. The TLS acceptor reads on past the `Finished` message until
+    /// it has decrypted one application record, so those bytes are counted by the handshake's
+    /// bound, and a figure with no room for a valid first batch closes a valid connection. The
+    /// batches are the largest honest ones that fill the first record (16,384 bytes): over HTTP/1
+    /// two heads of 8,192 bytes and a query of 4,096 bytes, over HTTP/2 two heads whose lists are
+    /// 8,191 bytes, one with a body of 4,096 bytes.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_a_first_batch_with_the_last_handshake_message_is_answered() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server =
+            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config()))
+                .await?;
+        let addr = server.https_addr().expect("https is bound");
+
+        let most = super::HTTP1_MAX_BUFFER_SIZE;
+        let head = |len: usize| {
+            let start = "GET /healthcheck HTTP/1.1\r\nhost: localhost\r\nx-fill: ";
+            let end = "\r\n\r\n";
+            let fill = "a".repeat(len - start.len() - end.len());
+            format!("{start}{fill}{end}").into_bytes()
+        };
+        let largest = super::DOH_MESSAGE_LIMIT;
+        let mut post = format!(
+            "POST /dns-query HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/dns-message\r\ncontent-length: {largest}\r\n\r\n"
+        )
+        .into_bytes();
+        post.extend(dns_query(largest));
+        let batch = [head(most), post, head(most)].concat();
+        assert!(batch.len() > 16_384, "the batch does not fill a record");
+        let mut stream = tls_client_with_first_batch(addr, &batch).await?;
+        for _ in 0..3 {
+            assert_eq!(read_answer(&mut stream).await?, 200);
+        }
+        drop(stream);
+
+        let list = |method: &str, path: &str, mut extra: Vec<(&'static str, String)>| {
+            let used = raw_h2::header_list_size(method, path, &extra) + "cookie".len() + 32;
+            extra.push((
+                "cookie",
+                "a".repeat(super::HTTP2_MAX_HEADER_LIST_SIZE as usize - 1 - used),
+            ));
+            extra
+        };
+        let post_fields = list(
+            "POST",
+            "/dns-query",
+            vec![
+                ("content-length", largest.to_string()),
+                ("content-type", "application/dns-message".to_string()),
+            ],
+        );
+        let get_fields = list("GET", "/healthcheck", Vec::new());
+        let mut batch = raw_h2::PREFACE.to_vec();
+        batch.extend(raw_h2::frame(raw_h2::SETTINGS, 0, 0, &[]));
+        batch.extend(raw_h2::frame(
+            raw_h2::HEADERS,
+            0x4,
+            1,
+            &raw_h2::request_block("POST", "/dns-query", &post_fields),
+        ));
+        batch.extend(raw_h2::frame(
+            raw_h2::DATA,
+            raw_h2::END_STREAM,
+            1,
+            &dns_query(largest),
+        ));
+        batch.extend(raw_h2::frame(
+            raw_h2::HEADERS,
+            0x4 | raw_h2::END_STREAM,
+            3,
+            &raw_h2::request_block("GET", "/healthcheck", &get_fields),
+        ));
+        assert!(batch.len() > 16_384, "the batch does not fill a record");
+        let mut peer = raw_h2::Peer::resumed(tls_client_with_first_batch(addr, &batch).await?);
+        let mut answered = Vec::new();
+        while answered.len() < 2 {
+            let frame = peer.next_frame().await?;
+            if frame.status().is_some() {
+                answered.push((frame.stream, frame.status()));
+            }
+        }
+        for stream in [1, 3] {
+            assert!(answered.contains(&(stream, Some(200))), "{answered:?}");
+        }
 
         server.shutdown().await?;
         Ok(())
@@ -1406,7 +1520,7 @@ mod tests {
     /// its handshake: with exactly that many read it is open, and one byte more closes it. The
     /// figure is written out here so that a change of it fails this case. The bytes are counted
     /// as the connection's own bytes, which on the TLS listener are the decrypted bytes: the
-    /// handshake's bound of 16,384 raw bytes does not apply to them.
+    /// handshake's bound of 32,768 raw bytes does not apply to them.
     #[tokio::test]
     #[traced_test]
     async fn test_read_bound_is_exact_over_http_and_tls() -> n0_error::Result {
@@ -1477,7 +1591,7 @@ mod tests {
 
         let mut hello = TcpStream::connect(https).await.anyerr()?;
         hello
-            .write_all(&partial_client_hello(16_384))
+            .write_all(&partial_client_hello(32_768))
             .await
             .anyerr()?;
         hello.write_all(&[0x16]).await.anyerr()?;
@@ -1558,8 +1672,16 @@ mod tests {
 
     /// The status of the answer to `request` on a connection that is kept, whose answer is read
     /// whole.
-    async fn exchange(stream: &mut TcpStream, request: &[u8]) -> n0_error::Result<u16> {
+    async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        stream: &mut S,
+        request: &[u8],
+    ) -> n0_error::Result<u16> {
         stream.write_all(request).await.anyerr()?;
+        read_answer(stream).await
+    }
+
+    /// The status of the next answer on a connection that is kept, read whole.
+    async fn read_answer<S: AsyncReadExt + Unpin>(stream: &mut S) -> n0_error::Result<u16> {
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
             let mut byte = [0];

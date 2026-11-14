@@ -4,7 +4,7 @@ This is KalaReach's fork of [`n0-computer/iroh`](https://github.com/n0-computer/
 services build from it, and each pins a commit of the `kalareach` branch:
 
 - the relay (`iroh-relay`, with a forwarding hook upstream does not have and an
-  address-discovery listener that takes no datagrams), and
+  address-discovery listener with DATAGRAM frames turned off), and
 - the discovery server (`iroh-dns-server`, with the fixes listed below).
 
 The client links the published `iroh` crate, not this fork.
@@ -43,14 +43,15 @@ Tests, in `iroh-relay/src/server/clients.rs`, module `forwarding_policy_tests`:
 `a_delivered_payload_is_settled_once_as_committed` and
 `a_payload_the_destination_refuses_is_settled_as_dropped`.
 
-### Relay: an address-discovery listener that takes no datagrams (`iroh-relay`)
+### Relay: an address-discovery listener with DATAGRAM frames turned off (`iroh-relay`)
 
 The relay answers QUIC address discovery on a UDP port: a client connects, the listener tells it
-which address it saw, and the client closes. The listener reads nothing else from a client, yet
+which address it saw. The client keeps the connection open for later reports and closes it when
+it no longer needs it. The listener reads nothing else from a client, yet
 upstream leaves DATAGRAM frames on, so a client could send them into a queue that nothing ever
 reads. The fork turns datagram reception off in the listener's transport configuration. The
 listener no longer offers DATAGRAM frames, and a connection that sends one is closed with a
-protocol violation. Address discovery uses no datagram, so clients of 1.2.0 and 1.4.1 are not
+protocol violation. Address discovery uses no DATAGRAM frame, so clients of 1.2.0 and 1.4.1 are not
 affected.
 
 Tests, in `iroh-relay/src/quic.rs`, module `tests`:
@@ -82,7 +83,7 @@ A release that fixes a vulnerability in `iroh`, `iroh-relay`, `iroh-dns-server`,
 `iroh-base` reaches the fork by a **merge**, never a rebase.
 
 1. Fetch the upstream tag. Create `merge/upstream-<version>` from `kalareach` and merge the tag
-   into it. Resolve conflicts by keeping the relay's forwarding hook and the discovery fixes
+   into it. Resolve conflicts by keeping every patch listed
    above. Update the base table above on this branch.
 2. Run the suites of the two services: `cargo test --locked -p iroh-relay --features server` and
    `cargo test --locked -p iroh-dns-server`. Every test named above must still exist and pass.

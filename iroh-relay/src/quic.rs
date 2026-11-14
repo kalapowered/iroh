@@ -673,6 +673,8 @@ mod tests {
             panic!("the listener did not close the connection with an error code: {error:?}");
         };
         assert_eq!(close.error_code, TransportErrorCode::PROTOCOL_VIOLATION);
+        // The text of the library's check that rejects a DATAGRAM frame while reception is off.
+        assert_eq!(&close.reason[..], b"unexpected DATAGRAM frame");
 
         client_endpoint.wait_idle().await;
         quic_server.shutdown().await;

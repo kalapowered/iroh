@@ -107,6 +107,9 @@ pub(crate) mod server {
             transport_config
                 .max_concurrent_uni_streams(0_u8.into())
                 .max_concurrent_bidi_streams(0_u8.into())
+                // nothing reads a datagram here, so none is accepted: a DATAGRAM frame ends the
+                // connection instead of queueing for a reader that does not exist
+                .datagram_receive_buffer_size(None)
                 // enable sending quic address discovery frames
                 .send_observed_address_reports(true);
 

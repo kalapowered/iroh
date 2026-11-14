@@ -3,7 +3,7 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use n0_error::{Result, StdResultExt};
+use n0_error::{Result, StdResultExt, anyerr};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -76,6 +76,8 @@ impl Frame {
 pub(super) struct Peer {
     stream: TcpStream,
     next_stream: u32,
+    /// What has been read from the connection and is not yet a whole frame.
+    pending: Vec<u8>,
 }
 
 impl Peer {
@@ -88,6 +90,7 @@ impl Peer {
         let mut peer = Self {
             stream,
             next_stream: 1,
+            pending: Vec::new(),
         };
         peer.send(SETTINGS, 0, 0, &[]).await?;
         // The server's settings come first; they are acknowledged as a client does.
@@ -116,55 +119,72 @@ impl Peer {
         self.stream.write_all(&frame).await.anyerr()
     }
 
-    /// The next frame from the server, which must come within a short stretch of real time.
+    /// The next frame from the server, which must come whole within a short stretch of real time.
     pub(super) async fn next_frame(&mut self) -> Result<Frame> {
-        let read = async {
-            let mut head = [0; 9];
-            self.stream.read_exact(&mut head).await?;
-            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
-            let mut payload = vec![0; len];
-            self.stream.read_exact(&mut payload).await?;
-            std::io::Result::Ok(Frame {
-                kind: head[3],
-                flags: head[4],
-                stream: u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff,
-                payload,
-            })
-        };
-        tokio::time::timeout(ANSWER_DEADLINE, read)
-            .await
-            .std_context("no frame from the server")?
-            .anyerr()
+        match self.read_frame(ANSWER_DEADLINE).await.anyerr()? {
+            Some(frame) => Ok(frame),
+            None if self.pending.is_empty() => {
+                Err(anyerr!("no frame from the server in {ANSWER_DEADLINE:?}"))
+            }
+            None => Err(anyerr!(
+                "the server sent {} bytes of a frame and nothing more in {ANSWER_DEADLINE:?}",
+                self.pending.len()
+            )),
+        }
     }
 
-    /// The next frame of the server within a short stretch of real time, or `None` if there is
-    /// none, which for a connection that stays open means that the server sent nothing.
-    pub(super) async fn frame_within(&mut self, wait: Duration) -> Option<Frame> {
-        // A frame is read whole or not at all: the stretch ends only between two frames.
-        let mut head = [0; 1];
-        let peeked = tokio::time::timeout(wait, self.stream.peek(&mut head)).await;
-        match peeked {
-            Ok(Ok(n)) if n > 0 => self.next_frame().await.ok(),
-            _ => None,
-        }
+    /// The next frame of the server, if a whole one comes within `wait` of real time; `None` means
+    /// that the server sent no whole frame and the connection is still open. A connection that
+    /// ends is an error.
+    pub(super) async fn frame_within(&mut self, wait: Duration) -> Result<Option<Frame>> {
+        self.read_frame(wait).await.anyerr()
     }
 
     /// Reads the frames that the server sends until the connection ends, which gives `true`, or
-    /// until `wait` of real time passes with nothing more to read, which gives `false`.
+    /// until no whole frame comes within `wait` of real time, which gives `false`.
     pub(super) async fn ended_within(&mut self, wait: Duration) -> bool {
         loop {
-            let mut head = [0; 9];
-            match tokio::time::timeout(wait, self.stream.read_exact(&mut head)).await {
-                Err(_elapsed) => return false,
-                Ok(Err(_)) => return true,
-                Ok(Ok(_)) => {
-                    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
-                    if self.stream.read_exact(&mut vec![0; len]).await.is_err() {
-                        return true;
-                    }
-                }
+            match self.read_frame(wait).await {
+                Ok(None) => return false,
+                Ok(Some(_)) => {}
+                Err(_) => return true,
             }
         }
+    }
+
+    /// A whole frame, or `None` if `wait` of real time passes first. The limit cancels only a read
+    /// of the socket, which loses nothing, and the bytes of a frame that is not yet whole stay in
+    /// `pending` for the next call. It fails if the connection ends or breaks.
+    async fn read_frame(&mut self, wait: Duration) -> std::io::Result<Option<Frame>> {
+        let whole = async {
+            loop {
+                if let Some(frame) = self.take_frame() {
+                    return Ok(frame);
+                }
+                if self.stream.read_buf(&mut self.pending).await? == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+            }
+        };
+        match tokio::time::timeout(wait, whole).await {
+            Ok(frame) => frame.map(Some),
+            Err(_elapsed) => Ok(None),
+        }
+    }
+
+    /// The first frame in `pending`, if it is whole, which is then no longer in `pending`.
+    fn take_frame(&mut self) -> Option<Frame> {
+        let head = self.pending.get(..9)?;
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let whole = self.pending.get(..9 + len)?;
+        let frame = Frame {
+            kind: whole[3],
+            flags: whole[4],
+            stream: u32::from_be_bytes([whole[5], whole[6], whole[7], whole[8]]) & 0x7fff_ffff,
+            payload: whole[9..].to_vec(),
+        };
+        self.pending.drain(..9 + len);
+        Some(frame)
     }
 
     /// Sends the headers of a request on a new stream and returns the stream's number. The header
@@ -267,4 +287,63 @@ fn string(block: &mut Vec<u8>, text: &str) {
         block.push(len as u8);
     }
     block.extend_from_slice(text.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::{net::TcpListener, sync::Notify};
+
+    use super::*;
+
+    /// A server that sends one frame in two parts, and then the head and a part of another frame
+    /// with the connection left open.
+    async fn serve(listener: TcpListener, go_on: Arc<Notify>) -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept().await?;
+        // The peer's preface and settings, the server's settings and the peer's acknowledgement.
+        stream.read_exact(&mut [0; 24 + 9]).await?;
+        stream
+            .write_all(&[0, 0, 0, SETTINGS, 0, 0, 0, 0, 0])
+            .await?;
+        stream.read_exact(&mut [0; 9]).await?;
+
+        let frame = [0, 0, 10, DATA, 0, 0, 0, 0, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        stream.write_all(&frame[..13]).await?;
+        go_on.notified().await;
+        stream.write_all(&frame[13..]).await?;
+        stream.write_all(&frame[..12]).await?;
+        go_on.notified().await;
+        Ok(())
+    }
+
+    /// A frame that arrives in parts is read whole, however long the peer has waited between
+    /// them, and one that stops part way is an error that says so.
+    #[tokio::test]
+    async fn a_frame_in_parts_is_kept_and_one_that_stops_is_reported() -> n0_error::Result {
+        let listener = TcpListener::bind("127.0.0.1:0").await.anyerr()?;
+        let addr = listener.local_addr().anyerr()?;
+        let go_on = Arc::new(Notify::new());
+        let server = tokio::spawn(serve(listener, go_on.clone()));
+        let mut peer = Peer::connect(addr).await?;
+
+        let early = peer.frame_within(Duration::from_millis(100)).await?;
+        assert!(early.is_none(), "a frame that was not whole was returned");
+        go_on.notify_one();
+        let frame = peer
+            .frame_within(ANSWER_DEADLINE)
+            .await?
+            .expect("the rest of the frame was not read");
+        assert_eq!((frame.kind, frame.stream), (DATA, 1));
+        assert_eq!(frame.payload, (0..10).collect::<Vec<u8>>());
+
+        let error = peer
+            .next_frame()
+            .await
+            .expect_err("a frame that stops part way was returned");
+        assert!(error.to_string().contains("12 bytes of a frame"), "{error}");
+
+        server.abort();
+        Ok(())
+    }
 }

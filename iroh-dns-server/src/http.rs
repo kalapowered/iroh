@@ -960,6 +960,7 @@ mod tests {
                 .await
                 .std_context("the request was not answered at its deadline")?;
             if frame.kind == raw_h2::HEADERS && frame.stream == stream {
+                assert_eq!(frame.status(), Some(408), "the request's answer");
                 break;
             }
         }
@@ -1335,7 +1336,7 @@ mod tests {
         let server = Server::spawn_for_tests(dir.path()).await?;
         let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
 
-        while let Some(frame) = peer.frame_within(Duration::from_millis(200)).await {
+        while let Some(frame) = peer.frame_within(Duration::from_millis(200)).await? {
             assert!(
                 !(frame.kind == raw_h2::WINDOW_UPDATE && frame.stream == 0),
                 "the server raised the connection's window"
@@ -1346,8 +1347,8 @@ mod tests {
         Ok(())
     }
 
-    /// A body that fits the stream's window is read, and one frame past the window is a
-    /// flow-control error on that stream.
+    /// A DNS query as large as the stream's window is read and answered `200`, and one frame past
+    /// the window is a flow-control error on that stream.
     #[tokio::test]
     #[traced_test]
     async fn test_http2_stream_window() -> n0_error::Result {
@@ -1360,7 +1361,7 @@ mod tests {
         let fits = peer
             .request("POST", "/dns-query", &length(window), false)
             .await?;
-        peer.data(fits, &vec![b'x'; window], true).await?;
+        peer.data(fits, &dns_query(window), true).await?;
         let past = peer
             .request("POST", "/dns-query", &length(window + 1), false)
             .await?;
@@ -1373,6 +1374,11 @@ mod tests {
                 .await
                 .std_context("a body was neither answered nor refused")?;
             if frame.kind == raw_h2::HEADERS && frame.stream == fits {
+                assert_eq!(
+                    frame.status(),
+                    Some(200),
+                    "the answer to a query of {window} bytes"
+                );
                 answered = true;
             }
             match frame.reset_code() {

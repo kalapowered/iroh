@@ -88,7 +88,20 @@ that workload only:
 
 In the last row an open stream took about 15 kB more than the same connection without it: 14.8 kB, the peak less the memory of the 16,384 connections before their streams opened (484 MB over 32,768 streams).
 
-Inside a control group with the service's limit of 2 GiB (as `MemoryHigh` and `MemoryMax`, no swap), the peak of the group's own memory, which counts the sockets' kernel memory and the empty server's 15 MB, for 16,384 connections was 960 MiB where each held 2 HTTP/2 streams open as in the last row, 505 MiB where each sent a header block that never ends (`HEADERS` and 5 `CONTINUATION` frames of 16,384 bytes), which the bound on bytes between request starts closes, and 510 MiB where each held the 2 streams and that block. No process was killed in these runs.
+Inside a control group with the service's limit of 2 GiB (as `MemoryHigh` and `MemoryMax`, no swap), on the same build and the TLS listener of the rig above, the peak of the group's own memory (`memory.peak`, which counts the sockets' kernel memory and the empty server's 9 MB) for 16,384 connections was:
+
+| Each of the 16,384 connections | Peak of the group |
+| --- | --- |
+| sends a request every 20 seconds and nothing else | 425 MiB |
+| holds an unfinished HTTP/1 head of 8,191 bytes | 576 MiB |
+| holds 2 HTTP/2 streams open, each with a header list of 8,191 bytes and 4,090 body bytes | 948 MiB |
+| sends `HEADERS` and five `CONTINUATION` frames of 16,384 bytes that do not end the block | 497 MiB; the bound on bytes between request starts then closed every connection |
+| sends the 2 streams of the row above and at once a block of 20,000 bytes that does not end | 563 MiB; the bound closed 14,791 of the 16,384 connections |
+| sends the 2 streams, the second 2.5 seconds after the first, and 2.5 seconds later a block of 20,000 bytes that does not end, so that the bytes read since the second request started stay under the bound | 1,642 MiB; no connection was closed |
+| sends the start of a TLS `ClientHello` that declares 65,535 bytes, 65,472 raw bytes in four records, with no bound on the handshake | 1,085 MiB; the 10 seconds of the handshake then closed every connection |
+| the same, with the bound of 16,384 raw bytes on the handshake | 52 MiB; the bound closed every connection |
+
+The sixth row is the worst shape measured: the bound on bytes between request starts lets a connection hold two open streams and a block that stays under the bound, 102 kB for each connection. No process was killed in these runs, and the group's `oom` and `oom_kill` stayed at 0.
 
 A deployment builds with `KR_FORK_REV` set to the commit it pins, and compares `/healthz` with
 it.

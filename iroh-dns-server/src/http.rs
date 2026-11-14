@@ -15,6 +15,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, put},
 };
+use axum_server::accept::DefaultAcceptor;
 use hyper_util::{
     rt::{TokioExecutor, TokioTimer},
     server::conn::auto,
@@ -34,10 +35,12 @@ use tracing::{Level, info, span, warn};
 
 mod doh;
 mod error;
+mod idle;
 mod pkarr;
 mod rate_limiting;
 mod tls;
 
+use self::idle::IdleBound;
 pub(crate) use self::rate_limiting::RateLimits;
 use self::rate_limiting::{LOOKUP_QUOTA, PUT_QUOTA, Quota};
 pub use self::{rate_limiting::RateLimitConfig, tls::CertMode};
@@ -183,7 +186,8 @@ impl HttpServer {
             let listener = bind_listener(bind_addr, backlog).anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
             set_keepalive(&listener).anyerr()?;
-            let mut server = axum_server::from_tcp(listener)?;
+            let mut server =
+                axum_server::from_tcp(listener)?.acceptor(IdleBound(DefaultAcceptor::new()));
             set_header_read_timeout(server.http_builder());
             let fut = server.serve(app.into_make_service_with_connect_info::<SocketAddr>());
             info!("HTTP server listening on {bind_addr}");
@@ -222,7 +226,7 @@ impl HttpServer {
             let listener = bind_listener(bind_addr, backlog).anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
             set_keepalive(&listener).anyerr()?;
-            let mut server = axum_server::from_tcp(listener)?.acceptor(acceptor);
+            let mut server = axum_server::from_tcp(listener)?.acceptor(IdleBound(acceptor));
             set_header_read_timeout(server.http_builder());
             let fut = server.serve(app.into_make_service_with_connect_info::<SocketAddr>());
             info!("HTTPS server listening on {bind_addr}");
@@ -571,6 +575,179 @@ mod tests {
         .into_bytes();
         request.extend(std::iter::repeat_n(b'x', sent));
         request
+    }
+
+    /// A connection that completes its handshake, or on the plain listener just connects, and then
+    /// sends nothing holds the server's task and socket for as long as the sender likes unless the
+    /// server closes it.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_silent_connection_closed() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        let mut stream = TcpStream::connect(addr).await.anyerr()?;
+        assert_closed_after(&mut stream, super::idle::IDLE_TIMEOUT).await?;
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The same on the TLS listener, which is the one the deployment serves: a client that
+    /// completes the TLS handshake and sends nothing is closed.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_silent_tls_connection_closed() -> n0_error::Result {
+        use std::sync::Arc;
+
+        use rustls::{
+            DigitallySignedStruct, SignatureScheme,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            crypto::ring::default_provider,
+            pki_types::{CertificateDer, ServerName, UnixTime},
+        };
+
+        /// Accepts the server's self-signed certificate.
+        #[derive(Debug)]
+        struct AcceptAnyCertificate;
+
+        impl ServerCertVerifier for AcceptAnyCertificate {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let https_config = HttpsConfig {
+            port: 0,
+            bind_addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            listen_backlog: None,
+            domains: vec!["localhost".to_string()],
+            cert_mode: crate::http::CertMode::SelfSigned,
+            letsencrypt_contact: None,
+            letsencrypt_prod: None,
+        };
+        let server =
+            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config))
+                .await?;
+        let addr = server.https_addr().expect("https is bound");
+
+        let client_config =
+            rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+                .with_safe_default_protocol_versions()
+                .anyerr()?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+                .with_no_client_auth();
+        let tcp = TcpStream::connect(addr).await.anyerr()?;
+        let mut stream = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("localhost").anyerr()?, tcp)
+            .await
+            .anyerr()?;
+
+        // The client is done once it has sent its last handshake message; give the server the
+        // time to take it in, so that its own clock for the handshake has ended.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut buf = [0; 1];
+        let open = |read: Result<std::io::Result<usize>, _>| read.is_err();
+        advance(super::idle::IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(
+            open(tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await),
+            "closed before the bound"
+        );
+        advance(Duration::from_secs(2)).await;
+        let read = tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut buf))
+            .await
+            .std_context("server did not close the connection")?;
+        assert!(
+            !matches!(read, Ok(n) if n > 0),
+            "the server sent data to a client that sent nothing"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// An HTTP/2 connection with no request open is closed, whatever its peer sends.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_connection_with_no_request_closed() -> n0_error::Result {
+        const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        const EMPTY_SETTINGS: [u8; 9] = [0, 0, 0, 4, 0, 0, 0, 0, 0];
+        const PING: [u8; 17] = [0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        let mut stream = TcpStream::connect(addr).await.anyerr()?;
+        stream.write_all(PREFACE).await.anyerr()?;
+        stream.write_all(&EMPTY_SETTINGS).await.anyerr()?;
+        let mut buf = [0; 256];
+        let n = tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut buf))
+            .await
+            .std_context("no settings from server")?
+            .anyerr()?;
+        assert!(n > 0, "connection closed before the settings");
+
+        // A ping every few seconds keeps the peer's side of the connection busy, and starts no request.
+        for _ in 0..3 {
+            advance(Duration::from_secs(8)).await;
+            stream.write_all(&PING).await.anyerr()?;
+            while let Ok(read) =
+                tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await
+            {
+                assert!(read.anyerr()? > 0, "closed before the bound");
+            }
+        }
+        advance(Duration::from_secs(8)).await;
+        loop {
+            let read = tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut buf))
+                .await
+                .std_context("server did not close the connection")?;
+            match read {
+                Ok(0) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Ok(_) => continue,
+                Err(err) => panic!("expected the server to close the connection: {err:?}"),
+            }
+        }
+
+        server.shutdown().await?;
+        Ok(())
     }
 
     /// A request whose body stops arriving is answered at the request's deadline, and not held.

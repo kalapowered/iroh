@@ -124,11 +124,12 @@ const REQUEST_HEAD_LIMIT: usize = 8_192;
 const HTTP1_MAX_BUFFER_SIZE: usize = REQUEST_HEAD_LIMIT;
 
 /// The most streams an HTTP/2 connection has open at once: 2 (hyper's default is 200; it has no
-/// lowest value, and RFC 9113 advises 100 or more only for clients that want parallelism, which
-/// this server's clients do not). An open request with a full header list and a body of 4 KB
-/// holds about 15 KB, so this is what bounds the cost of a connection that is held open. A client
-/// that has reached the figure waits for a stream to end; a stream past it is refused with
-/// `REFUSED_STREAM`, which the client may retry.
+/// lowest value). An open request with a full header list and a body of 4 kB measured about
+/// 15 kB above an empty server on the build box (see `MAX_CONNECTIONS`), so the figure sets how
+/// much an open connection holds for requests that are not complete. The server announces it in
+/// its settings: a client that has read them waits for a stream to end before it opens another,
+/// and one that opens a third stream before they arrive has that stream refused with
+/// `REFUSED_STREAM`, which it may retry.
 const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 2;
 
 /// The header list of an HTTP/2 request is held to the head allowance above, as HTTP/2 counts it
@@ -139,10 +140,10 @@ const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 2;
 const HTTP2_MAX_HEADER_LIST_SIZE: u32 = REQUEST_HEAD_LIMIT as u32;
 
 /// The window of an HTTP/2 stream for the request body the server has not yet read: 4,096 bytes,
-/// the largest body any route takes (hyper's default is 1 MiB; it has no lowest value). A body is
-/// read as it arrives, so an honest request never waits for more window. The server applies it
-/// once the client has acknowledged the server's settings; the connection window below bounds
-/// what a client that never does can send.
+/// the largest body any route takes (hyper's default is 1 MiB; it has no lowest value). A body of
+/// that size without padding fits the first window; padding in a `DATA` frame counts against the
+/// window too. The server applies it once the client has acknowledged the server's settings; the
+/// connection window below bounds what a client that never does can send.
 const HTTP2_STREAM_WINDOW_SIZE: u32 = 4_096;
 
 /// The window of an HTTP/2 connection for body bytes the server has not yet read: 65,535 bytes,
@@ -150,8 +151,8 @@ const HTTP2_STREAM_WINDOW_SIZE: u32 = 4_096;
 /// 1 MiB unless told otherwise.
 const HTTP2_CONNECTION_WINDOW_SIZE: u32 = 65_535;
 
-/// Set the limits on what a connection holds for a request that is not complete, so that the
-/// connections the server holds cannot take its memory.
+/// Set the limits on what a connection holds for a request that is not complete: the head that
+/// HTTP/1 buffers, and the streams, the header list and the two windows of HTTP/2.
 fn set_protocol_limits(builder: &mut auto::Builder<TokioExecutor>) {
     builder.http1().max_buf_size(HTTP1_MAX_BUFFER_SIZE);
     builder
@@ -177,17 +178,17 @@ fn bounded_server<A>(
     Ok(server)
 }
 
-/// The most connections the HTTP and HTTPS listeners hold at once, together; it bounds what held
-/// connections can take. A connection past it is closed at once, before its handshake, and its
-/// request is not queued; the connections already held stay usable. On the build box, 16,384 held
-/// connections measured 0.34 GiB above an empty server when each sent only a request every 20
-/// seconds, 0.48 GiB when each held an unfinished HTTP/1 head, and 0.83 GiB when each held two
-/// HTTP/2 streams open with a full header list and body.
+/// The most connections the HTTP and HTTPS listeners hold at once, together. A connection past it
+/// is closed at once, before its handshake, and its request is not queued; the connections already
+/// held stay usable. On the build box, 16,384 held connections measured 0.34 GiB of resident
+/// memory above an empty server when each sent only a request every 20 seconds, 0.48 GiB when
+/// each held an unfinished HTTP/1 head, and 0.83 GiB when each held two HTTP/2 streams open with a
+/// full header list and body. Each figure measures its own workload.
 pub(crate) const MAX_CONNECTIONS: usize = 16_384;
 
 /// How long a request may take from its headers until the server has made its answer, its body
 /// included. Delivering the answer is not part of it: a connection that does not take its answer
-/// is closed by the idle bound.
+/// is closed by the idle bound once it has no request in progress.
 ///
 /// A signed packet and a lookup are a kilobyte or two, so a request that takes longer is a
 /// sender that is holding the connection.

@@ -180,13 +180,17 @@ fn bounded_server<A>(
     Ok(server)
 }
 
-/// The most connections the HTTP and HTTPS listeners hold at once, together. A connection past it
-/// is closed at once, before its handshake, and its request is not queued; the connections already
-/// held stay usable. On the build box, 16,384 held connections measured 0.34 GiB of peak resident
-/// memory above an empty server when each sent only a request every 20 seconds, 0.48 GiB when
-/// each held an unfinished HTTP/1 head of the largest size, and 0.85 GiB when each held two HTTP/2
-/// streams open with a header list of the largest size and a body of 4,090 bytes. Each figure
-/// measures its own workload.
+/// The most connections the HTTP and HTTPS listeners hold at once, together: 8,192. A connection
+/// past it is closed at once, before its handshake, and its request is not queued; the
+/// connections already held stay usable. The figure was taken from what a connection costs in the
+/// heaviest shape that the limits permit, measured on the build box inside a control group: two
+/// HTTP/2 streams open, each with a header list of 8,191 bytes and 4,090 body bytes, and, 2.5
+/// seconds after the second, a header block of 20,000 bytes that does not end, which stays under
+/// `READ_BOUND`. 16,384 connections in that shape held 1,642 MiB at the group's peak, 102.1 kB
+/// each, and 8,192 held 857 MiB, 106 kB each; with an empty server of 9 MB, 8,192 times 102.1 kB
+/// is 826 MiB, from which the figure was taken. The same connections each sending a request every
+/// 20 seconds held 227 MiB. Each figure measures its own workload, and no heavier shape has been
+/// measured.
 pub(crate) const MAX_CONNECTIONS: usize = 8_192;
 
 /// How long a request may take from its headers until the server has made its answer, its body

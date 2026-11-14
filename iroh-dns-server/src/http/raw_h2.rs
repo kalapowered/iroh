@@ -5,7 +5,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use n0_error::{Result, StdResultExt, anyerr};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -16,8 +16,11 @@ pub(super) const DATA: u8 = 0;
 pub(super) const HEADERS: u8 = 1;
 pub(super) const RST_STREAM: u8 = 3;
 pub(super) const SETTINGS: u8 = 4;
+pub(super) const PING: u8 = 6;
 pub(super) const WINDOW_UPDATE: u8 = 8;
 pub(super) const CONTINUATION: u8 = 9;
+/// A frame type that the protocol does not define, which a receiver has to discard.
+pub(super) const UNDEFINED: u8 = 0xfa;
 
 pub(super) const END_STREAM: u8 = 0x1;
 pub(super) const ACK: u8 = 0x1;
@@ -74,16 +77,22 @@ impl Frame {
 
 /// A connection to the server that has done the handshake of HTTP/2 and acknowledged the server's
 /// settings, so that the server applies its own limits to what this peer sends next.
-pub(super) struct Peer {
-    stream: TcpStream,
+pub(super) struct Peer<S = TcpStream> {
+    stream: S,
     next_stream: u32,
     /// What has been read from the connection and is not yet a whole frame.
     pending: Vec<u8>,
 }
 
-impl Peer {
+impl Peer<TcpStream> {
     pub(super) async fn connect(addr: SocketAddr) -> Result<Self> {
-        let mut stream = TcpStream::connect(addr).await.anyerr()?;
+        Self::over(TcpStream::connect(addr).await.anyerr()?).await
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
+    /// A peer on `stream`, which is open already: a connection after a TLS handshake, for one.
+    pub(super) async fn over(mut stream: S) -> Result<Self> {
         stream
             .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
             .await
@@ -103,6 +112,11 @@ impl Peer {
         }
         peer.send(SETTINGS, ACK, 0, &[]).await?;
         Ok(peer)
+    }
+
+    /// Writes `bytes` as they are, which are not a frame.
+    pub(super) async fn send_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        self.stream.write_all(bytes).await.anyerr()
     }
 
     pub(super) async fn send(

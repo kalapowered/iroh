@@ -295,14 +295,26 @@ fn escape_hostname(hostname: &str) -> Cow<'_, str> {
     regex.replace_all(hostname, "")
 }
 
+/// The start of a `ClientHello` of `raw` bytes in all, the record's header included: one record
+/// whose handshake header declares the largest message, 65,535 bytes, so that the TLS library
+/// keeps what it is sent while it waits for the rest.
+#[cfg(test)]
+pub(super) fn partial_client_hello(raw: usize) -> Vec<u8> {
+    let mut bytes = vec![0x16, 0x03, 0x01];
+    bytes.extend_from_slice(&u16::try_from(raw - 5).expect("one record").to_be_bytes());
+    bytes.extend_from_slice(&[0x01, 0x00, 0xff, 0xff]);
+    bytes.resize(raw, 0);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use axum_server::accept::Accept;
-    use tokio::time::Instant;
+    use tokio::{io::AsyncWriteExt, time::Instant};
 
-    use super::{TLS_HANDSHAKE_TIMEOUT, TlsAcceptor};
+    use super::{AxumAcceptor, TLS_HANDSHAKE_TIMEOUT, TlsAcceptor, partial_client_hello};
 
     #[tokio::test(start_paused = true)]
     async fn test_handshake_timeout() {
@@ -322,5 +334,54 @@ mod tests {
             .expect_err("handshake cannot succeed without a client");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(start.elapsed() >= TLS_HANDSHAKE_TIMEOUT);
+    }
+
+    /// The Let's Encrypt acceptor as `letsencrypt` makes it, but with its state never polled, so
+    /// that nothing reaches the network.
+    fn lets_encrypt() -> TlsAcceptor {
+        let state = tokio_rustls_acme::AcmeConfig::new(["localhost"]).state();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(state.resolver());
+        TlsAcceptor::LetsEncrypt(AxumAcceptor::new(
+            state.acceptor(),
+            std::sync::Arc::new(config),
+        ))
+    }
+
+    /// A connection in its handshake may send 16,384 raw bytes and is closed by the next byte,
+    /// in both modes. The figure is written out here so that a change of it fails this case.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_may_send_the_bound_and_no_more() {
+        let manual = TlsAcceptor::self_signed(vec!["localhost".to_string()]).unwrap();
+        for (mode, acceptor) in [("manual", manual), ("letsencrypt", lets_encrypt())] {
+            let (mut client, server_io) = tokio::io::duplex(1 << 20);
+            let mut accept = acceptor.accept(server_io, ());
+
+            client
+                .write_all(&partial_client_hello(16_384))
+                .await
+                .unwrap();
+            // The acceptor reads all of it and waits for the rest, while the clock runs on.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut accept)
+                    .await
+                    .is_err(),
+                "{mode}: ended at the bound"
+            );
+
+            // The first byte of the next record.
+            client.write_all(&[0x16]).await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(1), accept)
+                .await
+                .unwrap_or_else(|_| panic!("{mode}: not closed past the bound"))
+                .err()
+                .unwrap_or_else(|| panic!("{mode}: a handshake of 16,385 bytes succeeded"));
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{mode}");
+        }
     }
 }

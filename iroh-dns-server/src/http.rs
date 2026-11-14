@@ -561,7 +561,7 @@ mod tests {
     use tokio_rustls::client::TlsStream;
 
     use crate::{
-        http::{HttpsConfig, raw_h2},
+        http::{HttpsConfig, raw_h2, tls::partial_client_hello},
         server::Server,
     };
 
@@ -886,17 +886,6 @@ mod tests {
 
         server.shutdown().await?;
         Ok(())
-    }
-
-    /// The start of a TLS `ClientHello` of `raw` bytes in all, the record's header included: one
-    /// record whose handshake header declares the largest message, 65,535 bytes, so that the TLS
-    /// library keeps what it is sent while it waits for the rest.
-    fn partial_client_hello(raw: usize) -> Vec<u8> {
-        let mut bytes = vec![0x16, 0x03, 0x01];
-        bytes.extend_from_slice(&u16::try_from(raw - 5).expect("one record").to_be_bytes());
-        bytes.extend_from_slice(&[0x01, 0x00, 0xff, 0xff]);
-        bytes.resize(raw, 0);
-        bytes
     }
 
     /// A connection that is still in its TLS handshake may send 16,384 bytes and no more: the
@@ -1375,6 +1364,131 @@ mod tests {
         assert!(
             peer.ended_within(CLOSE_DEADLINE).await,
             "an unfinished header block, with a request held open, was held"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The bytes that `Peer` has sent when it has connected: the preface of HTTP/2 (24), its own
+    /// settings (9) and the acknowledgement of the server's (9).
+    const PEER_CONNECT_BYTES: usize = 42;
+
+    /// Sends frames of a type that the protocol does not define, which the server discards, until
+    /// the server has read `total` bytes from the connection in all, the last 17 of them a ping,
+    /// and waits for the ping's answer, which shows that the server has read all of them and kept
+    /// the connection open.
+    async fn read_exactly<S>(peer: &mut raw_h2::Peer<S>, total: usize) -> n0_error::Result
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut left = total - PEER_CONNECT_BYTES - (9 + 8);
+        while left > 0 {
+            let payload = (left - 9).min(16_384);
+            peer.send(raw_h2::UNDEFINED, 0, 0, &vec![0; payload])
+                .await?;
+            left -= 9 + payload;
+        }
+        peer.send(raw_h2::PING, 0, 0, &[0; 8]).await?;
+        loop {
+            let frame = peer.next_frame().await?;
+            if frame.kind == raw_h2::PING && frame.flags & raw_h2::ACK != 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// A connection may read 24,576 bytes between two request starts, and before its first, after
+    /// its handshake: with exactly that many read it is open, and one byte more closes it. The
+    /// figure is written out here so that a change of it fails this case. The bytes are counted
+    /// as the connection's own bytes, which on the TLS listener are the decrypted bytes: the
+    /// handshake's bound of 16,384 raw bytes does not apply to them.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_read_bound_is_exact_over_http_and_tls() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server =
+            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config()))
+                .await?;
+
+        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+        read_exactly(&mut peer, 24_576).await?;
+        peer.send_raw(&[0]).await?;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "over HTTP: a byte past the bound was read"
+        );
+
+        let tls = tls_client(server.https_addr().expect("https is bound")).await?;
+        let mut peer = raw_h2::Peer::over(tls).await?;
+        read_exactly(&mut peer, 24_576).await?;
+        peer.send_raw(&[0]).await?;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "over TLS: a byte past the bound was read"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A connection that the server closes by either bound gives its place back: with the most at
+    /// one, a connection that the bound closed is followed by one that is answered.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_a_close_by_either_bound_gives_the_place_back() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests_with_connection_cap(
+            dir.path(),
+            None,
+            None,
+            Some(https_config()),
+            1,
+        )
+        .await?;
+        let http = server.http_addr().expect("http is bound");
+        let https = server.https_addr().expect("https is bound");
+
+        let mut peer = raw_h2::Peer::connect(http).await?;
+        let mut refused = TcpStream::connect(http).await.anyerr()?;
+        assert_refused(&mut refused).await?;
+        // A frame of 16,384 bytes and one of 8,200 take the connection past 24,576 bytes.
+        for payload in [16_384, 8_200] {
+            let _ = peer.send(raw_h2::UNDEFINED, 0, 0, &vec![0; payload]).await;
+        }
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "the bound did not close the connection"
+        );
+        let mut freed = false;
+        for _ in 0..40 {
+            let mut stream = TcpStream::connect(http).await.anyerr()?;
+            if answers(&mut stream).await.is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "no place came free after the read bound closed one");
+
+        let mut hello = TcpStream::connect(https).await.anyerr()?;
+        hello
+            .write_all(&partial_client_hello(16_384))
+            .await
+            .anyerr()?;
+        hello.write_all(&[0x16]).await.anyerr()?;
+        assert_refused(&mut hello).await?;
+        let mut freed = false;
+        for _ in 0..40 {
+            if tls_client(https).await.is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "no place came free after the handshake bound closed one"
         );
 
         server.shutdown().await?;

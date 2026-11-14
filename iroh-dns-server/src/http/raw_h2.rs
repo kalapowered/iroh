@@ -61,6 +61,26 @@ impl Frame {
         }
     }
 
+    /// The table size that a `HEADERS` frame's block starts by announcing, if it does: the
+    /// dynamic table size update of RFC 7541, 6.3, a 5-bit prefix integer after the bits `001`.
+    pub(super) fn table_size_update(&self) -> Option<usize> {
+        let first = *self.payload.first()?;
+        if self.kind != HEADERS || first & 0xe0 != 0x20 {
+            return None;
+        }
+        let mut value = usize::from(first & 0x1f);
+        if value < 0x1f {
+            return Some(value);
+        }
+        for (index, byte) in self.payload[1..].iter().enumerate() {
+            value += usize::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
     /// The error code of an `RST_STREAM` frame.
     pub(super) fn reset_code(&self) -> Option<u32> {
         (self.kind == RST_STREAM)
@@ -88,6 +108,15 @@ impl Peer<TcpStream> {
     pub(super) async fn connect(addr: SocketAddr) -> Result<Self> {
         Self::over(TcpStream::connect(addr).await.anyerr()?).await
     }
+
+    /// A peer whose first settings announce `size` as the table size that the server's encoder may
+    /// use for the header blocks of its answers (`SETTINGS_HEADER_TABLE_SIZE`).
+    pub(super) async fn connect_announcing_table_size(addr: SocketAddr, size: u32) -> Result<Self> {
+        let mut setting = 1u16.to_be_bytes().to_vec();
+        setting.extend(size.to_be_bytes());
+        let stream = TcpStream::connect(addr).await.anyerr()?;
+        Self::over_with_settings(stream, &setting).await
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
@@ -103,14 +132,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
     }
 
     /// A peer on `stream`, which is open already: a connection after a TLS handshake, for one.
-    pub(super) async fn over(mut stream: S) -> Result<Self> {
+    pub(super) async fn over(stream: S) -> Result<Self> {
+        Self::over_with_settings(stream, &[]).await
+    }
+
+    /// As `over`, with `settings` as the payload of the peer's first `SETTINGS` frame.
+    async fn over_with_settings(mut stream: S, settings: &[u8]) -> Result<Self> {
         stream.write_all(PREFACE).await.anyerr()?;
         let mut peer = Self {
             stream,
             next_stream: 1,
             pending: Vec::new(),
         };
-        peer.send(SETTINGS, 0, 0, &[]).await?;
+        peer.send(SETTINGS, 0, 0, settings).await?;
         // The server's settings come first; they are acknowledged as a client does.
         loop {
             let frame = peer.next_frame().await?;

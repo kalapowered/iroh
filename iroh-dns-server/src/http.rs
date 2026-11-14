@@ -1866,6 +1866,39 @@ mod tests {
         Ok(())
     }
 
+    /// A peer that announces a header table of 1 MiB does not get a table of that size for the
+    /// answers: the library caps what the encoder takes at 4 KiB, which is its starting size, so
+    /// the first answer carries no size update above it. Without the cap each answer's `Date`
+    /// value adds an entry to the table, and 2,048 seconds of one request a second hold over
+    /// 0.3 MiB a connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_answers_keep_the_header_table_at_4_kib() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut peer = raw_h2::Peer::connect_announcing_table_size(
+            server.http_addr().expect("http is bound"),
+            1 << 20,
+        )
+        .await?;
+
+        let stream = peer.request("GET", "/healthcheck", &[], true).await?;
+        loop {
+            let frame = peer.next_frame().await?;
+            if frame.kind == raw_h2::HEADERS && frame.stream == stream {
+                let update = frame.table_size_update();
+                assert!(
+                    update.is_none_or(|size| size <= 4096),
+                    "the answer's table size update is {update:?}"
+                );
+                break;
+            }
+        }
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A DNS query as large as the stream's window is read and answered `200`, and one frame past
     /// the window is a flow-control error on that stream.
     #[tokio::test]

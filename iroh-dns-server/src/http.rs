@@ -180,10 +180,11 @@ fn bounded_server<A>(
 
 /// The most connections the HTTP and HTTPS listeners hold at once, together. A connection past it
 /// is closed at once, before its handshake, and its request is not queued; the connections already
-/// held stay usable. On the build box, 16,384 held connections measured 0.34 GiB of resident
+/// held stay usable. On the build box, 16,384 held connections measured 0.34 GiB of peak resident
 /// memory above an empty server when each sent only a request every 20 seconds, 0.48 GiB when
-/// each held an unfinished HTTP/1 head, and 0.83 GiB when each held two HTTP/2 streams open with a
-/// full header list and body. Each figure measures its own workload.
+/// each held an unfinished HTTP/1 head of the largest size, and 0.85 GiB when each held two HTTP/2
+/// streams open with a header list of the largest size and a body of 4,090 bytes. Each figure
+/// measures its own workload.
 pub(crate) const MAX_CONNECTIONS: usize = 16_384;
 
 /// How long a request may take from its headers until the server has made its answer, its body

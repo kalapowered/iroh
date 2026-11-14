@@ -77,14 +77,16 @@ bounds the number of connections the server holds.
 
 What 16,384 held connections cost was measured on the build box (AMD EPYC 7502P, Linux), on a release
 build with one TLS listener on loopback, the rate limits off and a 65,536 descriptor limit. The figures
-are the resident memory above an empty server (15.5 MB) for the workload named, and measure that
-workload only:
+are the peak resident memory above an empty server (about 15 MB) for the workload named, and measure
+that workload only:
 
 | Each of the 16,384 connections | Resident memory above an empty server |
 | --- | --- |
 | sends a request every 20 seconds and nothing else | 0.34 GiB |
-| holds an unfinished HTTP/1 head of 8,190 bytes | 0.48 GiB |
-| holds 2 HTTP/2 streams open, each with a 4,096-byte header list and 4,090 body bytes | 0.83 GiB |
+| holds an unfinished HTTP/1 head of 8,191 bytes, the most the buffer takes | 0.48 GiB |
+| holds 2 HTTP/2 streams open, each with a header list of 8,191 bytes, the most the server accepts, and 4,090 body bytes | 0.85 GiB |
+
+In the last row an open stream took about 15 kB (14.8 kB: 484 MB for the 32,768 streams).
 
 A deployment builds with `KR_FORK_REV` set to the commit it pins, and compares `/healthz` with
 it.

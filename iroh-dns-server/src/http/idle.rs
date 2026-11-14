@@ -498,14 +498,12 @@ mod tests {
                     ended.store(true, Ordering::SeqCst);
                 })
             };
-            let polls = thread::spawn(move || {
+            let polls = thread::spawn(move || -> io::Result<()> {
                 let mut cx = Context::from_waker(Waker::noop());
                 start.wait();
                 loop {
                     let done = ended.load(Ordering::SeqCst);
-                    if let Err(error) = stream.check(&mut cx) {
-                        return Err(error);
-                    }
+                    stream.check(&mut cx)?;
                     if done {
                         return Ok(());
                     }

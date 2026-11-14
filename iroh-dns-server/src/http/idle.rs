@@ -5,7 +5,8 @@
 //! [`IdleBound`] wraps an acceptor and closes a connection that has had no request in progress
 //! for [`IDLE_TIMEOUT`], counted from the end of the handshake or from the end of the last
 //! request. Bytes that arrive without starting a request, such as the pings of an idle HTTP/2
-//! connection, do not extend it. A request in progress is bounded by its own deadline.
+//! connection, do not extend it. A request in progress is bounded by its own deadline. A connection
+//! may also read only [`READ_BOUND`] bytes between two request starts.
 
 use std::{
     future::Future,
@@ -30,6 +31,19 @@ use crate::metrics::Metrics;
 
 /// How long a connection may stand with no request in progress.
 pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most bytes a connection may read between two request starts, and before its first, whatever
+/// requests are in progress: 24,576, three times the head allowance. A request starts when the
+/// service is called, which is when its whole head has been read, and the count begins again
+/// there. Between two starts an honest client sends the rest of the body of the request before (at
+/// most 4,096 bytes), the head of the next request (at most 8,192) and HTTP/2's own frames
+/// (settings, window updates, pings), about 12.5 kB at the largest sizes, so the figure leaves
+/// room for twice that. What it bounds is what hyper holds for a request that has not started:
+/// HTTP/2 keeps a header block as it arrives until its last frame, up to 6 frames of 16,384
+/// bytes, and the block is not a stream, so the limit on streams and the header list limit do not
+/// count it. A connection that reads more is closed, and its client meets a connection that ends
+/// with no status, as with the idle bound.
+pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 
 /// The connections that the server holds at once, from the accept to the close, across its
 /// listeners. A connection that would be one more than `max` is closed at once.
@@ -93,6 +107,8 @@ struct State {
     in_flight: usize,
     /// When the connection last had no request in progress.
     idle_since: Instant,
+    /// The bytes read since the last request started, or since the connection began.
+    read: usize,
     /// The task that waits for the connection's last request to end.
     waker: Option<Waker>,
 }
@@ -103,6 +119,7 @@ impl Shared {
             state: Mutex::new(State {
                 in_flight: 0,
                 idle_since: Instant::now(),
+                read: 0,
                 waker: None,
             }),
         })
@@ -111,6 +128,20 @@ impl Shared {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Counts `bytes` read, and fails once more than [`READ_BOUND`] have been read since the last
+    /// request started.
+    fn count_read(&self, bytes: usize) -> io::Result<()> {
+        let mut state = self.state();
+        state.read = state.read.saturating_add(bytes);
+        if state.read > READ_BOUND {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "connection read more than it may between two requests",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A request in progress. The connection counts as busy until this is dropped.
@@ -118,7 +149,10 @@ struct InFlight(Arc<Shared>);
 
 impl InFlight {
     fn begin(shared: &Arc<Shared>) -> Self {
-        shared.state().in_flight += 1;
+        let mut state = shared.state();
+        state.in_flight += 1;
+        state.read = 0;
+        drop(state);
         Self(shared.clone())
     }
 }
@@ -303,7 +337,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for IdleStream<T> {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
         this.check(cx)?;
-        Pin::new(&mut this.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = polled {
+            this.shared.count_read(buf.filled().len() - before)?;
+        }
+        polled
     }
 }
 
@@ -585,6 +624,57 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_that_starts_and_ends_as_the_deadline_passes_gives_a_new_idle_time() {
         a_request_starts_as_the_deadline_passes(true).await;
+    }
+
+    /// Reads `count` bytes from the stream, a kilobyte at a time, as a client's bytes arrive.
+    async fn read_bytes(
+        client: &mut DuplexStream,
+        stream: &mut IdleStream<DuplexStream>,
+        count: usize,
+    ) -> io::Result<()> {
+        let mut left = count;
+        while left > 0 {
+            let chunk = left.min(1_024);
+            client.write_all(&vec![0; chunk]).await?;
+            stream.read_exact(&mut vec![0; chunk]).await?;
+            left -= chunk;
+        }
+        Ok(())
+    }
+
+    /// A connection reads up to the bound between two request starts and is closed past it,
+    /// with no request in progress and with one that is held open.
+    #[tokio::test]
+    async fn a_connection_that_reads_past_the_bound_is_closed() {
+        for requests_held in [0, 1] {
+            let (mut client, mut stream, mut service, _gate) = accepted().await;
+            let held: Vec<_> = (0..requests_held).map(|_| service.call(())).collect();
+            read_bytes(&mut client, &mut stream, READ_BOUND)
+                .await
+                .expect("the bound's own bytes were refused");
+            let error = read_bytes(&mut client, &mut stream, 1)
+                .await
+                .expect_err("a byte past the bound was read");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "with {requests_held} requests held"
+            );
+            drop(held);
+        }
+    }
+
+    /// The count begins again when a request starts: a connection may read the bound's worth of
+    /// bytes before each start, however many bytes it has read in all.
+    #[tokio::test]
+    async fn the_count_of_bytes_begins_again_at_each_request_start() {
+        let (mut client, mut stream, mut service, _gate) = accepted().await;
+        for _ in 0..4 {
+            read_bytes(&mut client, &mut stream, READ_BOUND)
+                .await
+                .expect("the bytes before a start were refused");
+            drop(service.call(()));
+        }
     }
 
     #[tokio::test(start_paused = true)]

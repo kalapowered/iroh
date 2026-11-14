@@ -17,6 +17,7 @@ pub(super) const HEADERS: u8 = 1;
 pub(super) const RST_STREAM: u8 = 3;
 pub(super) const SETTINGS: u8 = 4;
 pub(super) const WINDOW_UPDATE: u8 = 8;
+pub(super) const CONTINUATION: u8 = 9;
 
 pub(super) const END_STREAM: u8 = 0x1;
 pub(super) const ACK: u8 = 0x1;
@@ -206,6 +207,18 @@ impl Peer {
         let flags = END_HEADERS | if end_stream { END_STREAM } else { 0 };
         self.send(HEADERS, flags, stream, &block).await?;
         Ok(stream)
+    }
+
+    /// Sends a header block that never ends on a new stream: `HEADERS` and `continuations`
+    /// `CONTINUATION` frames of 16,384 bytes, none of them with `END_HEADERS`. A write that fails
+    /// is ignored, since the server may have closed the connection already.
+    pub(super) async fn unfinished_block(&mut self, continuations: usize) {
+        let stream = self.next_stream;
+        self.next_stream += 2;
+        let _ = self.send(HEADERS, 0, stream, &[0; 16_384]).await;
+        for _ in 0..continuations {
+            let _ = self.send(CONTINUATION, 0, stream, &[0; 16_384]).await;
+        }
     }
 
     /// Sends a `DATA` frame with `body`.

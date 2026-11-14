@@ -1302,6 +1302,162 @@ mod tests {
         Ok(())
     }
 
+    /// A header block that never ends, which HTTP/2 holds as it arrives and does not count as a
+    /// stream, is cut off at the bound on what a connection reads between two request starts,
+    /// with no request in progress and with one held open beside it. The client meets a
+    /// connection that ends.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_unfinished_header_block_closes_the_connection() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        let mut peer = raw_h2::Peer::connect(addr).await?;
+        peer.unfinished_block(5).await;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "an unfinished header block, with no request in progress, was held"
+        );
+
+        let mut peer = raw_h2::Peer::connect(addr).await?;
+        let length = [("content-length", "100".to_string())];
+        peer.request("POST", "/dns-query", &length, false).await?;
+        peer.unfinished_block(5).await;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "an unfinished header block, with a request held open, was held"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The bound on what a connection reads between two request starts leaves honest requests of
+    /// the largest sizes alone, over HTTP/2: a POST and then a GET one after another on one
+    /// connection, and two at once.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_largest_requests_are_answered_one_after_another_and_at_once()
+    -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+
+        let largest = super::DOH_MESSAGE_LIMIT;
+        let message = dns_query(largest);
+        let post_fields = [
+            ("content-length", largest.to_string()),
+            ("content-type", "application/dns-message".to_string()),
+        ];
+        let (get_path, get_fields) = dns_get_over_h2(
+            &message,
+            Some(super::HTTP2_MAX_HEADER_LIST_SIZE as usize - 1),
+        );
+
+        let post = peer
+            .request("POST", "/dns-query", &post_fields, false)
+            .await?;
+        peer.data(post, &message, true).await?;
+        let get = peer.request("GET", &get_path, &get_fields, true).await?;
+        // Both at once, the second pair after the first pair is answered.
+        let (mut answered, mut at_once) = (Vec::new(), Vec::new());
+        while answered.len() < 2 {
+            let frame = peer.next_frame().await?;
+            if frame.status().is_some() {
+                answered.push((frame.stream, frame.status()));
+            }
+        }
+        for stream in [post, get] {
+            assert!(answered.contains(&(stream, Some(200))), "{answered:?}");
+        }
+        let post = peer
+            .request("POST", "/dns-query", &post_fields, false)
+            .await?;
+        peer.data(post, &message, true).await?;
+        let get = peer.request("GET", &get_path, &get_fields, true).await?;
+        while at_once.len() < 2 {
+            let frame = peer.next_frame().await?;
+            if frame.status().is_some() {
+                at_once.push((frame.stream, frame.status()));
+            }
+        }
+        for stream in [post, get] {
+            assert!(at_once.contains(&(stream, Some(200))), "{at_once:?}");
+        }
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The status of the answer to `request` on a connection that is kept, whose answer is read
+    /// whole.
+    async fn exchange(stream: &mut TcpStream, request: &[u8]) -> n0_error::Result<u16> {
+        stream.write_all(request).await.anyerr()?;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            let n = tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut byte))
+                .await
+                .std_context("no answer from server")?
+                .anyerr()?;
+            n0_error::ensure_any!(n > 0, "the connection ended before the answer");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .map_or(Ok(0), str::parse)
+            .anyerr()?;
+        stream.read_exact(&mut vec![0; length]).await.anyerr()?;
+        head[9..12].parse().anyerr()
+    }
+
+    /// The bound on what a connection reads between two request starts leaves honest requests of
+    /// the largest sizes alone, over HTTP/1: heads of the largest size one after another, a
+    /// publication of the largest size and a query of the largest size, on one connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http1_largest_requests_are_answered_on_one_connection() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut stream = TcpStream::connect(server.http_addr().expect("http is bound"))
+            .await
+            .anyerr()?;
+
+        let most = super::HTTP1_MAX_BUFFER_SIZE;
+        let head = |len: usize| {
+            let start = "GET /healthcheck HTTP/1.1\r\nhost: localhost\r\nx-fill: ";
+            let end = "\r\n\r\n";
+            let fill = "a".repeat(len - start.len() - end.len());
+            format!("{start}{fill}{end}").into_bytes()
+        };
+        let largest = super::DOH_MESSAGE_LIMIT;
+        let query = dns_query(largest);
+        let mut post = format!(
+            "POST /dns-query HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/dns-message\r\ncontent-length: {largest}\r\n\r\n"
+        )
+        .into_bytes();
+        post.extend(&query);
+        let publication = super::PKARR_PUT_BODY_LIMIT;
+        let requests = [
+            (head(most), 200),
+            (head(most), 200),
+            (head(most), 200),
+            (put_request(publication, publication), 400),
+            (dns_get_request(&query, Some(most)), 200),
+            (post, 200),
+            (head(most), 200),
+        ];
+        for (request, status) in requests {
+            assert_eq!(exchange(&mut stream, &request).await?, status);
+        }
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A DNS query by GET is taken up to the size of the largest message that POST takes, over HTTP/1
     /// and over HTTP/2, and refused with the status that POST gives past it.
     #[tokio::test]

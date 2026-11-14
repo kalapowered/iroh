@@ -27,6 +27,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::{net::TcpSocket, task::JoinSet};
 use tower_http::{
     cors::{self, CorsLayer},
+    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use tracing::{Level, info, span, warn};
@@ -93,6 +94,12 @@ fn set_header_read_timeout(builder: &mut auto::Builder<TokioExecutor>) {
         .timer(TokioTimer::new())
         .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
 }
+
+/// How long a request may take from its headers to its answer, its body included.
+///
+/// A signed packet and a lookup are a kilobyte or two, so a request that takes longer is a
+/// sender that is holding the connection.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The largest body of `PUT /pkarr/{key}`: a signed packet without the public key the path names.
 const PKARR_PUT_BODY_LIMIT: usize = SignedPacket::MAX_BYTES - PublicKey::LENGTH;
@@ -371,6 +378,10 @@ fn create_app_with_quotas(
 
     // configure app
     router
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
         .layer(cors)
         .layer(trace)
         .route_layer(middleware::from_fn_with_state(state, metrics_middleware))
@@ -560,6 +571,32 @@ mod tests {
         .into_bytes();
         request.extend(std::iter::repeat_n(b'x', sent));
         request
+    }
+
+    /// A request whose body stops arriving is answered at the request's deadline, and not held.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_slow_request_body_gets_408() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        let mut stream = TcpStream::connect(addr).await.anyerr()?;
+        stream.write_all(&put_request(1000, 10)).await.anyerr()?;
+        assert_open(&mut stream).await;
+        advance(super::REQUEST_TIMEOUT - Duration::from_secs(1)).await;
+        assert_open(&mut stream).await;
+
+        advance(Duration::from_secs(2)).await;
+        let mut status_line = [0; 12];
+        tokio::time::timeout(CLOSE_DEADLINE, stream.read_exact(&mut status_line))
+            .await
+            .std_context("no answer at the deadline")?
+            .anyerr()?;
+        assert_eq!(&status_line[9..12], b"408");
+
+        server.shutdown().await?;
+        Ok(())
     }
 
     /// A body is read whole, so a request may not hold more than the largest thing the route takes.

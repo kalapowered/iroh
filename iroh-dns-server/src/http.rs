@@ -26,7 +26,10 @@ use iroh_dns::pkarr::SignedPacket;
 use n0_error::{Result, StdResultExt, anyerr, bail_any};
 use serde::{Deserialize, Serialize};
 use socket2::{SockRef, TcpKeepalive};
-use tokio::{net::TcpSocket, task::JoinSet};
+use tokio::{
+    net::{TcpListener, TcpSocket},
+    task::JoinSet,
+};
 use tower_http::{
     cors::{self, CorsLayer},
     timeout::TimeoutLayer,
@@ -41,6 +44,7 @@ mod pkarr;
 mod rate_limiting;
 #[cfg(test)]
 mod raw_h2;
+mod serve;
 mod tls;
 
 use self::idle::{Connections, IdleBound};
@@ -196,12 +200,16 @@ fn bounded_server<A>(
     listener: std::net::TcpListener,
     acceptor: A,
     connections: Arc<Connections>,
-) -> Result<axum_server::Server<SocketAddr, IdleBound<A>>> {
-    let mut server =
-        axum_server::from_tcp(listener)?.acceptor(IdleBound::new(acceptor, connections));
-    set_header_read_timeout(server.http_builder());
-    set_protocol_limits(server.http_builder());
-    Ok(server)
+) -> Result<serve::Server<IdleBound<A>>> {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    set_header_read_timeout(&mut builder);
+    set_protocol_limits(&mut builder);
+    let listener = TcpListener::from_std(listener).anyerr()?;
+    Ok(serve::Server::new(
+        listener,
+        IdleBound::new(acceptor, connections),
+        builder,
+    ))
 }
 
 /// The most connections the HTTP and HTTPS listeners hold at once, together: 8,192. A connection
@@ -1738,6 +1746,61 @@ mod tests {
         }
 
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The TLS handshake of a connection is done by the task of that connection, so a client
+    /// that stalls in its handshake delays no other: a second client completes its handshake and
+    /// is answered while the first still stands.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_a_stalled_handshake_does_not_delay_another_connection() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server =
+            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config()))
+                .await?;
+        let addr = server.https_addr().expect("https is bound");
+
+        let _stalled = TcpStream::connect(addr).await.anyerr()?;
+        let mut stream = tokio::time::timeout(CLOSE_DEADLINE, tls_client(addr))
+            .await
+            .std_context("the second handshake waited for the first")??;
+        let request = b"GET /healthcheck HTTP/1.1\r\nhost: localhost\r\n\r\n";
+        assert_eq!(exchange(&mut stream, request).await?, 200);
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Shutting the server down ends the connections that stand on its listeners, plain and TLS,
+    /// not only the listeners. The sockets are read for a short stretch of real time, which is
+    /// below the time an idle connection would stand.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_shutdown_ends_standing_connections() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server =
+            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config()))
+                .await?;
+        let request = b"GET /healthcheck HTTP/1.1\r\nhost: localhost\r\n\r\n";
+        let mut plain = TcpStream::connect(server.http_addr().expect("http is bound"))
+            .await
+            .anyerr()?;
+        assert_eq!(exchange(&mut plain, request).await?, 200);
+        let mut secure = tls_client(server.https_addr().expect("https is bound")).await?;
+        assert_eq!(exchange(&mut secure, request).await?, 200);
+
+        server.shutdown().await?;
+
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(CLOSE_DEADLINE, plain.read(&mut byte))
+            .await
+            .std_context("the plain connection stood after the shutdown")?;
+        assert!(!matches!(read, Ok(n) if n > 0), "{read:?}");
+        let read = tokio::time::timeout(CLOSE_DEADLINE, secure.read(&mut byte))
+            .await
+            .std_context("the TLS connection stood after the shutdown")?;
+        assert!(!matches!(read, Ok(n) if n > 0), "{read:?}");
         Ok(())
     }
 

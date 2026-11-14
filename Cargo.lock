@@ -2340,6 +2340,7 @@ dependencies = [
  "http",
  "humantime",
  "humantime-serde",
+ "hyper",
  "hyper-util",
  "iroh",
  "iroh-base",

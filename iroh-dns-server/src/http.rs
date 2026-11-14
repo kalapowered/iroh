@@ -505,6 +505,7 @@ async fn metrics_middleware(
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
         time::Duration,
     };
 
@@ -517,10 +518,16 @@ mod tests {
     use n0_error::StdResultExt;
     use n0_tracing_test::traced_test;
     use rand::{RngExt, SeedableRng};
+    use rustls::{
+        DigitallySignedStruct, SignatureScheme,
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
     };
+    use tokio_rustls::client::TlsStream;
 
     use crate::{
         http::{HttpsConfig, raw_h2},
@@ -664,63 +671,50 @@ mod tests {
         Ok(())
     }
 
-    /// The same on the TLS listener, which is the one the deployment serves: a client that
-    /// completes the TLS handshake and sends nothing is closed.
-    #[tokio::test]
-    #[traced_test]
-    async fn test_silent_tls_connection_closed() -> n0_error::Result {
-        use std::sync::Arc;
+    /// Accepts the server's self-signed certificate.
+    #[derive(Debug)]
+    struct AcceptAnyCertificate;
 
-        use rustls::{
-            DigitallySignedStruct, SignatureScheme,
-            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-            crypto::ring::default_provider,
-            pki_types::{CertificateDer, ServerName, UnixTime},
-        };
-
-        /// Accepts the server's self-signed certificate.
-        #[derive(Debug)]
-        struct AcceptAnyCertificate;
-
-        impl ServerCertVerifier for AcceptAnyCertificate {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &CertificateDer<'_>,
-                _intermediates: &[CertificateDer<'_>],
-                _server_name: &ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: UnixTime,
-            ) -> Result<ServerCertVerified, rustls::Error> {
-                Ok(ServerCertVerified::assertion())
-            }
-
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-
-            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-                default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
+    impl ServerCertVerifier for AcceptAnyCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
         }
 
-        let dir = tempfile::tempdir()?;
-        let https_config = HttpsConfig {
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// The configuration of an HTTPS listener on loopback with a self-signed certificate.
+    fn https_config() -> HttpsConfig {
+        HttpsConfig {
             port: 0,
             bind_addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             listen_backlog: None,
@@ -728,28 +722,41 @@ mod tests {
             cert_mode: crate::http::CertMode::SelfSigned,
             letsencrypt_contact: None,
             letsencrypt_prod: None,
-        };
-        let server =
-            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config))
-                .await?;
-        let addr = server.https_addr().expect("https is bound");
+        }
+    }
 
-        let client_config =
-            rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
-                .with_safe_default_protocol_versions()
-                .anyerr()?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
-                .with_no_client_auth();
+    /// A client of the HTTPS listener at `addr` that has finished the TLS handshake.
+    async fn tls_client(addr: SocketAddr) -> n0_error::Result<TlsStream<TcpStream>> {
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .anyerr()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+        .with_no_client_auth();
         let tcp = TcpStream::connect(addr).await.anyerr()?;
-        let mut stream = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(client_config))
             .connect(ServerName::try_from("localhost").anyerr()?, tcp)
             .await
             .anyerr()?;
-
         // The client is done once it has sent its last handshake message; give the server the
         // time to take it in, so that its own clock for the handshake has ended.
         tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok(stream)
+    }
+
+    /// The same on the TLS listener, which is the one the deployment serves: a client that
+    /// completes the TLS handshake and sends nothing is closed.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_silent_tls_connection_closed() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server =
+            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config()))
+                .await?;
+        let addr = server.https_addr().expect("https is bound");
+        let mut stream = tls_client(addr).await?;
 
         let mut buf = [0; 1];
         let open = |read: Result<std::io::Result<usize>, _>| read.is_err();
@@ -820,6 +827,54 @@ mod tests {
         Ok(())
     }
 
+    /// A request in progress on an HTTP/2 connection suspends the idle bound, which then runs from
+    /// the end of the request and not from the start of the connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_connection_with_a_request_open_is_held_until_it_ends() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+
+        // A publication whose body never arrives keeps its stream open until the request's
+        // deadline, which ends the request with an answer.
+        let key = SecretKey::from_bytes(&[7; 32]).public().to_z32();
+        let length = [("content-length", "1000".to_string())];
+        let stream = peer
+            .request("PUT", &format!("/pkarr/{key}"), &length, false)
+            .await?;
+        // The server has the request before the clock moves.
+        assert!(!peer.ended_within(Duration::from_millis(50)).await);
+        advance(Duration::from_secs(9)).await;
+        assert!(!peer.ended_within(Duration::from_millis(50)).await);
+        advance(Duration::from_secs(2)).await;
+        loop {
+            let frame = peer
+                .next_frame()
+                .await
+                .std_context("the request was not answered at its deadline")?;
+            if frame.kind == raw_h2::HEADERS && frame.stream == stream {
+                break;
+            }
+        }
+
+        // 35 seconds after the connection opened, which is past the bound counted from then, but
+        // 24 after the request ended.
+        advance(Duration::from_secs(24)).await;
+        assert!(
+            !peer.ended_within(Duration::from_millis(50)).await,
+            "closed before the bound ran from the end of the request"
+        );
+        advance(Duration::from_secs(8)).await;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "not closed at the bound"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A connection that the server answers with a request, for as long as the connection stands.
     async fn answers(stream: &mut TcpStream) -> n0_error::Result {
         stream
@@ -836,6 +891,20 @@ mod tests {
             assert!(n > 0, "connection closed before the answer");
             response.extend_from_slice(&chunk[..n]);
         }
+        Ok(())
+    }
+
+    /// A connection past the most the server holds is closed without an answer.
+    async fn assert_refused(stream: &mut TcpStream) -> n0_error::Result {
+        let mut buf = [0; 1];
+        let read = tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut buf))
+            .await
+            .std_context("a connection past the most was not closed")?;
+        assert!(
+            matches!(read, Ok(0))
+                || read.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+            "a connection past the most was answered"
+        );
         Ok(())
     }
 
@@ -864,15 +933,7 @@ mod tests {
             .num_alive_tasks();
         for _ in 0..20 {
             let mut refused = TcpStream::connect(addr).await.anyerr()?;
-            let mut buf = [0; 1];
-            let read = tokio::time::timeout(CLOSE_DEADLINE, refused.read(&mut buf))
-                .await
-                .std_context("a connection past the most was not closed")?;
-            assert!(
-                matches!(read, Ok(0))
-                    || read.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
-                "a connection past the most was answered"
-            );
+            assert_refused(&mut refused).await?;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
@@ -904,7 +965,46 @@ mod tests {
         Ok(())
     }
 
-    /// A request whose body stops arriving is answered at the request's deadline, and not held.
+    /// The most connections is one count for the HTTP and the HTTPS listener together: with the
+    /// most held between them, a new connection on either is closed at once.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_connection_cap_is_one_count_over_both_listeners() -> n0_error::Result {
+        const MOST: usize = 4;
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests_with_connection_cap(
+            dir.path(),
+            None,
+            None,
+            Some(https_config()),
+            MOST,
+        )
+        .await?;
+        let http = server.http_addr().expect("http is bound");
+        let https = server.https_addr().expect("https is bound");
+
+        let mut held = Vec::new();
+        let mut held_tls = Vec::new();
+        for _ in 0..MOST / 2 {
+            let mut stream = TcpStream::connect(http).await.anyerr()?;
+            answers(&mut stream).await?;
+            held.push(stream);
+            held_tls.push(tls_client(https).await?);
+        }
+
+        let mut refused = TcpStream::connect(http).await.anyerr()?;
+        assert_refused(&mut refused).await?;
+        assert!(
+            tls_client(https).await.is_err(),
+            "a TLS connection past the most was accepted"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A request whose body arrives slowly is answered at the request's deadline, counted from its
+    /// start, and not held: a byte every two seconds is no sign that the body is on its way.
     #[tokio::test]
     #[traced_test]
     async fn test_slow_request_body_gets_408() -> n0_error::Result {
@@ -914,11 +1014,17 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).await.anyerr()?;
         stream.write_all(&put_request(1000, 10)).await.anyerr()?;
+        // A byte every two seconds, until the next would come at the deadline.
+        let step = Duration::from_secs(2);
+        let mut elapsed = Duration::ZERO;
+        while elapsed + step < super::REQUEST_TIMEOUT {
+            assert_open(&mut stream).await;
+            advance(step).await;
+            stream.write_all(b"x").await.anyerr()?;
+            elapsed += step;
+        }
         assert_open(&mut stream).await;
-        advance(super::REQUEST_TIMEOUT - Duration::from_secs(1)).await;
-        assert_open(&mut stream).await;
-
-        advance(Duration::from_secs(2)).await;
+        advance(super::REQUEST_TIMEOUT + Duration::from_secs(1) - elapsed).await;
         let mut status_line = [0; 12];
         tokio::time::timeout(CLOSE_DEADLINE, stream.read_exact(&mut status_line))
             .await
@@ -956,7 +1062,8 @@ mod tests {
         };
         let largest = super::DOH_POST_BODY_LIMIT;
         assert_eq!(status_of(addr, &post(largest + 1)).await?, 413);
-        assert_ne!(status_of(addr, &post(largest)).await?, 413);
+        // A body of the largest size is read whole, and a message of zeros is an empty query.
+        assert_eq!(status_of(addr, &post(largest)).await?, 200);
 
         server.shutdown().await?;
         Ok(())

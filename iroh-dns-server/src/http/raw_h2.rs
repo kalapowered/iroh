@@ -129,6 +129,24 @@ impl Peer {
         }
     }
 
+    /// Reads the frames that the server sends until the connection ends, which gives `true`, or
+    /// until `wait` of real time passes with nothing more to read, which gives `false`.
+    pub(super) async fn ended_within(&mut self, wait: Duration) -> bool {
+        loop {
+            let mut head = [0; 9];
+            match tokio::time::timeout(wait, self.stream.read_exact(&mut head)).await {
+                Err(_elapsed) => return false,
+                Ok(Err(_)) => return true,
+                Ok(Ok(_)) => {
+                    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+                    if self.stream.read_exact(&mut vec![0; len]).await.is_err() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     /// Sends the headers of a request on a new stream and returns the stream's number. The header
     /// block is made of literal fields, `extra` among them; with `end_stream` the request has no
     /// body.

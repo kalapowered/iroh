@@ -28,7 +28,7 @@ use http::{HeaderValue, StatusCode, header, request::Parts};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::http::error::AppError;
+use crate::http::{DOH_GET_VALUE_LIMIT, error::AppError};
 
 /// A DNS packet encoding type
 #[derive(Debug)]
@@ -167,6 +167,11 @@ where
     S: Send + Sync,
 {
     let Query(params) = Query::<DnsMessageQuery>::from_request_parts(parts, state).await?;
+
+    // GET takes the messages that POST takes and no larger ones, with the status that POST gives.
+    if params.dns.trim_end_matches('=').len() > DOH_GET_VALUE_LIMIT {
+        return Err(AppError::with_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
 
     let buf = base64_url::decode(params.dns.as_bytes())
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, Some(err)))?;

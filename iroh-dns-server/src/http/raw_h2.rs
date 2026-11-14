@@ -25,9 +25,6 @@ const END_HEADERS: u8 = 0x4;
 pub(super) const FLOW_CONTROL_ERROR: u32 = 3;
 pub(super) const REFUSED_STREAM: u32 = 7;
 
-/// The static table's entry for `:status 200`, the first byte of a header block that answers `200`.
-pub(super) const STATUS_200: u8 = 0x88;
-
 #[derive(Debug)]
 pub(super) struct Frame {
     pub(super) kind: u8,
@@ -37,6 +34,29 @@ pub(super) struct Frame {
 }
 
 impl Frame {
+    /// The status that a `HEADERS` frame answers with. The server writes `:status` first, either as
+    /// an entry of HPACK's static table (200, 204, 206, 304, 400, 404 and 500 are entries 8 to 14)
+    /// or as a literal field whose name is entry 8 (RFC 7541, 6.1 and 6.2).
+    pub(super) fn status(&self) -> Option<u16> {
+        if self.kind != HEADERS {
+            return None;
+        }
+        let first = *self.payload.first()?;
+        if (0x88..=0x8e).contains(&first) {
+            return Some([200, 204, 206, 304, 400, 404, 500][usize::from(first - 0x88)]);
+        }
+        if ![0x48, 0x08, 0x18].contains(&first) {
+            return None;
+        }
+        let length = *self.payload.get(1)?;
+        let value = self.payload.get(2..2 + usize::from(length & 0x7f))?;
+        if length & 0x80 == 0 {
+            std::str::from_utf8(value).ok()?.parse().ok()
+        } else {
+            huffman_digits(value)?.parse().ok()
+        }
+    }
+
     /// The error code of an `RST_STREAM` frame.
     pub(super) fn reset_code(&self) -> Option<u32> {
         (self.kind == RST_STREAM)
@@ -160,15 +180,7 @@ impl Peer {
         let stream = self.next_stream;
         self.next_stream += 2;
         let mut block = Vec::new();
-        for (name, value) in [
-            (":method", method),
-            (":scheme", "http"),
-            (":path", path),
-            (":authority", "localhost"),
-        ] {
-            literal(&mut block, name, value);
-        }
-        for (name, value) in extra {
+        for (name, value) in fields(method, path, extra) {
             literal(&mut block, name, value);
         }
         let flags = END_HEADERS | if end_stream { END_STREAM } else { 0 };
@@ -176,11 +188,61 @@ impl Peer {
         Ok(stream)
     }
 
-    /// Sends a `DATA` frame of `len` bytes.
-    pub(super) async fn data(&mut self, stream: u32, len: usize, end_stream: bool) -> Result<()> {
+    /// Sends a `DATA` frame with `body`.
+    pub(super) async fn data(&mut self, stream: u32, body: &[u8], end_stream: bool) -> Result<()> {
         let flags = if end_stream { END_STREAM } else { 0 };
-        self.send(DATA, flags, stream, &vec![b'x'; len]).await
+        self.send(DATA, flags, stream, body).await
     }
+}
+
+/// The fields of a request that `Peer::request` sends: the four pseudo-header fields, then `extra`.
+fn fields<'a>(
+    method: &'a str,
+    path: &'a str,
+    extra: &'a [(&'a str, String)],
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    [
+        (":method", method),
+        (":scheme", "http"),
+        (":path", path),
+        (":authority", "localhost"),
+    ]
+    .into_iter()
+    .chain(extra.iter().map(|(name, value)| (*name, value.as_str())))
+}
+
+/// The size of a request's header list as HTTP/2 counts it (RFC 9113, 6.5.2): a name, a value and
+/// 32 bytes for each field.
+pub(super) fn header_list_size(method: &str, path: &str, extra: &[(&str, String)]) -> usize {
+    fields(method, path, extra)
+        .map(|(name, value)| name.len() + value.len() + 32)
+        .sum()
+}
+
+/// The decimal digits that HPACK's Huffman code (RFC 7541, appendix B) gives a string of digits:
+/// 5 bits for 0 to 2, 6 bits for 3 to 9, and ones as padding after the last one.
+fn huffman_digits(bytes: &[u8]) -> Option<String> {
+    let bits: Vec<u8> = bytes
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1))
+        .collect();
+    let read = |at: usize, len: usize| {
+        let window = bits.get(at..at + len)?;
+        Some(window.iter().fold(0u8, |value, bit| value << 1 | bit))
+    };
+    let (mut digits, mut at) = (String::new(), 0);
+    while let Some(code) = read(at, 5) {
+        if code <= 2 {
+            digits.push(char::from(b'0' + code));
+            at += 5;
+        } else if let Some(code @ 0x19..=0x1f) = read(at, 6) {
+            digits.push(char::from(b'3' + code - 0x19));
+            at += 6;
+        } else {
+            break;
+        }
+    }
+    (!digits.is_empty()).then_some(digits)
 }
 
 /// A header field that is neither indexed nor compressed, with a new name (RFC 7541, 6.2.2).

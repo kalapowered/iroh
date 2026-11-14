@@ -101,11 +101,27 @@ fn set_header_read_timeout(builder: &mut auto::Builder<TokioExecutor>) {
         .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
 }
 
-/// The most an HTTP/1 connection buffers while it reads the head of a request: 8,192 bytes, the
-/// lowest value hyper accepts (its default is 417,792). The longest honest head is a DNS-over-HTTPS
-/// request for the longest DNS name, about 500 bytes. A head that does not fit is answered `431`
-/// and the connection is closed.
-const HTTP1_MAX_BUFFER_SIZE: usize = 8_192;
+/// The most that the head of a request may be: 8,192 bytes, counted in the unit of each protocol
+/// below. The largest head of an honest request is a DNS query of the largest size by GET, which
+/// is `/dns-query?dns=` and 5,462 characters of base64url, 5,477 bytes of path. The other fields
+/// take what is left:
+///
+/// - HTTP/1: the request line is 4 + 5,477 + 11 = 5,492 bytes and the final empty line 2, which
+///   leaves 2,698 bytes for the `host` field and all others; with a name of 253 characters in
+///   `host` (261 bytes), 2,437 bytes.
+/// - HTTP/2: the largest accepted list is 8,191 (the setting is refused), and the fields `:method`
+///   (42 bytes), `:scheme` (44, for `https`) and `:path` (5 + 5,477 + 32 = 5,514) take 5,600; that
+///   leaves 2,591 bytes for `:authority` and all other fields; with a name of 253 characters in
+///   `:authority` (295 bytes), 2,296 bytes.
+///
+/// A head past the figure, such as a large cookie beside a query of the largest size, is answered
+/// `431`.
+const REQUEST_HEAD_LIMIT: usize = 8_192;
+
+/// The most an HTTP/1 connection buffers while it reads the head of a request, which is the head
+/// allowance above. It is the lowest value hyper accepts (its default is 417,792). A head that
+/// does not fit is answered `431` and the connection is closed.
+const HTTP1_MAX_BUFFER_SIZE: usize = REQUEST_HEAD_LIMIT;
 
 /// The most streams an HTTP/2 connection has open at once: 2 (hyper's default is 200; it has no
 /// lowest value, and RFC 9113 advises 100 or more only for clients that want parallelism, which
@@ -115,11 +131,12 @@ const HTTP1_MAX_BUFFER_SIZE: usize = 8_192;
 /// `REFUSED_STREAM`, which the client may retry.
 const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 2;
 
-/// The largest header list an HTTP/2 request may have: 4,096 bytes as HTTP/2 counts them (a name,
-/// a value and 32 bytes for each header), against hyper's 16,384; hyper has no lowest value. An
-/// honest request has under 1,000. The server applies it as soon as the connection opens, whether
-/// or not the client acknowledges the server's settings.
-const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 4_096;
+/// The header list of an HTTP/2 request is held to the head allowance above, as HTTP/2 counts it
+/// (a name, a value and 32 bytes for each field), against hyper's 16,384; hyper has no lowest
+/// value. A list as large as the setting is refused, so the largest accepted is one byte under it,
+/// and a request with a larger list is answered `431`. The server applies it as soon as the
+/// connection opens, whether or not the client acknowledges the server's settings.
+const HTTP2_MAX_HEADER_LIST_SIZE: u32 = REQUEST_HEAD_LIMIT as u32;
 
 /// The window of an HTTP/2 stream for the request body the server has not yet read: 4,096 bytes,
 /// the largest body any route takes (hyper's default is 1 MiB; it has no lowest value). A body is
@@ -179,8 +196,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest body of `PUT /pkarr/{key}`: a signed packet without the public key the path names.
 const PKARR_PUT_BODY_LIMIT: usize = SignedPacket::MAX_BYTES - PublicKey::LENGTH;
 
-/// The largest body of `POST /dns-query`: the most the server's own UDP path reads of a request.
-const DOH_POST_BODY_LIMIT: usize = hickory_server::net::udp::MAX_RECEIVE_BUFFER_SIZE;
+/// The largest DNS message of a request to `/dns-query`: the most the server's own UDP path reads
+/// of a request. `POST` takes it as the body and `GET` as the `dns=` value, and both refuse a
+/// larger one with `413`.
+const DOH_MESSAGE_LIMIT: usize = hickory_server::net::udp::MAX_RECEIVE_BUFFER_SIZE;
+
+/// The longest `dns=` value of `GET /dns-query`: a message of the largest size as base64url
+/// without padding, 5,462 characters.
+const DOH_GET_VALUE_LIMIT: usize = (DOH_MESSAGE_LIMIT * 4).div_ceil(3);
 
 /// Configuration for the HTTP listener.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -440,7 +463,7 @@ fn create_app_with_quotas(
     }
     // The bodies are read whole, so each route that takes one says how large it may be. The
     // default of axum is 2 MiB, which a sender could make the server hold for every connection.
-    let dns_query = dns_query.layer(DefaultBodyLimit::max(DOH_POST_BODY_LIMIT));
+    let dns_query = dns_query.layer(DefaultBodyLimit::max(DOH_MESSAGE_LIMIT));
     let pkarr_put = pkarr_put.layer(DefaultBodyLimit::max(PKARR_PUT_BODY_LIMIT));
     let router = Router::new()
         .route("/dns-query", dns_query)
@@ -656,6 +679,85 @@ mod tests {
         .into_bytes();
         request.extend(std::iter::repeat_n(b'x', sent));
         request
+    }
+
+    /// A valid DNS query for `x.example.` of exactly `len` bytes: the EDNS padding option (RFC 7830)
+    /// fills the message up to `len`.
+    fn dns_query(len: usize) -> Vec<u8> {
+        let mut message = vec![
+            0, 1, // the id
+            1, 0, // the flags: recursion desired
+            0, 1, 0, 0, 0, 0, 0, 1, // one question and one additional record
+            1, b'x', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, // the name
+            0, 16, 0, 1, // TXT, IN
+            0, 0, 41, 4, 208, 0, 0, 0,
+            0, // the OPT record: the root name, OPT, a payload size, no flags
+        ];
+        let padding = len - message.len() - 6;
+        message.extend((4 + padding as u16).to_be_bytes());
+        message.extend([0, 12]);
+        message.extend((padding as u16).to_be_bytes());
+        message.extend(std::iter::repeat_n(0, padding));
+        assert_eq!(message.len(), len);
+        message
+    }
+
+    /// The path of `GET /dns-query` for `message`: base64url without padding, as RFC 8484 writes it.
+    fn dns_get_path(message: &[u8]) -> String {
+        format!(
+            "/dns-query?dns={}",
+            data_encoding::BASE64URL_NOPAD.encode(message)
+        )
+    }
+
+    /// The HTTP/1 request `GET /dns-query` for `message`, with a `cookie` field that makes the head
+    /// `head_len` bytes long, if one is given.
+    fn dns_get_request(message: &[u8], head_len: Option<usize>) -> Vec<u8> {
+        let head = format!(
+            "GET {} HTTP/1.1\r\nhost: localhost\r\naccept: application/dns-message\r\n",
+            dns_get_path(message)
+        );
+        let Some(head_len) = head_len else {
+            return format!("{head}\r\n").into_bytes();
+        };
+        let (name, end) = ("cookie: ", "\r\n\r\n");
+        let fill = "a".repeat(head_len - head.len() - name.len() - end.len());
+        format!("{head}{name}{fill}{end}").into_bytes()
+    }
+
+    /// The status of the answer to a request over HTTP/2 on a connection of its own.
+    async fn status_over_h2(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        extra: &[(&str, String)],
+    ) -> n0_error::Result<u16> {
+        let mut peer = raw_h2::Peer::connect(addr).await?;
+        let stream = peer.request(method, path, extra, true).await?;
+        loop {
+            let frame = peer.next_frame().await.std_context("no answer")?;
+            if frame.stream == stream {
+                if let Some(status) = frame.status() {
+                    return Ok(status);
+                }
+                assert_eq!(frame.reset_code(), None, "the request was reset");
+            }
+        }
+    }
+
+    /// The fields of `GET /dns-query` for `message` over HTTP/2: `accept` and, if `list_size` is
+    /// given, a `cookie` that makes the header list that long.
+    fn dns_get_over_h2(
+        message: &[u8],
+        list_size: Option<usize>,
+    ) -> (String, Vec<(&'static str, String)>) {
+        let path = dns_get_path(message);
+        let mut extra = vec![("accept", "application/dns-message".to_string())];
+        if let Some(list_size) = list_size {
+            let used = raw_h2::header_list_size("GET", &path, &extra) + "cookie".len() + 32;
+            extra.push(("cookie", "a".repeat(list_size - used)));
+        }
+        (path, extra)
     }
 
     /// A connection that completes its handshake, or on the plain listener just connects, and then
@@ -1064,7 +1166,7 @@ mod tests {
             request.extend(std::iter::repeat_n(0, len));
             request
         };
-        let largest = super::DOH_POST_BODY_LIMIT;
+        let largest = super::DOH_MESSAGE_LIMIT;
         assert_eq!(status_of(addr, &post(largest + 1)).await?, 413);
         // A body of the largest size is read whole, and a message of zeros is an empty query.
         assert_eq!(status_of(addr, &post(largest)).await?, 200);
@@ -1073,8 +1175,8 @@ mod tests {
         Ok(())
     }
 
-    /// A request whose head does not fit the buffer that hyper reads it into is answered `431`;
-    /// the requests of this server's clients are far under it.
+    /// A request whose head does not fit the buffer that hyper reads it into is answered `431`. The
+    /// allowance holds the largest DNS query by GET with other fields beside it.
     #[tokio::test]
     #[traced_test]
     async fn test_http1_head_limit() -> n0_error::Result {
@@ -1091,8 +1193,20 @@ mod tests {
         };
         let most = super::HTTP1_MAX_BUFFER_SIZE;
         assert_eq!(status_of(addr, &head(1_000)).await?, 200);
-        assert_eq!(status_of(addr, &head(most - 1)).await?, 200);
+        assert_eq!(status_of(addr, &head(most)).await?, 200);
         assert_eq!(status_of(addr, &head(most + 1)).await?, 431);
+
+        // The largest query takes most of the head, and a cookie fills the rest.
+        let query = dns_query(super::DOH_MESSAGE_LIMIT);
+        assert_eq!(status_of(addr, &dns_get_request(&query, None)).await?, 200);
+        assert_eq!(
+            status_of(addr, &dns_get_request(&query, Some(most))).await?,
+            200
+        );
+        assert_eq!(
+            status_of(addr, &dns_get_request(&query, Some(most + 1))).await?,
+            431
+        );
 
         server.shutdown().await?;
         Ok(())
@@ -1126,7 +1240,7 @@ mod tests {
             }
         }
 
-        peer.data(open[0], 100, true).await?;
+        peer.data(open[0], &[b'x'; 100], true).await?;
         loop {
             let frame = peer
                 .next_frame()
@@ -1146,42 +1260,67 @@ mod tests {
         Ok(())
     }
 
-    /// A request whose header list is past the most the server allows is not answered with `200`,
-    /// and one under it is.
+    /// A request whose header list is as large as the setting is answered `431`, and one a byte
+    /// under it is answered. The allowance holds the largest DNS query by GET with other fields
+    /// beside it.
     #[tokio::test]
     #[traced_test]
     async fn test_http2_header_list_limit() -> n0_error::Result {
         let dir = tempfile::tempdir()?;
         let server = Server::spawn_for_tests(dir.path()).await?;
-        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+        let addr = server.http_addr().expect("http is bound");
 
         let most = super::HTTP2_MAX_HEADER_LIST_SIZE as usize;
-        let fill = |len: usize| [("x-fill", "a".repeat(len))];
-        let under = peer
-            .request("GET", "/healthcheck", &fill(most / 2), true)
-            .await?;
-        let over = peer
-            .request("GET", "/healthcheck", &fill(most + 1), true)
-            .await?;
+        // A list of `size`: a request for the health check and a field that fills it.
+        let fill = |size: usize| {
+            let used = raw_h2::header_list_size("GET", "/healthcheck", &[]) + "x-fill".len() + 32;
+            [("x-fill", "a".repeat(size - used))]
+        };
+        let status = |size: usize| {
+            let extra = fill(size);
+            async move { status_over_h2(addr, "GET", "/healthcheck", &extra).await }
+        };
+        assert_eq!(status(most / 2).await?, 200);
+        assert_eq!(status(most - 1).await?, 200);
+        assert_eq!(status(most).await?, 431);
 
-        let mut answers = std::collections::HashMap::new();
-        while answers.len() < 2 {
-            let frame = peer
-                .next_frame()
-                .await
-                .std_context("a request was not answered")?;
-            if frame.kind == raw_h2::HEADERS {
-                answers.insert(
-                    frame.stream,
-                    frame.payload.first() == Some(&raw_h2::STATUS_200),
-                );
-            }
+        let query = dns_query(super::DOH_MESSAGE_LIMIT);
+        let status = |list_size: Option<usize>| {
+            let (path, extra) = dns_get_over_h2(&query, list_size);
+            async move { status_over_h2(addr, "GET", &path, &extra).await }
+        };
+        assert_eq!(status(None).await?, 200);
+        assert_eq!(status(Some(most - 1)).await?, 200);
+        assert_eq!(status(Some(most)).await?, 431);
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A DNS query by GET is taken up to the size of the largest message that POST takes, over HTTP/1
+    /// and over HTTP/2, and refused with the status that POST gives past it.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_doh_get_takes_what_post_takes() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        let largest = super::DOH_MESSAGE_LIMIT;
+        for (len, status) in [(largest, 200), (largest + 1, 413)] {
+            let query = dns_query(len);
+            assert_eq!(
+                status_of(addr, &dns_get_request(&query, None)).await?,
+                status,
+                "a query of {len} bytes by GET over HTTP/1"
+            );
+            let (path, extra) = dns_get_over_h2(&query, None);
+            assert_eq!(
+                status_over_h2(addr, "GET", &path, &extra).await?,
+                status,
+                "a query of {len} bytes by GET over HTTP/2"
+            );
         }
-        assert!(answers[&under], "a header list under the limit was refused");
-        assert!(
-            !answers[&over],
-            "a header list past the limit was answered with 200"
-        );
 
         server.shutdown().await?;
         Ok(())
@@ -1221,11 +1360,11 @@ mod tests {
         let fits = peer
             .request("POST", "/dns-query", &length(window), false)
             .await?;
-        peer.data(fits, window, true).await?;
+        peer.data(fits, &vec![b'x'; window], true).await?;
         let past = peer
             .request("POST", "/dns-query", &length(window + 1), false)
             .await?;
-        peer.data(past, window + 1, false).await?;
+        peer.data(past, &vec![b'x'; window + 1], false).await?;
 
         let (mut answered, mut reset) = (false, false);
         while !(answered && reset) {

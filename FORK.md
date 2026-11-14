@@ -131,7 +131,9 @@ All three keep the 15 per cent that the proof asks for (1,741 MiB). The figure i
 
 The table that the server keeps for the headers of its answers is capped at 4 KiB by the locked version of its HTTP/2 library, and the case `test_http2_answers_keep_the_header_table_at_4_kib` holds that.
 
-Not bounded by these figures: the connections of port 53 over TCP, which the cap does not count and which have no limit of their own beside the descriptors, and the kernel's buffers on that port; and the settings of the host's kernel, whose limits on TCP memory and on buffer sizes were larger on the build box than a host of 3.9 GB has.
+The server does not count connections of port 53 over TCP. The DNS library ends one that sends nothing after 1 second. A deployment bounds their number at its firewall; ours allows 1,024 at once, beside its limits for one address and one network.
+
+Not bounded by these figures: the settings of the host's kernel, whose limits on TCP memory and on buffer sizes were larger on the build box than a host of 3.9 GB has.
 
 A deployment builds with `KR_FORK_REV` set to the commit it pins, and compares `/healthz` with
 it.

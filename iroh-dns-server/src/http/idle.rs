@@ -188,6 +188,8 @@ where
                     timer: Box::pin(tokio::time::sleep_until(Instant::now() + IDLE_TIMEOUT)),
                     armed: None,
                     _slot: slot,
+                    #[cfg(test)]
+                    after_read: None,
                 },
                 Tracked {
                     inner: service,
@@ -241,33 +243,52 @@ pub(super) struct IdleStream<T> {
     armed: Option<Instant>,
     /// The connection's place among the connections the server holds.
     _slot: Slot,
+    /// Runs once, in the first `check`, after the state is read and before the timer is polled, so
+    /// that a case can place a change of the state between the two.
+    #[cfg(test)]
+    after_read: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<T> IdleStream<T> {
     /// Fails with a time-out once the connection has had no request in progress for
     /// [`IDLE_TIMEOUT`]. Otherwise arranges for the task to be polled again at that time, or when
     /// the request in progress ends.
+    ///
+    /// The state is not held while the timer is polled, so a request can start or end between the
+    /// read and the poll. When the timer reports that the deadline has passed, the state is read
+    /// again under the lock, and the connection ends only if it still has no request in progress
+    /// and the deadline it read is still its deadline.
     fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
-        let deadline = {
-            let mut state = self.shared.state();
-            if state.in_flight > 0 {
-                // The waker is in place before the request can end, since the end takes the lock.
-                state.waker = Some(cx.waker().clone());
-                self.armed = None;
+        loop {
+            let deadline = {
+                let mut state = self.shared.state();
+                if state.in_flight > 0 {
+                    // The waker is in place before the request can end, since the end takes the
+                    // lock.
+                    state.waker = Some(cx.waker().clone());
+                    self.armed = None;
+                    return Ok(());
+                }
+                state.idle_since + IDLE_TIMEOUT
+            };
+            #[cfg(test)]
+            if let Some(after_read) = self.after_read.take() {
+                after_read();
+            }
+            if self.armed != Some(deadline) {
+                self.timer.as_mut().reset(deadline);
+                self.armed = Some(deadline);
+            }
+            if self.timer.as_mut().poll(cx).is_pending() {
                 return Ok(());
             }
-            state.idle_since + IDLE_TIMEOUT
-        };
-        if self.armed != Some(deadline) {
-            self.timer.as_mut().reset(deadline);
-            self.armed = Some(deadline);
-        }
-        match self.timer.as_mut().poll(cx) {
-            Poll::Ready(()) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "connection idle with no request in progress",
-            )),
-            Poll::Pending => Ok(()),
+            let state = self.shared.state();
+            if state.in_flight == 0 && state.idle_since + IDLE_TIMEOUT == deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connection idle with no request in progress",
+                ));
+            }
         }
     }
 }
@@ -515,6 +536,53 @@ mod tests {
                 .expect("the polls end")
                 .expect("a poll met the idle time from before the request");
         }
+    }
+
+    /// A request that starts after the connection's state is read and before its timer is polled
+    /// is a request in progress, even when the timer reports that the deadline has passed: the
+    /// connection is not closed inside the request's own deadline, and its idle time then runs from
+    /// the end of the request. The request may also end between the read and the poll, which gives
+    /// the connection a new idle time as well.
+    async fn a_request_starts_as_the_deadline_passes(ends_before_the_poll: bool) {
+        type Answer = <Tracked<Gated> as Service<()>>::Future;
+
+        let (_client, mut stream, service, _gate) = accepted().await;
+        let request: Arc<Mutex<Option<Answer>>> = Arc::default();
+        stream.after_read = Some(Box::new({
+            let (mut service, request) = (service, request.clone());
+            move || {
+                let answer = service.call(());
+                if !ends_before_the_poll {
+                    *request.lock().unwrap() = Some(answer);
+                }
+            }
+        }));
+
+        advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        let mut cx = Context::from_waker(Waker::noop());
+        stream
+            .check(&mut cx)
+            .expect("a connection with a request was met with the idle time-out");
+
+        // The request ends 31 seconds after the connection opened, and the bound runs from there.
+        drop(request.lock().unwrap().take());
+        advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        stream
+            .check(&mut cx)
+            .expect("closed before the bound ran from the end of the request");
+        advance(Duration::from_secs(2)).await;
+        let error = stream.check(&mut cx).expect_err("not closed at the bound");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_starts_as_the_deadline_passes_keeps_the_connection() {
+        a_request_starts_as_the_deadline_passes(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_starts_and_ends_as_the_deadline_passes_gives_a_new_idle_time() {
+        a_request_starts_as_the_deadline_passes(true).await;
     }
 
     #[tokio::test(start_paused = true)]

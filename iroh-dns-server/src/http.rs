@@ -160,13 +160,17 @@ fn bounded_server<A>(
     Ok(server)
 }
 
-/// The most connections the HTTP and HTTPS listeners hold at once, together; the next is closed at
-/// once. A held connection costs the server about 26 KB, so this is about 0.4 GiB of the memory
-/// the service may use, which leaves the rest for the zone cache and for the DNS server that runs
-/// in the same process.
+/// The most connections the HTTP and HTTPS listeners hold at once, together; it bounds what held
+/// connections can take. A connection past it is closed at once, before its handshake, and its
+/// request is not queued; the connections already held stay usable. On the build box, 16,384 held
+/// connections measured 0.34 GiB above an empty server when each sent only a request every 20
+/// seconds, 0.48 GiB when each held an unfinished HTTP/1 head, and 0.83 GiB when each held two
+/// HTTP/2 streams open with a full header list and body.
 pub(crate) const MAX_CONNECTIONS: usize = 16_384;
 
-/// How long a request may take from its headers to its answer, its body included.
+/// How long a request may take from its headers until the server has made its answer, its body
+/// included. Delivering the answer is not part of it: a connection that does not take its answer
+/// is closed by the idle bound.
 ///
 /// A signed packet and a lookup are a kilobyte or two, so a request that takes longer is a
 /// sender that is holding the connection.

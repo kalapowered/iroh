@@ -79,16 +79,18 @@ impl Drop for Slot {
     }
 }
 
-/// What a connection's stream and its service both see.
+/// What a connection's stream and its service both see. The count of requests in progress and the
+/// time the connection last had none change together, under one lock, so that a reader never sees
+/// the count at zero with the time from before the request.
 #[derive(Debug)]
 struct Shared {
-    /// The requests that have been handed to the service and have not been answered.
-    in_flight: AtomicUsize,
     state: Mutex<State>,
 }
 
 #[derive(Debug)]
 struct State {
+    /// The requests that have been handed to the service and have not been answered.
+    in_flight: usize,
     /// When the connection last had no request in progress.
     idle_since: Instant,
     /// The task that waits for the connection's last request to end.
@@ -98,8 +100,8 @@ struct State {
 impl Shared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            in_flight: AtomicUsize::new(0),
             state: Mutex::new(State {
+                in_flight: 0,
                 idle_since: Instant::now(),
                 waker: None,
             }),
@@ -116,15 +118,16 @@ struct InFlight(Arc<Shared>);
 
 impl InFlight {
     fn begin(shared: &Arc<Shared>) -> Self {
-        shared.in_flight.fetch_add(1, Ordering::SeqCst);
+        shared.state().in_flight += 1;
         Self(shared.clone())
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
-            let mut state = self.0.state();
+        let mut state = self.0.state();
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
             state.idle_since = Instant::now();
             // The stream is not polled while it waits for a request to end, so wake it to start
             // its clock.
@@ -245,15 +248,16 @@ impl<T> IdleStream<T> {
     /// [`IDLE_TIMEOUT`]. Otherwise arranges for the task to be polled again at that time, or when
     /// the request in progress ends.
     fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
-        if self.shared.in_flight.load(Ordering::SeqCst) > 0 {
-            self.shared.state().waker = Some(cx.waker().clone());
-            // The request may have ended before the waker was in place.
-            if self.shared.in_flight.load(Ordering::SeqCst) > 0 {
+        let deadline = {
+            let mut state = self.shared.state();
+            if state.in_flight > 0 {
+                // The waker is in place before the request can end, since the end takes the lock.
+                state.waker = Some(cx.waker().clone());
                 self.armed = None;
                 return Ok(());
             }
-        }
-        let deadline = self.shared.state().idle_since + IDLE_TIMEOUT;
+            state.idle_since + IDLE_TIMEOUT
+        };
         if self.armed != Some(deadline) {
             self.timer.as_mut().reset(deadline);
             self.armed = Some(deadline);
@@ -464,6 +468,55 @@ mod tests {
             read_ends(&mut stream).await.is_some(),
             "not closed after a dropped request"
         );
+    }
+
+    /// A request that starts near the bound and ends inside its own deadline gives the connection
+    /// a whole new idle period, even when a poll of the stream falls between the two changes that
+    /// the end of a request makes: the count of requests going to zero and the clock restarting.
+    /// The request's old idle time has long run out, so a poll that sees the count at zero and the
+    /// old time ends the connection. The connection is polled from another thread, as the
+    /// connection's task is, while the request ends.
+    #[tokio::test]
+    async fn a_request_that_ends_is_never_met_with_the_idle_time_from_before_it() {
+        use std::{
+            sync::{Barrier, atomic::AtomicBool},
+            thread,
+        };
+
+        for _ in 0..5_000 {
+            let (_client, mut stream, _service, _gate) = accepted().await;
+            let request = InFlight::begin(&stream.shared);
+            stream.shared.state().idle_since = Instant::now() - IDLE_TIMEOUT * 2;
+
+            let start = Arc::new(Barrier::new(2));
+            let ended = Arc::new(AtomicBool::new(false));
+            let ends = {
+                let (start, ended) = (start.clone(), ended.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    drop(request);
+                    ended.store(true, Ordering::SeqCst);
+                })
+            };
+            let polls = thread::spawn(move || {
+                let mut cx = Context::from_waker(Waker::noop());
+                start.wait();
+                loop {
+                    let done = ended.load(Ordering::SeqCst);
+                    if let Err(error) = stream.check(&mut cx) {
+                        return Err(error);
+                    }
+                    if done {
+                        return Ok(());
+                    }
+                }
+            });
+            ends.join().expect("the request ends");
+            polls
+                .join()
+                .expect("the polls end")
+                .expect("a poll met the idle time from before the request");
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -102,14 +102,15 @@ fn set_header_read_timeout(builder: &mut auto::Builder<TokioExecutor>) {
 }
 
 /// The most that the head of a request may be: 8,192 bytes, counted in the unit of each protocol
-/// below. The largest head of an honest request is a DNS query of the largest size by GET, which
-/// is `/dns-query?dns=` and 5,462 characters of base64url, 5,477 bytes of path. The other fields
-/// take what is left:
+/// below. The largest head that the server's routes call for is a DNS query of the largest size by
+/// GET, which is `/dns-query?dns=` and 5,462 characters of base64url, 5,477 bytes of path. The
+/// other fields take what is left, and a client that adds a large cookie to such a query can pass
+/// the figure (see the end):
 ///
 /// - HTTP/1: the request line is 4 + 5,477 + 11 = 5,492 bytes and the final empty line 2, which
 ///   leaves 2,698 bytes for the `host` field and all others; with a name of 253 characters in
 ///   `host` (261 bytes), 2,437 bytes.
-/// - HTTP/2: the largest accepted list is 8,191 (the setting is refused), and the fields `:method`
+/// - HTTP/2: the largest accepted list is 8,191 (a list as large as the setting is refused), and the fields `:method`
 ///   (42 bytes), `:scheme` (44, for `https`) and `:path` (5 + 5,477 + 32 = 5,514) take 5,600; that
 ///   leaves 2,591 bytes for `:authority` and all other fields; with a name of 253 characters in
 ///   `:authority` (295 bytes), 2,296 bytes.
@@ -124,11 +125,12 @@ const REQUEST_HEAD_LIMIT: usize = 8_192;
 const HTTP1_MAX_BUFFER_SIZE: usize = REQUEST_HEAD_LIMIT;
 
 /// The most streams an HTTP/2 connection has open at once: 2 (hyper's default is 200; it has no
-/// lowest value). An open request with a full header list and a body of 4 kB measured about
-/// 15 kB above an empty server on the build box (see `MAX_CONNECTIONS`), so the figure sets how
-/// much an open connection holds for requests that are not complete. The server announces it in
-/// its settings: a client that has read them waits for a stream to end before it opens another,
-/// and one that opens a third stream before they arrive has that stream refused with
+/// lowest value). An open request with a full header list and a body of 4 kB measured about 15 kB
+/// more than the same connection without it on the build box: the peak less the memory of the
+/// connections before their streams opened (see `MAX_CONNECTIONS`). So the figure sets how much an
+/// open connection holds for requests that are not complete. The server announces it in its
+/// settings: a client that has read them waits for a stream to end before it opens another, and
+/// one that opens a third stream before they arrive has that stream refused with
 /// `REFUSED_STREAM`, which it may retry.
 const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 2;
 

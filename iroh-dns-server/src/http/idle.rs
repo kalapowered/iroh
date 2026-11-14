@@ -254,9 +254,11 @@ impl<T> IdleStream<T> {
     /// [`IDLE_TIMEOUT`]. Otherwise arranges for the task to be polled again at that time, or when
     /// the request in progress ends.
     ///
-    /// The state is not held while the timer is polled, so a request can start or end between the
-    /// read and the poll. When the timer reports that the deadline has passed, the state is read
-    /// again under the lock, and the connection ends only if it still has no request in progress
+    /// The state is not held while the timer is polled. hyper starts a request from the
+    /// connection's own task, the task that runs this check, and a request can end only after one
+    /// has started, so in a real run nothing changes the state between the read and the poll. When
+    /// the timer reports that the deadline has passed, the state is read again under the lock all
+    /// the same, as a safeguard: the connection ends only if it still has no request in progress
     /// and the deadline it read is still its deadline.
     fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         loop {

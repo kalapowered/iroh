@@ -9,7 +9,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -19,6 +19,8 @@ use hyper_util::{
     rt::{TokioExecutor, TokioTimer},
     server::conn::auto,
 };
+use iroh_base::PublicKey;
+use iroh_dns::pkarr::SignedPacket;
 use n0_error::{Result, StdResultExt, anyerr, bail_any};
 use serde::{Deserialize, Serialize};
 use socket2::{SockRef, TcpKeepalive};
@@ -91,6 +93,12 @@ fn set_header_read_timeout(builder: &mut auto::Builder<TokioExecutor>) {
         .timer(TokioTimer::new())
         .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
 }
+
+/// The largest body of `PUT /pkarr/{key}`: a signed packet without the public key the path names.
+const PKARR_PUT_BODY_LIMIT: usize = SignedPacket::MAX_BYTES - PublicKey::LENGTH;
+
+/// The largest body of `POST /dns-query`: the most the server's own UDP path reads of a request.
+const DOH_POST_BODY_LIMIT: usize = hickory_server::net::udp::MAX_RECEIVE_BUFFER_SIZE;
 
 /// Configuration for the HTTP listener.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -348,6 +356,10 @@ fn create_app_with_quotas(
     if let Some(limit) = put_limit {
         pkarr_put = pkarr_put.route_layer(limit);
     }
+    // The bodies are read whole, so each route that takes one says how large it may be. The
+    // default of axum is 2 MiB, which a sender could make the server hold for every connection.
+    let dns_query = dns_query.layer(DefaultBodyLimit::max(DOH_POST_BODY_LIMIT));
+    let pkarr_put = pkarr_put.layer(DefaultBodyLimit::max(PKARR_PUT_BODY_LIMIT));
     let router = Router::new()
         .route("/dns-query", dns_query)
         .route("/pkarr/{key}", pkarr_get.merge(pkarr_put))
@@ -410,7 +422,7 @@ async fn metrics_middleware(
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         time::Duration,
     };
 
@@ -519,6 +531,64 @@ mod tests {
         }
         assert!(response.starts_with(b"HTTP/1.1 200 OK"));
         assert_closed_after(&mut stream, super::HTTP1_HEADER_READ_TIMEOUT).await?;
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The status of the answer to `request`, sent whole on a new connection.
+    async fn status_of(addr: SocketAddr, request: &[u8]) -> n0_error::Result<u16> {
+        let mut stream = TcpStream::connect(addr).await.anyerr()?;
+        stream.write_all(request).await.anyerr()?;
+        let mut status_line = [0; 12];
+        tokio::time::timeout(CLOSE_DEADLINE, stream.read_exact(&mut status_line))
+            .await
+            .std_context("no answer from server")?
+            .anyerr()?;
+        std::str::from_utf8(&status_line[9..12])
+            .anyerr()?
+            .parse()
+            .anyerr()
+    }
+
+    /// A `PUT /pkarr/{key}` request with a body of `body_len` bytes, of which `sent` are sent.
+    fn put_request(body_len: usize, sent: usize) -> Vec<u8> {
+        let key = SecretKey::from_bytes(&[7; 32]).public().to_z32();
+        let mut request = format!(
+            "PUT /pkarr/{key} HTTP/1.1\r\nhost: localhost\r\ncontent-length: {body_len}\r\n\r\n"
+        )
+        .into_bytes();
+        request.extend(std::iter::repeat_n(b'x', sent));
+        request
+    }
+
+    /// A body is read whole, so a request may not hold more than the largest thing the route takes.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_body_limits() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        let largest = super::PKARR_PUT_BODY_LIMIT;
+        // Past the limit is refused as too large; at the limit the body is read and then judged.
+        assert_eq!(
+            status_of(addr, &put_request(largest + 1, largest + 1)).await?,
+            413
+        );
+        assert_eq!(status_of(addr, &put_request(largest, largest)).await?, 400);
+
+        let post = |len: usize| {
+            let mut request = format!(
+                "POST /dns-query HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/dns-message\r\ncontent-length: {len}\r\n\r\n"
+            )
+            .into_bytes();
+            request.extend(std::iter::repeat_n(0, len));
+            request
+        };
+        let largest = super::DOH_POST_BODY_LIMIT;
+        assert_eq!(status_of(addr, &post(largest + 1)).await?, 413);
+        assert_ne!(status_of(addr, &post(largest)).await?, 413);
 
         server.shutdown().await?;
         Ok(())

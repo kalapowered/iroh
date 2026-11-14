@@ -149,7 +149,7 @@ where
 
             let body = Bytes::from_request(req, state)
                 .await
-                .map_err(|_| AppError::with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
+                .map_err(|rejection| AppError::with_status(rejection.status()))?;
 
             let request = decode_request(&body, src_addr)?;
 

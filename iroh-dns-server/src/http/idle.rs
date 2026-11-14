@@ -60,7 +60,8 @@ pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// idle bound.
 pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 
-/// The most bytes a connection may read in its life, counted as [`READ_BOUND`] counts them. It
+/// The most bytes a connection may read in its life, counted as [`READ_BOUND`] counts them:
+/// 65,536. It
 /// bounds what a connection may send in its life, so that nothing that a connection makes the
 /// server keep can grow with the connection's age: what the server keeps for a connection came in
 /// the bytes that the peer sent, and the peer may send this many. The figure was taken from the
@@ -82,7 +83,7 @@ pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 ///
 /// A client that keeps one connection for many requests meets a closed connection after about
 /// this many bytes, and opens a new one.
-pub(super) const LIFETIME_READ_BOUND: usize = 48 * 1024;
+pub(super) const LIFETIME_READ_BOUND: usize = 64 * 1024;
 
 /// How long a connection that has read [`LIFETIME_READ_BOUND`] may stand with no request in
 /// progress, in place of [`IDLE_TIMEOUT`]. An answer is written after the request that made it has

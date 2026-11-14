@@ -88,6 +88,8 @@ that workload only:
 
 In the last row an open stream took about 15 kB more than the same connection without it: 14.8 kB, the peak less the memory of the 16,384 connections before their streams opened (484 MB over 32,768 streams).
 
+Inside a control group with the service's limit of 2 GiB (as `MemoryHigh` and `MemoryMax`, no swap), the peak of the group's own memory, which counts the sockets' kernel memory and the empty server's 15 MB, for 16,384 connections was 960 MiB where each held 2 HTTP/2 streams open as in the last row, 505 MiB where each sent a header block that never ends (`HEADERS` and 5 `CONTINUATION` frames of 16,384 bytes), which the bound on bytes between request starts closes, and 510 MiB where each held the 2 streams and that block. No process was killed in these runs.
+
 A deployment builds with `KR_FORK_REV` set to the commit it pins, and compares `/healthz` with
 it.
 

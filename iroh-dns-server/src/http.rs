@@ -1174,6 +1174,15 @@ mod tests {
         Ok(())
     }
 
+    /// The most connections of the deployment is 8,192. The figure is taken from the measured
+    /// cost of a connection in the heaviest shape measured, against the share of the memory
+    /// limit that the connections have, and it changes only with a new measure: the cases that
+    /// hold a few connections do not show which figure the server runs with.
+    #[test]
+    fn test_the_most_connections_is_the_measured_figure() {
+        assert_eq!(super::MAX_CONNECTIONS, 8_192);
+    }
+
     /// The connection past the most the server holds is closed at once, the ones held still
     /// answer, a place comes free when one of them ends, and a refused connection leaves no task.
     /// The figure of the deployment is 8,192; this case holds four, and the figure itself is
@@ -1589,11 +1598,30 @@ mod tests {
         }
         assert!(freed, "no place came free after the read bound closed one");
 
-        let mut hello = TcpStream::connect(https).await.anyerr()?;
-        hello
-            .write_all(&partial_client_hello(32_768))
-            .await
-            .anyerr()?;
+        // A handshake that has sent the most it may stands open and holds the only place: the
+        // place that the probe above gave back is taken in a moment, so the connection is made
+        // again until one stands open.
+        let mut hello = None;
+        for _ in 0..40 {
+            let mut stream = TcpStream::connect(https).await.anyerr()?;
+            stream
+                .write_all(&partial_client_hello(32_768))
+                .await
+                .anyerr()?;
+            let mut buf = [0; 1];
+            if tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf))
+                .await
+                .is_err()
+            {
+                hello = Some(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut hello = hello.expect("no handshake stood open: the place did not come free");
+        let mut second = TcpStream::connect(http).await.anyerr()?;
+        assert_refused(&mut second).await?;
+        // Only now the byte past the figure, which the handshake's bound closes.
         hello.write_all(&[0x16]).await.anyerr()?;
         assert_refused(&mut hello).await?;
         let mut freed = false;

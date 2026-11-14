@@ -488,28 +488,47 @@ mod tests {
         time::{advance, timeout},
     };
 
+    use http::{Request, Response};
+
     use super::*;
 
-    /// A service whose answers wait for a signal.
+    /// A service whose answers wait for a signal, and which counts the requests that it is given.
     #[derive(Clone)]
-    struct Gated(Arc<Notify>);
+    struct Gated {
+        gate: Arc<Notify>,
+        calls: Arc<AtomicUsize>,
+    }
 
-    impl Service<()> for Gated {
-        type Response = ();
+    impl Gated {
+        fn new(gate: Arc<Notify>) -> Self {
+            Self {
+                gate,
+                calls: Arc::default(),
+            }
+        }
+    }
+
+    impl Service<Request<()>> for Gated {
+        type Response = Response<()>;
         type Error = Infallible;
-        type Future = Pin<Box<dyn Future<Output = Result<(), Infallible>> + Send>>;
+        type Future = Pin<Box<dyn Future<Output = Result<Response<()>, Infallible>> + Send>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _request: ()) -> Self::Future {
-            let gate = self.0.clone();
+        fn call(&mut self, _request: Request<()>) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.clone();
             Box::pin(async move {
                 gate.notified().await;
-                Ok(())
+                Ok(Response::new(()))
             })
         }
+    }
+
+    fn a_request() -> Request<()> {
+        Request::new(())
     }
 
     async fn accepted() -> (
@@ -522,7 +541,7 @@ mod tests {
         let gate = Arc::new(Notify::new());
         let (stream, service): (IdleStream<DuplexStream>, Tracked<Gated>) =
             IdleBound::new(DefaultAcceptor, Connections::new(1_000, Default::default()))
-                .accept(server, Gated(gate.clone()))
+                .accept(server, Gated::new(gate.clone()))
                 .await
                 .expect("the acceptor passes the connection on");
         (client, stream, service, gate)
@@ -581,7 +600,7 @@ mod tests {
     async fn a_request_in_progress_keeps_the_connection_open_until_it_ends() {
         let (_client, mut stream, mut service, gate) = accepted().await;
 
-        let answer = tokio::spawn(service.call(()));
+        let answer = tokio::spawn(service.call(a_request()));
         advance(IDLE_TIMEOUT * 4).await;
         assert!(
             read_ends(&mut stream).await.is_none(),
@@ -610,7 +629,7 @@ mod tests {
     async fn a_request_that_is_dropped_ends_like_one_that_is_answered() {
         let (_client, mut stream, mut service, _gate) = accepted().await;
 
-        let answer = service.call(());
+        let answer = service.call(a_request());
         advance(IDLE_TIMEOUT * 2).await;
         assert!(
             read_ends(&mut stream).await.is_none(),
@@ -678,14 +697,14 @@ mod tests {
     /// the end of the request. The request may also end between the read and the poll, which gives
     /// the connection a new idle time as well.
     async fn a_request_starts_as_the_deadline_passes(ends_before_the_poll: bool) {
-        type Answer = <Tracked<Gated> as Service<()>>::Future;
+        type Answer = <Tracked<Gated> as Service<Request<()>>>::Future;
 
         let (_client, mut stream, service, _gate) = accepted().await;
         let request: Arc<Mutex<Option<Answer>>> = Arc::default();
         stream.after_read = Some(Box::new({
             let (mut service, request) = (service, request.clone());
             move || {
-                let answer = service.call(());
+                let answer = service.call(a_request());
                 if !ends_before_the_poll {
                     *request.lock().unwrap() = Some(answer);
                 }
@@ -741,7 +760,9 @@ mod tests {
     async fn a_connection_that_reads_past_the_bound_is_closed() {
         for requests_held in [0, 1] {
             let (mut client, mut stream, mut service, _gate) = accepted().await;
-            let held: Vec<_> = (0..requests_held).map(|_| service.call(())).collect();
+            let held: Vec<_> = (0..requests_held)
+                .map(|_| service.call(a_request()))
+                .collect();
             read_bytes(&mut client, &mut stream, READ_BOUND)
                 .await
                 .expect("the bound's own bytes were refused");
@@ -766,7 +787,7 @@ mod tests {
             read_bytes(&mut client, &mut stream, READ_BOUND)
                 .await
                 .expect("the bytes before a start were refused");
-            drop(service.call(()));
+            drop(service.call(a_request()));
         }
     }
 
@@ -790,7 +811,7 @@ mod tests {
         gate: &Notify,
     ) -> io::Result<()> {
         read_bytes(client, stream, 1_024).await?;
-        let answer = tokio::spawn(service.call(()));
+        let answer = tokio::spawn(service.call(a_request()));
         gate.notify_one();
         answer
             .await
@@ -820,7 +841,7 @@ mod tests {
         read_bytes(&mut client, &mut stream, 1_024)
             .await
             .expect("the bytes of the next request were refused");
-        let refused = service.call(());
+        let refused = service.call(a_request());
         let error = read_bytes(&mut client, &mut stream, 1)
             .await
             .expect_err("a request after the budget was served");
@@ -843,8 +864,8 @@ mod tests {
             state.lifetime = LIFETIME_READ_BOUND - 1_000;
             state.lifetime_at_last_start = LIFETIME_READ_BOUND - 1_000;
         }
-        let first = tokio::spawn(service.call(()));
-        let second = tokio::spawn(service.call(()));
+        let first = tokio::spawn(service.call(a_request()));
+        let second = tokio::spawn(service.call(a_request()));
         read_bytes(&mut client, &mut stream, 2_048)
             .await
             .expect("the bytes that pass the budget were refused");
@@ -883,7 +904,7 @@ mod tests {
             read_ends(&mut stream).await.is_none(),
             "closed before its idle time ended"
         );
-        let answer = tokio::spawn(service.call(()));
+        let answer = tokio::spawn(service.call(a_request()));
         gate.notify_one();
         answer
             .await
@@ -900,7 +921,7 @@ mod tests {
         let gate = Arc::new(Notify::new());
         let bound = IdleBound::new(DefaultAcceptor, connections.clone());
         let (mut stream, mut service): (IdleStream<DuplexStream>, Tracked<Gated>) = bound
-            .accept(server, Gated(gate))
+            .accept(server, Gated::new(gate))
             .await
             .expect("the acceptor passes the connection on");
         assert_eq!(connections.held(), 1);
@@ -909,7 +930,7 @@ mod tests {
             state.lifetime = LIFETIME_READ_BOUND + 1;
             state.lifetime_at_last_start = LIFETIME_READ_BOUND + 1;
         }
-        drop(service.call(()));
+        drop(service.call(a_request()));
         assert!(
             read_ends(&mut stream).await.is_some(),
             "the connection did not end"
@@ -918,7 +939,7 @@ mod tests {
         assert_eq!(connections.held(), 0);
         let (_client, server) = tokio::io::duplex(1024);
         bound
-            .accept(server, Gated(Arc::new(Notify::new())))
+            .accept(server, Gated::new(Arc::new(Notify::new())))
             .await
             .expect("the place was not given back");
     }
@@ -931,7 +952,7 @@ mod tests {
         let connections = Connections::new(1, Default::default());
         let bound = IdleBound::new(DefaultAcceptor, connections.clone());
         let (mut stream, _service): (IdleStream<DuplexStream>, Tracked<Gated>) = bound
-            .accept(server, Gated(Arc::new(Notify::new())))
+            .accept(server, Gated::new(Arc::new(Notify::new())))
             .await
             .expect("the acceptor passes the connection on");
         stream.shared.state().lifetime = LIFETIME_READ_BOUND - 100;
@@ -950,7 +971,7 @@ mod tests {
         assert_eq!(connections.held(), 0);
         let (_client, server) = tokio::io::duplex(1024);
         bound
-            .accept(server, Gated(Arc::new(Notify::new())))
+            .accept(server, Gated::new(Arc::new(Notify::new())))
             .await
             .expect("the place was not given back");
     }

@@ -227,7 +227,9 @@ where
     }
 }
 
-/// A connection's stream, which fails once the connection has stood idle for too long.
+/// A connection's stream, which fails once the connection has stood idle for too long. Every
+/// operation that can stay pending, a close included, checks the clock first, so an expired
+/// deadline ends the connection whatever the inner stream is doing.
 pub(super) struct IdleStream<T> {
     inner: T,
     shared: Arc<Shared>,
@@ -310,7 +312,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for IdleStream<T> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = &mut *self;
+        this.check(cx)?;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -472,6 +476,116 @@ mod tests {
             .await
             .expect_err("the write succeeded after the bound");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// A stream that never completes a read, a write, a flush or a shutdown, as one whose peer has
+    /// stopped reading while its send buffer is full. It never wakes the task either, so only the
+    /// idle bound's own timer can end an operation on it.
+    struct Blocked;
+
+    impl AsyncRead for Blocked {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for Blocked {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Runs `operation` on a stream whose inner stream never completes it. The operation stays
+    /// pending until the bound, and then ends with a time-out whatever the inner stream is doing.
+    async fn a_blocked_operation_ends_at_the_bound<Operation, Output>(operation: Operation)
+    where
+        Operation: FnOnce(IdleStream<Blocked>) -> Output,
+        Output: Future<Output = io::Result<()>> + Send + 'static,
+    {
+        let (stream, _service) =
+            IdleBound::new(DefaultAcceptor, Connections::new(1, Default::default()))
+                .accept(Blocked, ())
+                .await
+                .expect("the acceptor passes the connection on");
+        let operation = tokio::spawn(operation(stream));
+
+        advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!operation.is_finished(), "ended before the bound");
+
+        advance(Duration::from_secs(2)).await;
+        let error = timeout(Duration::from_secs(1), operation)
+            .await
+            .expect("still pending after the bound")
+            .expect("the operation's task ends")
+            .expect_err("the operation succeeded");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_stays_pending_ends_at_the_bound() {
+        a_blocked_operation_ends_at_the_bound(|mut stream| async move {
+            stream.read(&mut [0u8; 1]).await.map(drop)
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_stays_pending_ends_at_the_bound() {
+        a_blocked_operation_ends_at_the_bound(|mut stream| async move {
+            stream.write(b"x").await.map(drop)
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_vectored_write_that_stays_pending_ends_at_the_bound() {
+        a_blocked_operation_ends_at_the_bound(|mut stream| async move {
+            stream
+                .write_vectored(&[io::IoSlice::new(b"x")])
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_that_stays_pending_ends_at_the_bound() {
+        a_blocked_operation_ends_at_the_bound(|mut stream| async move { stream.flush().await })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_that_stays_pending_ends_at_the_bound() {
+        a_blocked_operation_ends_at_the_bound(|mut stream| async move { stream.shutdown().await })
+            .await;
     }
 
     /// An acceptor whose handshake never ends.

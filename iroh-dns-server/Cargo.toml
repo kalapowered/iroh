@@ -69,6 +69,7 @@ n0-tracing-test = "0.3"
 rand = "0.10"
 simple-dns = "0.12"
 rand_chacha = "0.10"
+redb = { version = "4.1.0", features = ["cache_metrics"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider", "http2", "json"
 ] }

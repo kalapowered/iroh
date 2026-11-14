@@ -29,8 +29,15 @@ use crate::{
 
 mod signed_packets;
 
-/// Cache up to 1 million pkarr zones by default
-const DEFAULT_CACHE_CAPACITY: usize = 1024 * 1024;
+/// The pkarr zones the zone cache holds at most: 131,072. A zone costs a little under 3 kB in the
+/// cache for an ordinary packet and under 2 kB for the largest; budgeted at 3.5 kB, the cache
+/// takes 448 MiB at most, beside the packet database's page cache and the held connections inside
+/// the service's limit of 2 GiB. The capacity follows that budget and not the store's ceiling of
+/// packets: a zone that is not cached costs one read of the store.
+const ZONE_CACHE_CAPACITY: usize = 131_072;
+/// The zones the cache of DHT zones holds at most: 16,384, 56 MiB at 3.5 kB a zone. Its entries
+/// last five minutes.
+const DHT_CACHE_CAPACITY: usize = 16_384;
 /// Default TTL for DHT cache entries
 const DHT_CACHE_TTL: Duration = Duration::from_secs(300);
 /// The number of change counters the zone cache keeps. A key shares its counter with one in
@@ -148,6 +155,24 @@ impl ZoneStore {
             metrics.clone(),
             invalidator(&cache),
         )?;
+        Ok(Self::new(packet_store, cache, metrics))
+    }
+
+    /// Create an in-memory store whose caches hold at most the given numbers of zones.
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_cache_capacity(
+        options: Options,
+        metrics: Arc<Metrics>,
+        zones: usize,
+        dht_zones: usize,
+    ) -> Result<Self> {
+        let cache = Arc::new(Mutex::new(ZoneCache::new(
+            zones,
+            dht_zones,
+            metrics.clone(),
+        )));
+        let packet_store =
+            SignedPacketStore::in_memory(options, metrics.clone(), invalidator(&cache))?;
         Ok(Self::new(packet_store, cache, metrics))
     }
 
@@ -345,7 +370,8 @@ impl ZoneStore {
 
 fn new_cache(metrics: &Arc<Metrics>) -> Arc<Mutex<ZoneCache>> {
     Arc::new(Mutex::new(ZoneCache::new(
-        DEFAULT_CACHE_CAPACITY,
+        ZONE_CACHE_CAPACITY,
+        DHT_CACHE_CAPACITY,
         metrics.clone(),
     )))
 }
@@ -376,6 +402,11 @@ impl ZoneStore {
     /// Whether the cache holds a zone for this key.
     pub(crate) fn cached(&self, pubkey: &PublicKeyBytes) -> bool {
         self.lock_cache().cache.contains(pubkey)
+    }
+
+    /// How many zones the cache holds.
+    pub(crate) fn cached_zones(&self) -> usize {
+        self.lock_cache().cache.len()
     }
 
     /// Pause the next lookup that finds a packet in the store, after it has read the packet and
@@ -447,9 +478,10 @@ struct ZoneCache {
 }
 
 impl ZoneCache {
-    fn new(cap: usize, metrics: Arc<Metrics>) -> Self {
-        let cache = LruCache::new(NonZeroUsize::new(cap).expect("capacity must be larger than 0"));
-        let dht_cache = TtlCache::new(cap);
+    fn new(zones: usize, dht_zones: usize, metrics: Arc<Metrics>) -> Self {
+        let cache =
+            LruCache::new(NonZeroUsize::new(zones).expect("capacity must be larger than 0"));
+        let dht_cache = TtlCache::new(dht_zones);
         Self {
             cache,
             dht_cache,
@@ -1001,7 +1033,7 @@ mod tests {
 
     #[test]
     fn a_cache_left_in_doubt_by_a_panic_starts_over_and_counts_a_change_for_every_key() {
-        let cache = std::sync::Mutex::new(super::ZoneCache::new(16, Default::default()));
+        let cache = std::sync::Mutex::new(super::ZoneCache::new(16, 16, Default::default()));
         let (cached, dht_cached) = (SecretKey::generate(), SecretKey::generate());
         let noted = {
             let mut cache = cache.lock().expect("lock");
@@ -1055,7 +1087,7 @@ mod tests {
 
     #[test]
     fn a_dht_zone_is_not_cached_if_the_stored_packet_changed_during_the_lookup() {
-        let mut cache = super::ZoneCache::new(16, Default::default());
+        let mut cache = super::ZoneCache::new(16, 16, Default::default());
         let endpoint = SecretKey::generate();
         let pubkey = key(&endpoint);
 
@@ -1089,6 +1121,75 @@ mod tests {
             Some("relay=second")
         );
         assert!(!cache.dht_cache.contains_key(&pubkey));
+    }
+
+    /// The zone cache holds at most its capacity under a fill above it, and a zone that it does
+    /// not hold is answered from the store as every zone is, the right one for each key.
+    #[tokio::test]
+    async fn the_zone_cache_holds_at_most_its_capacity_and_a_miss_is_answered_from_the_store()
+    -> Result {
+        const ZONES: usize = 4;
+        let store = ZoneStore::in_memory_with_cache_capacity(
+            Options::default(),
+            Default::default(),
+            ZONES,
+            ZONES,
+        )?;
+        let endpoints: Vec<SecretKey> = (0..3 * ZONES).map(|_| SecretKey::generate()).collect();
+        for (i, endpoint) in endpoints.iter().enumerate() {
+            let packet = signed_packet_at(endpoint, now_micros(), &format!("relay-{i}"));
+            publish(&store, packet).await?;
+        }
+
+        for _ in 0..2 {
+            for (i, endpoint) in endpoints.iter().enumerate() {
+                assert_eq!(
+                    lookup(&store, endpoint).await?,
+                    Some(format!("relay=relay-{i}")),
+                    "the answer for endpoint {i}"
+                );
+                assert!(
+                    store.cached_zones() <= ZONES,
+                    "the cache holds more zones than its capacity"
+                );
+            }
+        }
+        assert_eq!(store.cached_zones(), ZONES);
+        Ok(())
+    }
+
+    /// The cache of DHT zones has a capacity of its own, and holds at most that.
+    #[test]
+    fn the_dht_cache_holds_at_most_its_capacity() {
+        let mut cache = super::ZoneCache::new(16, 2, Default::default());
+        for _ in 0..5 {
+            let endpoint = SecretKey::generate();
+            let pubkey = key(&endpoint);
+            let noted = cache.changes(&pubkey);
+            cache.insert_and_resolve_dht(
+                &pubkey,
+                zone_of(&endpoint, "dht"),
+                noted,
+                &name(),
+                RecordType::TXT,
+            );
+            assert!(
+                cache.dht_cache.iter().count() <= 2,
+                "the DHT cache holds more zones than its capacity"
+            );
+        }
+        assert_eq!(cache.dht_cache.iter().count(), 2);
+        assert_eq!(cache.cache.cap().get(), 16, "the two capacities are one");
+    }
+
+    /// The server's caches have the capacities of the memory budget: 131,072 zones, and 16,384
+    /// for DHT zones.
+    #[test]
+    fn the_servers_caches_have_the_budgeted_capacities() {
+        let cache = super::new_cache(&Default::default());
+        let cache = super::lock_cache(&cache);
+        assert_eq!(cache.cache.cap().get(), 131_072);
+        assert_eq!(cache.dht_cache.capacity(), 16_384);
     }
 
     #[tokio::test]

@@ -31,6 +31,25 @@ pub(super) type OnChange = Arc<dyn Fn(&PublicKeyBytes) + Send + Sync>;
 /// endpoints, about a gigabyte of packets.
 pub(crate) const DEFAULT_MAX_PACKETS: usize = 1_000_000;
 
+/// The memory the packet database may use to cache the pages it has read and to buffer the pages
+/// it has written, together: 256 MiB. redb's own setting is 1 GiB, which with the zone cache and
+/// the held connections would pass the service's limit of 2 GiB. A read that misses it goes to the
+/// database file, which the kernel's file cache usually serves.
+pub(crate) const PAGE_CACHE_SIZE: usize = 256 * 1024 * 1024;
+
+/// A database builder whose page cache is `bytes` large.
+fn builder_with_cache(bytes: usize) -> redb::Builder {
+    let mut builder = Database::builder();
+    builder.set_cache_size(bytes);
+    builder
+}
+
+/// The builder that every open of the packet database goes through, so that none of them has
+/// redb's default page cache.
+fn database_builder() -> redb::Builder {
+    builder_with_cache(PAGE_CACHE_SIZE)
+}
+
 /// What the store did with a packet it was offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Upsert {
@@ -560,13 +579,13 @@ impl SignedPacketStore {
                 )
             })?;
         }
-        let db = Database::builder()
+        let db = database_builder()
             .create(path)
             .std_context("failed to open packet database")?;
         let path = path.to_path_buf();
         // Open, and not create: a file that is gone is not an empty store to carry on with.
         let reopen: Reopen = Arc::new(move || {
-            Database::builder()
+            database_builder()
                 .open(&path)
                 .std_context("failed to reopen packet database")
         });
@@ -580,7 +599,7 @@ impl SignedPacketStore {
         on_change: OnChange,
     ) -> Result<Self> {
         info!("using in-memory packet database");
-        let db = Database::builder()
+        let db = database_builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .anyerr()?;
         Self::open(db, options, metrics, on_change, true, no_reopen())
@@ -594,7 +613,7 @@ impl SignedPacketStore {
         metrics: Arc<Metrics>,
         on_change: OnChange,
     ) -> Result<Self> {
-        let db = Database::builder()
+        let db = database_builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .anyerr()?;
         Self::open(db, options, metrics, on_change, false, no_reopen())
@@ -612,7 +631,7 @@ impl SignedPacketStore {
     ) -> Result<Self> {
         let again = backend.clone();
         let reopen: Reopen = Arc::new(move || {
-            Database::builder()
+            database_builder()
                 .create_with_backend(again.clone())
                 .anyerr()
         });
@@ -636,7 +655,7 @@ impl SignedPacketStore {
         run_eviction_task: bool,
         reopen: Reopen,
     ) -> Result<Self> {
-        let db = Database::builder().create_with_backend(backend).anyerr()?;
+        let db = database_builder().create_with_backend(backend).anyerr()?;
         Self::open(db, options, metrics, on_change, run_eviction_task, reopen)
     }
 
@@ -954,6 +973,46 @@ mod tests {
     use iroh_base::SecretKey;
 
     use super::*;
+
+    /// A database holds in its page cache what the builder lets it: with a cache of 1 MiB, 8 MiB
+    /// of pages written and read back are evicted from it, which they are not with redb's own
+    /// 1 GiB. The packet store's cache is 256 MiB, and every open of it takes that figure from
+    /// the one builder.
+    #[test]
+    fn the_page_cache_is_the_size_that_the_builder_sets() {
+        assert_eq!(PAGE_CACHE_SIZE, 256 * 1024 * 1024);
+
+        let db = builder_with_cache(1 << 20)
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("a database");
+        let value = [7u8; 4096];
+        let key_of = |n: u32| {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&n.to_be_bytes());
+            key
+        };
+        for batch in 0..8u32 {
+            let tx = db.begin_write().expect("write");
+            {
+                let mut table = tx.open_table(SIGNED_PACKETS_TABLE).expect("table");
+                for i in 0..256u32 {
+                    table
+                        .insert(&key_of(batch * 256 + i), value.as_slice())
+                        .expect("insert");
+                }
+            }
+            tx.commit().expect("commit");
+        }
+        let tx = db.begin_read().expect("read");
+        let table = tx.open_table(SIGNED_PACKETS_TABLE).expect("table");
+        for n in 0..8 * 256u32 {
+            assert!(table.get(&key_of(n)).expect("get").is_some());
+        }
+        assert!(
+            db.cache_stats().evictions() > 0,
+            "8 MiB passed through a cache of 1 MiB and nothing was evicted"
+        );
+    }
     use crate::testing::{DAY_MICROS, Disk, FullDisk, signed_packet_at};
 
     fn test_signed_packet() -> SignedPacket {
@@ -1683,7 +1742,7 @@ mod tests {
         let again = disk.clone();
         let reopen: Reopen = Arc::new(move || {
             held.lock().expect("gate").recv().ok();
-            Database::builder()
+            database_builder()
                 .create_with_backend(again.clone())
                 .anyerr()
         });

@@ -90,6 +90,34 @@ What held connections cost was measured on the build box (AMD EPYC 7502P, Linux)
 
 The sixth row is the heaviest shape measured: the bound on bytes between request starts lets a connection hold two open streams and a block that stays under the bound. At 16,384 connections it took 102.1 KiB for each connection. The cap of 8,192 was taken from that cost: 8,192 connections at 102.1 KiB, with the empty server's 9 MiB, come to 826 MiB, and 8,192 connections in that shape held 857 MiB at the peak of the group, 106 KiB each. No heavier shape has been measured. No process was killed in these runs, and the group's `oom` and `oom_kill` stayed at 0.
 
+### Memory budget
+
+The service runs in a unit with a memory limit of 2 GiB and no swap. The limit counts the anonymous memory of the process, the kernel's memory for its sockets and the file cache, which the kernel fills and reclaims. Each figure below bounds one part. They were measured on the build box (AMD EPYC 7502P, Linux 7.0, 64 threads), on a release build with one TLS listener on loopback and the rate limits off, inside a control group with the unit's limit (`MemoryHigh` and `MemoryMax` of 2 GiB, `MemorySwapMax` of 0).
+
+| What | Figure | What it bounds, and what was measured |
+| --- | --- | --- |
+| Zone cache | 131,072 zones | The zones that answer DNS without a read of the packet store; a miss costs one read. A zone held 3.2 kB at capacity with `MALLOC_ARENA_MAX=2` and 4.9 kB with the default arenas. |
+| Cache of DHT zones | 16,384 zones | The same for zones that come from the DHT. |
+| Page cache of the packet database | 256 MiB (the library's default is 1 GiB) | What the database keeps of its pages. The database part of the process levelled off at about 290 MiB above the empty server over 400,000 stored zones; nothing else grows with each stored zone. |
+| Connections | 8,192 | See the table of shapes above: 857 MiB at the peak of the shape of its sixth row. |
+| Socket buffers | 4 KiB for receive, 8 KiB for send, on each accepted socket of the HTTP and HTTPS listeners | The kernel's queues for a client that sends and does not read, below. |
+
+The allocator's setting belongs to the deployment: the unit sets `MALLOC_ARENA_MAX=2`, and the figures are those of a run with it. glibc allows 8 arenas for each processor, and the memory that a cache frees stays with the arena that held it: on the build box 400,000 stored zones held 948 MiB of anonymous memory with the default and 723 MiB with 2 arenas. A host with fewer processors holds less than the box does without the setting, and one with more holds more.
+
+What the kernel's socket buffers cost was measured with 8,192 connections, one TLS listener, and clients that send and do not read. The group's peak, with the buffers fixed:
+
+| Each of the connections | Group peak |
+| --- | --- |
+| sends `GET /pkarr/{key}` requests one after another (about 90 bytes each, an answer of about 1,200 bytes) over HTTP/1 and reads no answer | 729 MiB (407 MiB of socket memory); no process killed |
+| opens HTTP/2 streams one after another, each a `GET` that ends, and reads no answer | 586 MiB |
+| the same, then a `PING` and `PING` frames without end | 470 MiB; the bound on bytes between request starts closed every connection |
+
+On the build box a connection starts with a send buffer of 2.5 MiB and a receive buffer that tunes itself up to 32 MiB. A buffer set on the listening socket before `listen` is the accepted socket's and the kernel does not tune it; the kernel keeps twice the figure. 4 KiB is the least at which the largest `ClientHello` measured, 2,035 bytes, arrives in one flight with a margin of 2 (a write of 20,000 bytes to a server that did not read arrived 4,308 bytes at 4 KiB and 2,048 at 2 KiB, with a client segment size of 1,448); 8 KiB is the least at which one send takes a handshake flight of about 5 kB (9,412 bytes at 8 KiB, 5,068 at 4 KiB). A larger request is read as the server takes it in, and the largest honest request, a head of 8,192 bytes with a body of 4,096, is answered. The send queue holds, beside the buffer, one buffer of the kernel's own of up to 64 KiB, so a connection holds about 50 kB of socket memory in the first row, and the buffer sizes do not bound that.
+
+The proof is a run of the server in the group with 8,064 held connections, 6,016 in the shape of the sixth row above and 2,048 that pipeline requests and read no answer, a store filled to 400,000 zones, each looked up once as it was published, and 150,000 lookups of the first zones while the shapes are held. The peak of anonymous, kernel and socket memory, taken from the group's own figures every two seconds, with `MALLOC_ARENA_MAX=2`: 1,563 MiB for the ordinary packet and 1,423 MiB for the largest (1,072 bytes), against the limit of 2,048 MiB less 15 per cent, 1,741 MiB; no process was killed, `oom` and `oom_kill` stayed at 0, and DNS answered on the server's own port throughout. The same run with the default arenas peaked at 1,855 MiB. The group's total reaches 2,048 MiB in every run, because the kernel's file cache fills it and is reclaimed.
+
+Not bounded by these figures: the connections of port 53 over TCP, which the cap does not count and which have no limit of their own beside the descriptors, and the kernel's buffers on that port; and the settings of the host's kernel, whose limits on TCP memory and on buffer sizes were larger on the build box than a host of 3.9 GB has.
+
 A deployment builds with `KR_FORK_REV` set to the commit it pins, and compares `/healthz` with
 it.
 

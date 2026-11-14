@@ -72,7 +72,29 @@ fn set_keepalive(listener: &std::net::TcpListener) -> std::io::Result<()> {
 /// overflows under bursts of slow handshakes.
 const DEFAULT_LISTEN_BACKLOG: u32 = 1024;
 
-/// Bind a TCP listener on `addr` with a listen queue of `backlog`.
+/// The size that every accepted connection asks of the kernel for its receive buffer: 4,096
+/// bytes. A client that sends and does not read lets the kernel's queues grow with the kernel's
+/// own tuning: on the build box a connection started with a send buffer of 2.5 MiB and a receive
+/// buffer that tunes itself up to 32 MiB, and 8,192 connections that pipelined small requests
+/// and read none of the answers took the server's group past its limit of 2 GiB in 30 seconds,
+/// 1.7 GiB of it in the sockets. A buffer set before `listen` is the accepted sockets' too, and
+/// the kernel does not tune it. The figure is the least at which the largest honest request that
+/// comes in one flight, the TLS `ClientHello` of 2,035 bytes, arrives whole before the server
+/// reads: with an Ethernet segment size the receive queue took 4,308 bytes of one write at this
+/// figure, and 2,048 at half of it. A larger request is read as the server takes it in, one round
+/// trip for each window, and the largest honest request, a head of 8,192 bytes with a body of
+/// 4,096, is answered. The kernel keeps twice the figure, and no more than `net.core.rmem_max`.
+const SOCKET_RECV_BUFFER: u32 = 4 * 1024;
+
+/// The size that every accepted connection asks of the kernel for its send buffer: 8,192 bytes.
+/// The largest answer that an honest client waits for is the server's handshake flight, about 5
+/// kB with a certificate chain and a post-quantum key share; one send took 9,412 bytes at this
+/// figure and 5,068 at half of it, before the client has read any. The kernel keeps twice the
+/// figure, and no more than `net.core.wmem_max`.
+const SOCKET_SEND_BUFFER: u32 = 8 * 1024;
+
+/// Bind a TCP listener on `addr` with a listen queue of `backlog`. The buffers of the sockets that
+/// it accepts are the fixed sizes above.
 fn bind_listener(addr: SocketAddr, backlog: u32) -> std::io::Result<std::net::TcpListener> {
     let socket = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
@@ -81,6 +103,8 @@ fn bind_listener(addr: SocketAddr, backlog: u32) -> std::io::Result<std::net::Tc
 
     #[cfg(not(windows))]
     socket.set_reuseaddr(true)?;
+    socket.set_recv_buffer_size(SOCKET_RECV_BUFFER)?;
+    socket.set_send_buffer_size(SOCKET_SEND_BUFFER)?;
     socket.bind(addr)?;
     socket.listen(backlog)?.into_std()
 }
@@ -1180,6 +1204,26 @@ mod tests {
     #[test]
     fn test_the_most_connections_is_the_measured_figure() {
         assert_eq!(super::MAX_CONNECTIONS, 8_192);
+    }
+
+    /// The sockets that a listener accepts have the buffers that the server sets, and the kernel
+    /// does not tune them: Linux gives an accepted socket the buffers of the listening socket and
+    /// keeps twice the size that was set. The sizes are written out here so that a change of a
+    /// figure, or no figure, fails this case. (macOS does not carry the sizes to the accepted
+    /// socket and tunes it.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_accepted_sockets_have_the_fixed_buffers() -> n0_error::Result {
+        let listener = super::bind_listener((Ipv4Addr::LOCALHOST, 0).into(), 16).anyerr()?;
+        let listener = tokio::net::TcpListener::from_std(listener).anyerr()?;
+        let _client = TcpStream::connect(listener.local_addr().anyerr()?)
+            .await
+            .anyerr()?;
+        let (accepted, _) = listener.accept().await.anyerr()?;
+        let socket = socket2::SockRef::from(&accepted);
+        assert_eq!(socket.recv_buffer_size().anyerr()?, 2 * 4_096);
+        assert_eq!(socket.send_buffer_size().anyerr()?, 2 * 8_192);
+        Ok(())
     }
 
     /// The connection past the most the server holds is closed at once, the ones held still

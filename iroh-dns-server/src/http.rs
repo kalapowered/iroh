@@ -3,6 +3,7 @@
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -38,6 +39,8 @@ mod error;
 mod idle;
 mod pkarr;
 mod rate_limiting;
+#[cfg(test)]
+mod raw_h2;
 mod tls;
 
 use self::idle::{Connections, IdleBound};
@@ -96,6 +99,65 @@ fn set_header_read_timeout(builder: &mut auto::Builder<TokioExecutor>) {
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
+}
+
+/// The most an HTTP/1 connection buffers while it reads the head of a request: 8,192 bytes, the
+/// lowest value hyper accepts (its default is 417,792). The longest honest head is a DNS-over-HTTPS
+/// request for the longest DNS name, about 500 bytes. A head that does not fit is answered `431`
+/// and the connection is closed.
+const HTTP1_MAX_BUFFER_SIZE: usize = 8_192;
+
+/// The most streams an HTTP/2 connection has open at once: 2 (hyper's default is 200; it has no
+/// lowest value, and RFC 9113 advises 100 or more only for clients that want parallelism, which
+/// this server's clients do not). An open request with a full header list and a body of 4 KB
+/// holds about 15 KB, so this is what bounds the cost of a connection that is held open. A client
+/// that has reached the figure waits for a stream to end; a stream past it is refused with
+/// `REFUSED_STREAM`, which the client may retry.
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 2;
+
+/// The largest header list an HTTP/2 request may have: 4,096 bytes as HTTP/2 counts them (a name,
+/// a value and 32 bytes for each header), against hyper's 16,384; hyper has no lowest value. An
+/// honest request has under 1,000. The server applies it as soon as the connection opens, whether
+/// or not the client acknowledges the server's settings.
+const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 4_096;
+
+/// The window of an HTTP/2 stream for the request body the server has not yet read: 4,096 bytes,
+/// the largest body any route takes (hyper's default is 1 MiB; it has no lowest value). A body is
+/// read as it arrives, so an honest request never waits for more window. The server applies it
+/// once the client has acknowledged the server's settings; the connection window below bounds
+/// what a client that never does can send.
+const HTTP2_STREAM_WINDOW_SIZE: u32 = 4_096;
+
+/// The window of an HTTP/2 connection for body bytes the server has not yet read: 65,535 bytes,
+/// the size the protocol starts every connection with and the least it can be. hyper raises it to
+/// 1 MiB unless told otherwise.
+const HTTP2_CONNECTION_WINDOW_SIZE: u32 = 65_535;
+
+/// Set the limits on what a connection holds for a request that is not complete, so that the
+/// connections the server holds cannot take its memory.
+fn set_protocol_limits(builder: &mut auto::Builder<TokioExecutor>) {
+    builder.http1().max_buf_size(HTTP1_MAX_BUFFER_SIZE);
+    builder
+        .http2()
+        .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
+        .max_header_list_size(HTTP2_MAX_HEADER_LIST_SIZE)
+        .initial_stream_window_size(HTTP2_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(HTTP2_CONNECTION_WINDOW_SIZE);
+}
+
+/// A server on `listener` whose connections are bounded: by the idle bound, by the header read
+/// timeout and by the protocol limits. The HTTP and HTTPS listeners are both made here, so that
+/// they cannot differ.
+fn bounded_server<A>(
+    listener: std::net::TcpListener,
+    acceptor: A,
+    connections: Arc<Connections>,
+) -> Result<axum_server::Server<SocketAddr, IdleBound<A>>> {
+    let mut server =
+        axum_server::from_tcp(listener)?.acceptor(IdleBound::new(acceptor, connections));
+    set_header_read_timeout(server.http_builder());
+    set_protocol_limits(server.http_builder());
+    Ok(server)
 }
 
 /// The most connections the HTTP and HTTPS listeners hold at once, together; the next is closed at
@@ -194,9 +256,7 @@ impl HttpServer {
             let listener = bind_listener(bind_addr, backlog).anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
             set_keepalive(&listener).anyerr()?;
-            let mut server = axum_server::from_tcp(listener)?
-                .acceptor(IdleBound::new(DefaultAcceptor::new(), connections.clone()));
-            set_header_read_timeout(server.http_builder());
+            let server = bounded_server(listener, DefaultAcceptor::new(), connections.clone())?;
             let fut = server.serve(app.into_make_service_with_connect_info::<SocketAddr>());
             info!("HTTP server listening on {bind_addr}");
             tasks.spawn(fut);
@@ -234,9 +294,7 @@ impl HttpServer {
             let listener = bind_listener(bind_addr, backlog).anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
             set_keepalive(&listener).anyerr()?;
-            let mut server =
-                axum_server::from_tcp(listener)?.acceptor(IdleBound::new(acceptor, connections));
-            set_header_read_timeout(server.http_builder());
+            let server = bounded_server(listener, acceptor, connections)?;
             let fut = server.serve(app.into_make_service_with_connect_info::<SocketAddr>());
             info!("HTTPS server listening on {bind_addr}");
             tasks.spawn(fut);
@@ -464,7 +522,10 @@ mod tests {
         net::TcpStream,
     };
 
-    use crate::{http::HttpsConfig, server::Server};
+    use crate::{
+        http::{HttpsConfig, raw_h2},
+        server::Server,
+    };
 
     /// Linux completes at most `backlog + 1` handshakes that are not yet accepted,
     /// then drops further SYNs, so a sequential connect beyond that times out.
@@ -896,6 +957,183 @@ mod tests {
         let largest = super::DOH_POST_BODY_LIMIT;
         assert_eq!(status_of(addr, &post(largest + 1)).await?, 413);
         assert_ne!(status_of(addr, &post(largest)).await?, 413);
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A request whose head does not fit the buffer that hyper reads it into is answered `431`;
+    /// the requests of this server's clients are far under it.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http1_head_limit() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+
+        // A head of `len` bytes: a request for the health check and a header that fills it.
+        let head = |len: usize| {
+            let start = "GET /healthcheck HTTP/1.1\r\nhost: localhost\r\nx-fill: ";
+            let end = "\r\n\r\n";
+            let fill = "a".repeat(len - start.len() - end.len());
+            format!("{start}{fill}{end}").into_bytes()
+        };
+        let most = super::HTTP1_MAX_BUFFER_SIZE;
+        assert_eq!(status_of(addr, &head(1_000)).await?, 200);
+        assert_eq!(status_of(addr, &head(most - 1)).await?, 200);
+        assert_eq!(status_of(addr, &head(most + 1)).await?, 431);
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A peer that opens a stream past the most the server allows has that stream refused, and
+    /// the streams within the limit go on and are answered.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_stream_limit() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+
+        // A request whose body has not arrived keeps its stream open.
+        let length = [("content-length", "100".to_string())];
+        let mut open = Vec::new();
+        for _ in 0..super::HTTP2_MAX_CONCURRENT_STREAMS {
+            open.push(peer.request("POST", "/dns-query", &length, false).await?);
+        }
+        let refused = peer.request("POST", "/dns-query", &length, false).await?;
+        loop {
+            let frame = peer
+                .next_frame()
+                .await
+                .std_context("the stream past the limit was not refused")?;
+            if let Some(code) = frame.reset_code() {
+                assert_eq!(frame.stream, refused, "a stream within the limit was reset");
+                assert_eq!(code, raw_h2::REFUSED_STREAM);
+                break;
+            }
+        }
+
+        peer.data(open[0], 100, true).await?;
+        loop {
+            let frame = peer
+                .next_frame()
+                .await
+                .std_context("a stream within the limit was not answered")?;
+            assert_eq!(
+                frame.reset_code(),
+                None,
+                "a stream within the limit was reset"
+            );
+            if frame.kind == raw_h2::HEADERS && frame.stream == open[0] {
+                break;
+            }
+        }
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A request whose header list is past the most the server allows is not answered with `200`,
+    /// and one under it is.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_header_list_limit() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+
+        let most = super::HTTP2_MAX_HEADER_LIST_SIZE as usize;
+        let fill = |len: usize| [("x-fill", "a".repeat(len))];
+        let under = peer
+            .request("GET", "/healthcheck", &fill(most / 2), true)
+            .await?;
+        let over = peer
+            .request("GET", "/healthcheck", &fill(most + 1), true)
+            .await?;
+
+        let mut answers = std::collections::HashMap::new();
+        while answers.len() < 2 {
+            let frame = peer
+                .next_frame()
+                .await
+                .std_context("a request was not answered")?;
+            if frame.kind == raw_h2::HEADERS {
+                answers.insert(
+                    frame.stream,
+                    frame.payload.first() == Some(&raw_h2::STATUS_200),
+                );
+            }
+        }
+        assert!(answers[&under], "a header list under the limit was refused");
+        assert!(
+            !answers[&over],
+            "a header list past the limit was answered with 200"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The connection's window for request bodies is the protocol's own 65,535 bytes: the server
+    /// does not raise it, as hyper does by default.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_connection_window_is_not_raised() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+
+        while let Some(frame) = peer.frame_within(Duration::from_millis(200)).await {
+            assert!(
+                !(frame.kind == raw_h2::WINDOW_UPDATE && frame.stream == 0),
+                "the server raised the connection's window"
+            );
+        }
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A body that fits the stream's window is read, and one frame past the window is a
+    /// flow-control error on that stream.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_stream_window() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let mut peer = raw_h2::Peer::connect(server.http_addr().expect("http is bound")).await?;
+
+        let window = super::HTTP2_STREAM_WINDOW_SIZE as usize;
+        let length = |len: usize| [("content-length", len.to_string())];
+        let fits = peer
+            .request("POST", "/dns-query", &length(window), false)
+            .await?;
+        peer.data(fits, window, true).await?;
+        let past = peer
+            .request("POST", "/dns-query", &length(window + 1), false)
+            .await?;
+        peer.data(past, window + 1, false).await?;
+
+        let (mut answered, mut reset) = (false, false);
+        while !(answered && reset) {
+            let frame = peer
+                .next_frame()
+                .await
+                .std_context("a body was neither answered nor refused")?;
+            if frame.kind == raw_h2::HEADERS && frame.stream == fits {
+                answered = true;
+            }
+            match frame.reset_code() {
+                Some(code) if frame.stream == past => {
+                    assert_eq!(code, raw_h2::FLOW_CONTROL_ERROR);
+                    reset = true;
+                }
+                Some(code) => assert_eq!(code, 0, "the body within the window was reset"),
+                None => {}
+            }
+        }
 
         server.shutdown().await?;
         Ok(())

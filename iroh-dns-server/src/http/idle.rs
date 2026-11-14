@@ -81,8 +81,11 @@ pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 ///   with `REFUSED_STREAM`, which tells the client that the request was not processed and may be
 ///   sent again; over HTTP/1 the answer to the last request served says `Connection: close`, so
 ///   the client opens a new connection for its next request. A connection that refuses a request
-///   with no other in progress ends once the reset is written, so that the retry does not meet it
-///   again; with others in progress it stands until they have ended.
+///   with no other in progress ends at the first flush that follows the next write after the
+///   refusal. That write is usually the reset, but the state does not tell it from another
+///   write, and a client whose reset did not come first meets a closed connection. With others
+///   in progress the connection stands until they have ended, and a request sent again before
+///   then is refused again.
 /// - **Time.** A connection that takes no further request stands for [`SPENT_IDLE_TIMEOUT`] at
 ///   most when it has no request in progress, in place of [`IDLE_TIMEOUT`]. The allowance is not
 ///   zero, because an answer is written after the request that made it has ended. Until then, a
@@ -96,9 +99,15 @@ pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 ///   connection reads at most `2 * (READ_BOUND + 1)`, 49,154 bytes: the interval in which the
 ///   figure was passed, and, when no request was in progress then, the interval of the last
 ///   request served.
+/// - **Limits.** A request counts as in progress until its handler has returned the response,
+///   not until the response has been sent whole, so a refusal that comes between the two can end
+///   the connection first. A head in transit beside a request in progress when the figure is
+///   passed has the ordinary times only until that request ends, and then the allowance. The
+///   server sends no `GOAWAY` of its own at the figure.
 ///
 /// A client that keeps one connection for many requests meets a refusal after about this many
-/// bytes of requests, and opens a new connection.
+/// bytes of requests. Whether it then reaches a new connection without an error depends on its
+/// library and on the order of its requests.
 pub(super) const LIFETIME_READ_BOUND: usize = 64 * 1024;
 
 /// How long a connection that takes no further request may stand with no request in progress, in
@@ -183,16 +192,21 @@ struct State {
     waker: Option<Waker>,
 }
 
-/// A request that is refused, with no other request in progress, ends the connection once the
-/// reset that answers it is on its way, so that a client that retries the request opens a new
-/// connection and does not meet the spent one again. The reset is written by the connection's own
-/// task after the request's answer was made, so the stream sees it as the next write after the
-/// refusal and the flush that follows.
+/// Where a refusal that was made with no other request in progress leads: the connection ends at
+/// the first flush that follows the next write after the refusal.
+///
+/// The state counts that write and that flush, not the reset's own write. The reset is made by
+/// the HTTP library from the error that the service returns, and the connection's task writes it
+/// after the refusal, so the next write is usually the reset. Any other write that comes first, a
+/// response or a control frame, moves the state in its place, and the connection can then end
+/// before the reset is written, so that its client meets a closed connection. If no write
+/// follows, the connection ends at its allowance. A refusal with other requests in progress does
+/// not enter the state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refusal {
     /// No request was refused with none other in progress.
     None,
-    /// A request was refused and its reset is not written yet.
+    /// A request was refused and no write has been made since.
     Refused,
     /// A write has been made since.
     Written,
@@ -243,8 +257,8 @@ impl Shared {
         (READ_BOUND + 1).saturating_sub(self.state().read).max(1)
     }
 
-    /// Notes that `bytes` were written: the first write after a refusal is the one that carries
-    /// its reset.
+    /// Notes that `bytes` were written: the first write after a refusal moves the state, whatever
+    /// it carries. It is usually the refusal's reset.
     fn wrote(&self, bytes: usize) {
         let mut state = self.state();
         if bytes > 0 && state.refusal == Refusal::Refused {
@@ -333,9 +347,10 @@ impl Drop for InFlight {
     }
 }
 
-/// A request that was refused. It is not in progress and does not hold the connection open. When
-/// it is dropped, which is after the server has made its reset, and no other request is in
-/// progress, the connection ends at the end of the next write and its flush.
+/// A request that was refused. It is not in progress and does not hold the connection open. It is
+/// dropped when the service's future returns its error, which is before the HTTP library makes
+/// the reset from that error. When no other request is in progress then, the connection ends at
+/// the first flush that follows the next write.
 struct Refused {
     shared: Arc<Shared>,
     /// No other request was in progress when it was refused.
@@ -421,7 +436,8 @@ pub(super) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// A request that is refused does not reach the handlers. Over HTTP/2 the stream is reset with
 /// `REFUSED_STREAM`: the client is told that the request was not processed, and it may send it
-/// again on a new connection. Over HTTP/1 a request is never refused in practice: the answer of
+/// again. The spent connection ends by the rules of [`LIFETIME_READ_BOUND`], so the retry can meet
+/// it again. Over HTTP/1 a request is never refused in practice: the answer of
 /// the last request served says `Connection: close`, so the client does not send another on that
 /// connection.
 #[derive(Clone, Debug)]
@@ -1141,8 +1157,9 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
-    /// A request refused with no other request in progress ends the connection once the reset
-    /// that answers it has been written, without the allowance, and the place comes back.
+    /// A request refused with no other request in progress ends the connection at the first flush
+    /// that follows the next write, which here is the reset that answers it, without the
+    /// allowance, and the place comes back.
     #[tokio::test(start_paused = true)]
     async fn a_refused_request_ends_the_connection_once_the_reset_has_been_written() {
         let (mut client, server) = tokio::io::duplex(1024);

@@ -2,7 +2,9 @@ use std::{
     borrow::Cow,
     io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, OnceLock},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -17,7 +19,7 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls_acme::{AcmeConfig, axum::AxumAcceptor, caches::DirCache};
 use tokio_stream::StreamExt;
 use tracing::{Instrument, debug, error, info_span};
@@ -61,6 +63,96 @@ impl CertMode {
 /// Generous, so that clients on lossy high-latency links still get through.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The most raw bytes that a connection may send before its TLS handshake has ended: 16,384, one
+/// full TLS record of plaintext. The TLS library keeps a handshake message that it is sent in
+/// pieces until the message ends, up to 64 KiB of raw bytes, and the time limit above alone lets
+/// every connection that stands in its handshake hold that for as long as the limit runs. An honest
+/// handshake sends far less: the largest `ClientHello` that common clients send, with key shares
+/// for X25519 and ML-KEM-768 together, extensions, a pre-shared key and the encrypted-hello
+/// extension, is under 2.5 kB; with a second one after a `HelloRetryRequest`, the client's
+/// `Finished` and a first request that comes in the same read, a handshake stays under 8 kB, half
+/// of the figure. A connection that sends more is closed. The count is of the bytes read from the
+/// socket, record headers included, and stops when the handshake ends; the bytes after it are
+/// bounded by `READ_BOUND` in the idle bound, as plain bytes. As with `READ_BOUND`, it is a
+/// threshold at which the connection is closed: the read that crosses it has been made, and one
+/// read is at most 4 KiB while no message is being joined.
+pub(super) const HANDSHAKE_READ_BOUND: usize = 16_384;
+
+/// A connection's socket as the TLS acceptor reads it: it counts the raw bytes read until the
+/// handshake has ended, and fails once more than [`HANDSHAKE_READ_BOUND`] have been read.
+#[derive(Debug)]
+pub(crate) struct Handshaking<I> {
+    inner: I,
+    /// The bytes read so far, or `None` once the handshake has ended.
+    read: Option<usize>,
+}
+
+impl<I> Handshaking<I> {
+    fn new(inner: I) -> Self {
+        Self {
+            inner,
+            read: Some(0),
+        }
+    }
+
+    /// Ends the count: the bytes read from now on are the connection's own.
+    fn end_handshake(&mut self) {
+        self.read = None;
+    }
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for Handshaking<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let (Poll::Ready(Ok(())), Some(read)) = (&polled, &mut this.read) {
+            *read = read.saturating_add(buf.filled().len().saturating_sub(before));
+            if *read > HANDSHAKE_READ_BOUND {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "connection sent more than it may before its TLS handshake ended",
+                )));
+            }
+        }
+        polled
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for Handshaking<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// TLS Certificate Authority acceptor.
 #[derive(Clone)]
 pub(crate) enum TlsAcceptor {
@@ -71,25 +163,29 @@ pub(crate) enum TlsAcceptor {
 impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> Accept<I, S>
     for TlsAcceptor
 {
-    type Stream = tokio_rustls::server::TlsStream<I>;
+    type Stream = tokio_rustls::server::TlsStream<Handshaking<I>>;
     type Service = S;
     type Future = BoxFuture<io::Result<(Self::Stream, Self::Service)>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
+        let stream = Handshaking::new(stream);
         let accept = match self {
             Self::LetsEncrypt(a) => a.accept(stream, service).boxed(),
             Self::Manual(a) => a.accept(stream, service).boxed(),
         };
         // The ACME acceptor has no handshake timeout of its own.
         async move {
-            tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, accept)
+            let accepted = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, accept)
                 .await
                 .unwrap_or_else(|_| {
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "TLS handshake timed out",
                     ))
-                })
+                });
+            let (mut stream, service) = accepted?;
+            stream.get_mut().0.end_handshake();
+            Ok((stream, service))
         }
         .boxed()
     }

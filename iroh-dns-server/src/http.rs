@@ -888,6 +888,54 @@ mod tests {
         Ok(())
     }
 
+    /// The start of a TLS `ClientHello` of `raw` bytes in all, the record's header included: one
+    /// record whose handshake header declares the largest message, 65,535 bytes, so that the TLS
+    /// library keeps what it is sent while it waits for the rest.
+    fn partial_client_hello(raw: usize) -> Vec<u8> {
+        let mut bytes = vec![0x16, 0x03, 0x01];
+        bytes.extend_from_slice(&u16::try_from(raw - 5).expect("one record").to_be_bytes());
+        bytes.extend_from_slice(&[0x01, 0x00, 0xff, 0xff]);
+        bytes.resize(raw, 0);
+        bytes
+    }
+
+    /// A connection that is still in its TLS handshake may send 16,384 bytes and no more: the
+    /// TLS library holds a message that it is sent in pieces, up to 64 KiB, until the message
+    /// ends, and the handshake's time limit alone would let every held connection hold that for 30
+    /// seconds. With the figure sent the connection stays open; one byte more and it is closed.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_tls_handshake_past_the_bound_is_closed() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server =
+            Server::spawn_for_tests_with_options(dir.path(), None, None, Some(https_config()))
+                .await?;
+        let addr = server.https_addr().expect("https is bound");
+
+        let mut stream = TcpStream::connect(addr).await.anyerr()?;
+        stream
+            .write_all(&partial_client_hello(16_384))
+            .await
+            .anyerr()?;
+        assert_open(&mut stream).await;
+        // The first byte of the next record, which the TLS library would wait on.
+        stream.write_all(&[0x16]).await.anyerr()?;
+        let mut buf = [0; 1];
+        let read = tokio::time::timeout(CLOSE_DEADLINE, stream.read(&mut buf))
+            .await
+            .std_context("a connection that sent past the handshake's bound was held")?;
+        assert!(
+            matches!(&read, Ok(0))
+                || read
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+            "expected the server to close the connection: {read:?}"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// An HTTP/2 connection with no request open is closed, whatever its peer sends.
     #[tokio::test]
     #[traced_test]

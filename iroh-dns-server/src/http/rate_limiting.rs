@@ -1,17 +1,32 @@
 use std::{
+    hash::{BuildHasher, RandomState},
     net::{IpAddr, Ipv6Addr},
-    sync::Arc,
+    num::{NonZeroU32, NonZeroUsize},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
-use governor::{clock::QuantaInstant, middleware::NoOpMiddleware};
-use http::Request;
+use axum::{body::Body, extract::State, middleware::Next, response::Response};
+use governor::{
+    Quota as GovernorQuota, RateLimiter,
+    clock::{Clock, DefaultClock, QuantaInstant},
+    middleware::NoOpMiddleware,
+    nanos::Nanos,
+    state::{StateStore, keyed::ShrinkableKeyedStateStore},
+};
+use http::{HeaderMap, Request};
+use iroh_metrics::Gauge;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use tower_governor::{
-    GovernorError, GovernorLayer,
-    governor::GovernorConfigBuilder,
+    GovernorError,
     key_extractor::{KeyExtractor, PeerIpKeyExtractor, SmartIpKeyExtractor},
 };
+
+use crate::metrics::Metrics;
 
 /// Rate limiting strategy for the HTTP server.
 #[derive(Debug, Deserialize, Default, Serialize, Clone)]
@@ -74,14 +89,152 @@ pub(super) const LOOKUP_QUOTA: Quota = Quota {
     burst: 100,
 };
 
-/// Create the rate-limiting layer for publications, which keys on the network of the connection's
-/// peer address and never reads forwarding headers.
+/// How many shards a limiter's store has. Each has a lock of its own, so that requests from
+/// different sources do not wait for one another.
+const SHARDS: usize = 64;
+
+/// The most entries a limiter's store holds, one for each source network: 131,072, which is
+/// [`SHARD_CAPACITY`] in each of the [`SHARDS`] shards.
+const STORE_CAPACITY: usize = 131_072;
+
+/// The most entries one shard holds: 2,048.
+const SHARD_CAPACITY: usize = STORE_CAPACITY / SHARDS;
+
+/// The state of the sources of one limiter, with a cap.
 ///
-/// This spawns a background thread to clean up the rate limiting cache.
-pub(super) fn create<RespBody>(
+/// Each of the [`SHARDS`] shards holds the most recently used [`SHARD_CAPACITY`] sources, and a
+/// source that arrives at a full shard removes the one that was used least recently. A source is
+/// used when it sends a request, whether the limiter lets the request through or refuses it, so a
+/// source that keeps sending, a refused one included, is not the one that goes.
+///
+/// The shard of a source is chosen by a hash with a key that is made when the store is, and each
+/// shard's table has a hash with a key of its own. A sender cannot see either key, so it cannot
+/// choose the shard its sources fall in, and what it can do to the one shard that its sources reach
+/// is the same as what it can do to any other: to remove one given entry from its shard it needs
+/// [`SHARD_CAPACITY`] other sources that reach that shard after the entry's last use, which are
+/// about [`STORE_CAPACITY`] distinct source networks in all. When an entry is removed, its source
+/// is met as a source that has not been seen: it may send one burst, which is at most one fresh
+/// burst for each entry removed.
+///
+/// A shard's table is made for [`SHARD_CAPACITY`] entries, and under churn (entries that come and
+/// go) it may grow to a table of 8,192 buckets before it is made again, so a limiter's store takes
+/// about 16.5 MiB when it is full: 131,072 entries of about 64 bytes, and up to 64 tables of 8,192
+/// buckets of 17 bytes. The count of entries is exported (`rate_limit_lookup_entries` and
+/// `rate_limit_put_entries`).
+///
+/// There is no sweep that removes the entries of sources that have gone quiet: when a shard is
+/// full the entry that goes is the one used least recently, which is not always the one that has
+/// expired. An entry that is indebted can go before a newer entry that has expired.
+#[derive(Clone)]
+pub(super) struct Store {
+    inner: Arc<StoreInner>,
+}
+
+struct StoreInner {
+    shards: Vec<Mutex<LruCache<IpAddr, Nanos, RandomState>>>,
+    /// Chooses the shard of a source.
+    chooser: RandomState,
+    /// The entries of all shards.
+    len: AtomicUsize,
+}
+
+impl Store {
+    /// A store of the size that the limiters use.
+    pub(super) fn new() -> Self {
+        Self::with_shards(SHARDS, SHARD_CAPACITY)
+    }
+
+    /// A store of `shards` shards that hold `capacity` entries each.
+    fn with_shards(shards: usize, capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity).expect("a shard holds at least one entry");
+        Self {
+            inner: Arc::new(StoreInner {
+                shards: (0..shards)
+                    .map(|_| Mutex::new(LruCache::with_hasher(capacity, RandomState::new())))
+                    .collect(),
+                chooser: RandomState::new(),
+                len: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn shard(&self, key: &IpAddr) -> &Mutex<LruCache<IpAddr, Nanos, RandomState>> {
+        let hash = self.inner.chooser.hash_one(key);
+        &self.inner.shards[(hash % self.inner.shards.len() as u64) as usize]
+    }
+}
+
+impl StateStore for Store {
+    type Key = IpAddr;
+
+    fn measure_and_replace<T, F, E>(&self, key: &IpAddr, f: F) -> Result<T, E>
+    where
+        F: Fn(Option<Nanos>) -> Result<(T, Nanos), E>,
+    {
+        let mut shard = self
+            .shard(key)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // `get` makes the entry the most recently used, whether or not the request is refused.
+        let before = shard.get(key).copied();
+        let (outcome, after) = f(before)?;
+        let held = shard.len();
+        shard.put(*key, after);
+        if shard.len() > held {
+            self.inner.len.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(outcome)
+    }
+}
+
+impl ShrinkableKeyedStateStore<IpAddr> for Store {
+    /// Nothing is removed by age: the store's own cap bounds it.
+    fn retain_recent(&self, _drop_below: Nanos) {}
+
+    fn len(&self) -> usize {
+        self.inner.len.load(Ordering::Relaxed)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A request limit: the key of a request, the quota of its source and the state of the sources.
+pub(super) struct Limiter {
+    source: SourceNetwork,
+    limiter: RateLimiter<IpAddr, Store, DefaultClock, NoOpMiddleware<QuantaInstant>>,
+    metrics: Arc<Metrics>,
+    /// The gauge of the number of entries of this limiter's store.
+    entries: fn(&Metrics) -> &Gauge,
+}
+
+impl Limiter {
+    fn new(
+        source: SourceNetwork,
+        quota: Quota,
+        metrics: Arc<Metrics>,
+        entries: fn(&Metrics) -> &Gauge,
+    ) -> Arc<Self> {
+        let quota = GovernorQuota::with_period(quota.replenish)
+            .expect("a period above zero")
+            .allow_burst(NonZeroU32::new(quota.burst).expect("a burst above zero"));
+        Arc::new(Self {
+            source,
+            limiter: RateLimiter::new(quota, Store::new(), DefaultClock::default()),
+            metrics,
+            entries,
+        })
+    }
+}
+
+/// Create the rate limit for publications, which keys on the network of the connection's peer
+/// address and never reads forwarding headers.
+pub(super) fn create(
     rate_limit_config: &RateLimitConfig,
     quota: Quota,
-) -> Option<GovernorLayer<SourceNetwork, NoOpMiddleware<QuantaInstant>, RespBody>> {
+    metrics: &Arc<Metrics>,
+) -> Option<Arc<Limiter>> {
     match rate_limit_config {
         RateLimitConfig::Disabled => {
             tracing::info!("Rate limiting disabled");
@@ -89,23 +242,24 @@ pub(super) fn create<RespBody>(
         }
         RateLimitConfig::Simple | RateLimitConfig::Smart => {
             tracing::info!("Rate limiting enabled ({rate_limit_config:?})");
-            Some(layer(
+            Some(Limiter::new(
                 SourceNetwork {
                     trust_forwarding_headers: false,
                 },
                 quota,
+                metrics.clone(),
+                |metrics| &metrics.rate_limit_put_entries,
             ))
         }
     }
 }
 
-/// Create the rate-limiting layer for lookups, which keys on the source's network.
-///
-/// This spawns a background thread to clean up the rate limiting cache.
-pub(super) fn create_lookup<RespBody>(
+/// Create the rate limit for lookups, which keys on the source's network.
+pub(super) fn create_lookup(
     rate_limit_config: &RateLimitConfig,
     quota: Quota,
-) -> Option<GovernorLayer<SourceNetwork, NoOpMiddleware<QuantaInstant>, RespBody>> {
+    metrics: &Arc<Metrics>,
+) -> Option<Arc<Limiter>> {
     let trust_forwarding_headers = match rate_limit_config {
         RateLimitConfig::Disabled => {
             tracing::info!("Lookup rate limiting disabled");
@@ -115,44 +269,47 @@ pub(super) fn create_lookup<RespBody>(
         RateLimitConfig::Smart => true,
     };
     tracing::info!("Lookup rate limiting enabled ({rate_limit_config:?})");
-    Some(layer(
+    Some(Limiter::new(
         SourceNetwork {
             trust_forwarding_headers,
         },
         quota,
+        metrics.clone(),
+        |metrics| &metrics.rate_limit_lookup_entries,
     ))
 }
 
-fn layer<K, RespBody>(
-    key_extractor: K,
-    quota: Quota,
-) -> GovernorLayer<K, NoOpMiddleware<QuantaInstant>, RespBody>
-where
-    K: KeyExtractor,
-    K::Key: Send + Sync + 'static,
-{
-    let mut builder = GovernorConfigBuilder::default();
-    builder.period(quota.replenish);
-    builder.burst_size(quota.burst);
-    let governor_conf = builder
-        .key_extractor(key_extractor)
-        .finish()
-        .expect("failed to build rate-limiting governor");
-
-    let governor_conf = Arc::new(governor_conf);
-
-    // The governor needs a background task for garbage collection (to clear expired records)
-    let gc_interval = Duration::from_secs(60);
-    let governor_limiter = governor_conf.limiter().clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(gc_interval);
-            tracing::debug!("rate limiting storage size: {}", governor_limiter.len());
-            governor_limiter.retain_recent();
+/// The limit as a layer: a request from a source that is within its quota goes on, and one from a
+/// source that is over it is answered `429` with the headers `x-ratelimit-after` and `retry-after`
+/// that say how many whole seconds to wait. A request whose source cannot be found is answered
+/// `500`.
+pub(super) async fn limit(
+    State(limiter): State<Arc<Limiter>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let key = match limiter.source.extract(&request) {
+        Ok(key) => key,
+        Err(error) => return error.into(),
+    };
+    let checked = limiter.limiter.check_key(&key);
+    (limiter.entries)(&limiter.metrics).set(limiter.limiter.len() as i64);
+    match checked {
+        Ok(()) => next.run(request).await,
+        Err(negative) => {
+            let wait_time = negative
+                .wait_time_from(limiter.limiter.clock().now())
+                .as_secs();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ratelimit-after", wait_time.into());
+            headers.insert("retry-after", wait_time.into());
+            GovernorError::TooManyRequests {
+                wait_time,
+                headers: Some(headers),
+            }
+            .into()
         }
-    });
-
-    GovernorLayer::new(governor_conf)
+    }
 }
 
 /// A key extractor that puts every address of one network in the same bucket: an IPv4 address is
@@ -200,6 +357,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use axum::extract::ConnectInfo;
+    use governor::clock::FakeRelativeClock;
+    use tower_service::Service;
 
     use super::*;
 
@@ -287,5 +446,176 @@ mod tests {
             behind_a_proxy.extract(&request).expect("a key"),
             ip("198.51.100.4")
         );
+    }
+
+    type FakeLimiter = RateLimiter<IpAddr, Store, FakeRelativeClock, NoOpMiddleware<Nanos>>;
+
+    /// A limiter with two requests at once and one more each second, on a store of `shards` shards
+    /// of `capacity` entries, and its clock, which only moves when a case moves it.
+    fn limiter(shards: usize, capacity: usize) -> (FakeLimiter, FakeRelativeClock) {
+        let clock = FakeRelativeClock::default();
+        let quota = GovernorQuota::with_period(Duration::from_secs(1))
+            .expect("a period")
+            .allow_burst(NonZeroU32::new(2).expect("a burst"));
+        (
+            RateLimiter::new(quota, Store::with_shards(shards, capacity), clock.clone()),
+            clock,
+        )
+    }
+
+    /// The `n`th source of a run of distinct IPv4 networks.
+    fn source(n: usize) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + n as u32))
+    }
+
+    fn allowed(limiter: &FakeLimiter, key: &IpAddr) -> bool {
+        limiter.check_key(key).is_ok()
+    }
+
+    /// The store holds at most its capacity, however many sources send.
+    #[test]
+    fn the_store_holds_at_most_its_capacity_however_many_sources_send() {
+        let limiter: FakeLimiter = RateLimiter::new(
+            GovernorQuota::with_period(Duration::from_secs(1)).expect("a period"),
+            Store::new(),
+            FakeRelativeClock::default(),
+        );
+        for n in 0..3 * STORE_CAPACITY {
+            assert!(limiter.check_key(&source(n)).is_ok());
+            assert!(limiter.len() <= STORE_CAPACITY, "{} entries", limiter.len());
+        }
+        // Three times the capacity of sources fill every shard.
+        assert_eq!(limiter.len(), STORE_CAPACITY);
+    }
+
+    /// A source that is refused is still a source in use: while others come and go it stays in
+    /// the store, indebted, as long as it keeps sending.
+    #[test]
+    fn a_refused_source_stays_indebted_while_others_come_and_go() {
+        let (limiter, _clock) = limiter(64, 2_048);
+        let refused = source(1_000_000);
+        assert!(allowed(&limiter, &refused));
+        assert!(allowed(&limiter, &refused));
+        assert!(!allowed(&limiter, &refused));
+        for n in 0..3 * STORE_CAPACITY {
+            assert!(allowed(&limiter, &source(n)));
+            if n % 1_000 == 0 {
+                assert!(!allowed(&limiter, &refused), "forgotten after {n} sources");
+            }
+        }
+        assert!(!allowed(&limiter, &refused));
+    }
+
+    /// The source that goes is the one used least recently, and it meets a store that has not seen
+    /// it: one burst, and no more.
+    #[test]
+    fn an_entry_that_goes_gives_its_source_one_fresh_burst_and_no_more() {
+        let (limiter, _clock) = limiter(1, 3);
+        let first = source(1);
+        assert!(allowed(&limiter, &first));
+        assert!(allowed(&limiter, &first));
+        assert!(!allowed(&limiter, &first));
+        for n in 2..5 {
+            assert!(allowed(&limiter, &source(n)));
+        }
+        assert!(allowed(&limiter, &first), "its entry was not removed");
+        assert!(allowed(&limiter, &first));
+        assert!(!allowed(&limiter, &first), "more than one fresh burst");
+    }
+
+    /// Without a sweep, the entry that goes is the one used least recently, even when it is
+    /// indebted and a newer one has expired.
+    #[test]
+    fn the_entry_used_least_recently_goes_even_when_a_newer_one_has_expired() {
+        let (limiter, clock) = limiter(1, 3);
+        let (indebted, expired) = (source(1), source(2));
+        assert!(allowed(&limiter, &indebted));
+        assert!(allowed(&limiter, &indebted));
+        assert!(!allowed(&limiter, &indebted));
+        assert!(allowed(&limiter, &expired));
+        // The expired source's debt is over, the other's is not: one request more is let through
+        // and the next is not.
+        clock.advance(Duration::from_secs(1));
+        assert!(allowed(&limiter, &source(3)));
+        assert!(allowed(&limiter, &source(4)));
+        // `indebted` was the oldest of the entries that were in the store, so it was removed and
+        // starts again, with a whole burst.
+        assert!(allowed(&limiter, &indebted), "its entry was not removed");
+        assert!(allowed(&limiter, &indebted), "it did not get a whole burst");
+    }
+
+    fn metrics() -> Arc<Metrics> {
+        Arc::default()
+    }
+
+    async fn status_and_body(
+        router: &mut axum::Router,
+        request: Request<Body>,
+    ) -> (u16, HeaderMap, String) {
+        let response =
+            std::future::poll_fn(|cx| Service::<Request<Body>>::poll_ready(router, cx)).await;
+        assert!(response.is_ok());
+        let response = Service::call(router, request).await.expect("an answer");
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("a body");
+        (
+            parts.status.as_u16(),
+            parts.headers,
+            String::from_utf8(body.to_vec()).expect("a text"),
+        )
+    }
+
+    /// The limit lets a source within its quota through and answers one over it as the library's
+    /// own layer did: `429`, the two headers with the same whole number of seconds, and the
+    /// body that names it. A request whose source is unknown is answered `500`.
+    #[tokio::test]
+    async fn the_limit_answers_a_refusal_with_the_libraries_headers_and_body() {
+        let metrics = metrics();
+        let quota = Quota {
+            replenish: Duration::from_secs(4),
+            burst: 1,
+        };
+        let limiter =
+            create(&RateLimitConfig::Simple, quota, &metrics).expect("rate limiting is enabled");
+        let mut router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "through" }))
+            .route_layer(axum::middleware::from_fn_with_state(limiter, limit));
+        let from = |peer: &str| {
+            let mut request = Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("a request");
+            request.extensions_mut().insert(ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().expect("an address"),
+            ));
+            request
+        };
+
+        let (status, _, body) = status_and_body(&mut router, from("203.0.113.9:1000")).await;
+        assert_eq!((status, body.as_str()), (200, "through"));
+        assert_eq!(metrics.rate_limit_put_entries.get(), 1);
+
+        let (status, headers, body) = status_and_body(&mut router, from("203.0.113.9:1001")).await;
+        assert_eq!(status, 429);
+        let after = headers.get("x-ratelimit-after").expect("a header");
+        assert_eq!(headers.get("retry-after"), Some(after));
+        let wait: u64 = after.to_str().expect("a text").parse().expect("a number");
+        assert!(wait <= 4, "{wait}");
+        assert_eq!(body, format!("Too Many Requests! Wait for {wait}s"));
+
+        // Another source is not held back by it.
+        let (status, _, _) = status_and_body(&mut router, from("203.0.113.10:1000")).await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics.rate_limit_put_entries.get(), 2);
+
+        // A request with no peer address has no source.
+        let request = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("a request");
+        let (status, _, body) = status_and_body(&mut router, request).await;
+        assert_eq!((status, body.as_str()), (500, "Unable To Extract Key!"));
     }
 }

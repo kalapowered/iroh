@@ -25,6 +25,12 @@ pub struct Metrics {
     /// in the drain, a request head that did not end, or a client that did not acknowledge the
     /// shutdown. The server ends each of them. The stop on bytes read is not counted here.
     pub http_connections_drain_timeouts: Counter,
+    /// Current number of source networks that the lookup rate limit holds an entry for. It never
+    /// passes the most that the store holds, 131,072.
+    pub rate_limit_lookup_entries: Gauge,
+    /// Current number of source networks that the publication rate limit holds an entry for. It
+    /// never passes the most that the store holds, 131,072.
+    pub rate_limit_put_entries: Gauge,
     /// Total number of DNS requests across all transports.
     pub dns_requests: Counter,
     /// Number of DNS requests received over UDP.

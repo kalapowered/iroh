@@ -9,7 +9,6 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{Method, StatusCode},
     middleware::{self, Next},
@@ -480,8 +479,9 @@ fn create_app_with_quotas(
     });
 
     // configure rate limiting middleware
-    let put_limit = rate_limiting::create(&rate_limits.pkarr_put, put_quota);
-    let lookup_limit = rate_limiting::create_lookup::<Body>(&rate_limits.lookup, lookup_quota);
+    let put_limit = rate_limiting::create(&rate_limits.pkarr_put, put_quota, &state.metrics);
+    let lookup_limit =
+        rate_limiting::create_lookup(&rate_limits.lookup, lookup_quota, &state.metrics);
 
     // configure routes
     //
@@ -492,6 +492,7 @@ fn create_app_with_quotas(
     let mut dns_query = get(doh::get).post(doh::post);
     let mut pkarr_get = get(pkarr::get);
     if let Some(limit) = lookup_limit {
+        let limit = middleware::from_fn_with_state(limit, rate_limiting::limit);
         let count = middleware::from_fn_with_state(state.clone(), count_refused_lookups);
         dns_query = dns_query
             .route_layer(limit.clone())
@@ -500,7 +501,8 @@ fn create_app_with_quotas(
     }
     let mut pkarr_put = put(pkarr::put);
     if let Some(limit) = put_limit {
-        pkarr_put = pkarr_put.route_layer(limit);
+        pkarr_put =
+            pkarr_put.route_layer(middleware::from_fn_with_state(limit, rate_limiting::limit));
     }
     // The bodies are read whole, so each route that takes one says how large it may be. The
     // default of axum is 2 MiB, which a sender could make the server hold for every connection.

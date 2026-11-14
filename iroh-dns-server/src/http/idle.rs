@@ -67,12 +67,21 @@ pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 /// group's peak with the cap of connections, each of them in the shapes that held the most (the
 /// table in `FORK.md`).
 ///
-/// A connection that has read more than this takes no further request: the request in whose bytes
-/// the figure was passed, and the ones in progress by then, are answered, and a request that starts
-/// after that closes the connection as the bound on reads between two starts does. With no request
-/// in progress the connection then stands for [`SPENT_IDLE_TIMEOUT`] at most, which lets the answer
-/// that has just been made reach the socket. A client that keeps one connection for many requests
-/// meets a closed connection after about this many bytes, and opens a new one.
+/// A connection that has read more than this takes no further request, in three rules:
+///
+/// - The request in whose bytes the figure was passed, and the requests in progress by then, are
+///   answered. A request that starts after that one is refused: the connection ends at its next
+///   operation, as it does when it reads more than [`READ_BOUND`] between two starts.
+/// - With no request in progress, the connection stands for [`SPENT_IDLE_TIMEOUT`] at most, not
+///   for [`IDLE_TIMEOUT`]. The allowance is not zero, because an answer is written after the
+///   request that made it has ended. The read that passes the figure starts it when no request is
+///   in progress, so a request that is read in the same bytes and starts a moment later is not met
+///   with an allowance that ran from the end of the last one.
+/// - So a connection that has used its budget ends within that allowance, or within the request
+///   deadline when a request is in progress, and gives back its place among the connections.
+///
+/// A client that keeps one connection for many requests meets a closed connection after about
+/// this many bytes, and opens a new one.
 pub(super) const LIFETIME_READ_BOUND: usize = 48 * 1024;
 
 /// How long a connection that has read [`LIFETIME_READ_BOUND`] may stand with no request in
@@ -904,6 +913,38 @@ mod tests {
             read_ends(&mut stream).await.is_some(),
             "the connection did not end"
         );
+        drop((stream, client));
+        assert_eq!(connections.held(), 0);
+        let (_client, server) = tokio::io::duplex(1024);
+        bound
+            .accept(server, Gated(Arc::new(Notify::new())))
+            .await
+            .expect("the place was not given back");
+    }
+
+    /// A connection that has used its budget and sends nothing more is closed at the allowance of
+    /// one that has, which is not the idle time of the others, and gives back its place.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_connection_that_has_used_its_budget_is_closed_and_gives_back_its_place() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let connections = Connections::new(1, Default::default());
+        let bound = IdleBound::new(DefaultAcceptor, connections.clone());
+        let (mut stream, _service): (IdleStream<DuplexStream>, Tracked<Gated>) = bound
+            .accept(server, Gated(Arc::new(Notify::new())))
+            .await
+            .expect("the acceptor passes the connection on");
+        stream.shared.state().lifetime = LIFETIME_READ_BOUND - 100;
+        read_bytes(&mut client, &mut stream, 200)
+            .await
+            .expect("the bytes that pass the budget were refused");
+        assert!(stream.shared.state().spent());
+        assert!(read_ends(&mut stream).await.is_none(), "closed at once");
+
+        advance(SPENT_IDLE_TIMEOUT).await;
+        let error = read_ends(&mut stream)
+            .await
+            .expect("not closed at the allowance");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         drop((stream, client));
         assert_eq!(connections.held(), 0);
         let (_client, server) = tokio::io::duplex(1024);

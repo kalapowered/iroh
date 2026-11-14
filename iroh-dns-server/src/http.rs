@@ -2008,6 +2008,314 @@ mod tests {
         Ok(())
     }
 
+    /// The server's own listener, bounded as the server's are, with two routes that record the
+    /// requests that run and the peer that sent each: `GET /n/{id}`, and `POST /hold`, which runs
+    /// once its body is whole.
+    struct Recording {
+        addr: SocketAddr,
+        ran: Arc<std::sync::Mutex<Vec<(String, SocketAddr)>>>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl Recording {
+        fn start() -> n0_error::Result<Self> {
+            use axum::{
+                Router,
+                body::Bytes,
+                extract::{ConnectInfo, Path},
+                routing::{get, post},
+            };
+
+            let ran: Arc<std::sync::Mutex<Vec<(String, SocketAddr)>>> = Arc::default();
+            let recorder = ran.clone();
+            let numbered = get(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>, Path(id): Path<String>| async move {
+                    recorder.lock().unwrap().push((id, peer));
+                    "OK"
+                },
+            );
+            let recorder = ran.clone();
+            let held = post(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>, _body: Bytes| async move {
+                    recorder.lock().unwrap().push(("hold".to_string(), peer));
+                    "OK"
+                },
+            );
+            let app = Router::new()
+                .route("/n/{id}", numbered)
+                .route("/hold", held);
+            let listener = super::bind_listener(
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+                super::DEFAULT_LISTEN_BACKLOG,
+            )
+            .anyerr()?;
+            let addr = listener.local_addr().anyerr()?;
+            let server = super::bounded_server(
+                listener,
+                axum_server::accept::DefaultAcceptor::new(),
+                super::idle::Connections::new(64, Default::default()),
+            )?;
+            let task =
+                tokio::spawn(server.serve(app.into_make_service_with_connect_info::<SocketAddr>()));
+            Ok(Self { addr, ran, task })
+        }
+
+        fn ran(&self) -> Vec<(String, SocketAddr)> {
+            self.ran.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// A raw HTTP/2 connection to `addr` that has sent requests until it is at most 6,000 bytes
+    /// short of its budget, and the number of bytes that pass the budget when sent.
+    async fn h2_peer_near_the_budget(addr: SocketAddr) -> n0_error::Result<(raw_h2::Peer, usize)> {
+        let mut peer = raw_h2::Peer::connect(addr).await?;
+        // the preface, the peer's settings and the acknowledgement of the server's
+        let mut sent = raw_h2::PREFACE.len() + 18;
+        let extra = [("x-pad", "a".repeat(3_000))];
+        let block = raw_h2::request_block("GET", "/n/p", &extra);
+        while super::idle::LIFETIME_READ_BOUND + 1 - sent > 6_000 {
+            let stream = peer.request("GET", "/n/p", &extra, true).await?;
+            sent += raw_h2::frame(raw_h2::HEADERS, 5, stream, &block).len();
+            h2_answer(&mut peer, stream).await?;
+        }
+        Ok((peer, super::idle::LIFETIME_READ_BOUND + 1 - sent))
+    }
+
+    /// The frames of the answer on `stream`, up to the one that ends it. A reset is an error.
+    async fn h2_answer(
+        peer: &mut raw_h2::Peer,
+        stream: u32,
+    ) -> n0_error::Result<Vec<raw_h2::Frame>> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = peer.next_frame().await?;
+            if frame.stream != stream {
+                continue;
+            }
+            if frame.kind == raw_h2::RST_STREAM {
+                n0_error::bail_any!("stream {stream} was reset with {:?}", frame.reset_code());
+            }
+            let ends = frame.flags & raw_h2::END_STREAM != 0;
+            frames.push(frame);
+            if ends {
+                return Ok(frames);
+            }
+        }
+    }
+
+    /// The answer to one request on a raw HTTP/1 connection, up to its body `OK`.
+    async fn h1_answer(stream: &mut TcpStream) -> n0_error::Result<String> {
+        let mut answer = Vec::new();
+        let mut buf = [0u8; 512];
+        while !answer.ends_with(b"\r\n\r\nOK") {
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .std_context("no answer")?
+                .anyerr()?;
+            if n == 0 {
+                n0_error::bail_any!("the connection ended with {answer:?}");
+            }
+            answer.extend_from_slice(&buf[..n]);
+        }
+        Ok(String::from_utf8_lossy(&answer).into_owned())
+    }
+
+    /// A request in progress when the next request is refused is answered whole, its body and its
+    /// end included, and the refused request's handler does not run: it is reset as refused.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_request_in_progress_is_answered_whole_when_the_next_is_refused()
+    -> n0_error::Result {
+        let server = Recording::start()?;
+        let (mut peer, left) = h2_peer_near_the_budget(server.addr).await?;
+
+        // The head of the first request passes the budget, and its body is still to come.
+        let first = peer
+            .request(
+                "POST",
+                "/hold",
+                &[
+                    ("content-length", "4".to_string()),
+                    ("x-pad", "a".repeat(left + 50)),
+                ],
+                false,
+            )
+            .await?;
+        let second = peer.request("GET", "/n/refused", &[], true).await?;
+        loop {
+            let frame = peer.next_frame().await?;
+            if frame.stream == second {
+                assert_eq!(
+                    frame.kind,
+                    raw_h2::RST_STREAM,
+                    "the second request was answered"
+                );
+                assert_eq!(frame.reset_code(), Some(raw_h2::REFUSED_STREAM));
+                break;
+            }
+        }
+        peer.data(first, b"abcd", true).await?;
+        let frames = h2_answer(&mut peer, first).await?;
+        assert_eq!(frames[0].kind, raw_h2::HEADERS);
+        assert_eq!(frames[0].status(), Some(200));
+        let last = frames.last().expect("the answer has frames");
+        assert_eq!(last.kind, raw_h2::DATA, "the answer has no body");
+        assert_eq!(last.payload, b"OK");
+
+        // The connection ends at the allowance after the request in progress.
+        advance(super::idle::SPENT_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            peer.ended_within(CLOSE_DEADLINE).await,
+            "the connection stood on"
+        );
+        let ran = server.ran();
+        assert!(
+            ran.iter().all(|(id, _)| id != "refused"),
+            "the handler of the refused request ran"
+        );
+        assert_eq!(ran.iter().filter(|(id, _)| id == "hold").count(), 1);
+        Ok(())
+    }
+
+    /// A head whose first part passes the budget and whose rest comes two seconds later is
+    /// answered: the connection stands under the ordinary idle time while the head is in transit.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_head_in_transit_when_the_budget_is_passed_is_answered() -> n0_error::Result
+    {
+        let server = Recording::start()?;
+        let (mut peer, left) = h2_peer_near_the_budget(server.addr).await?;
+
+        let extra = [("x-pad", "a".repeat(left + 50))];
+        let (stream, rest) = peer
+            .request_in_parts("GET", "/n/slow", &extra, left + 20)
+            .await?;
+        // The server reads the first part, which passes the budget, before the clock moves.
+        while peer
+            .frame_within(Duration::from_millis(50))
+            .await?
+            .is_some()
+        {}
+        advance(Duration::from_secs(2)).await;
+        peer.finish_block(stream, &rest).await?;
+        let frames = h2_answer(&mut peer, stream).await?;
+        assert_eq!(frames[0].status(), Some(200));
+        Ok(())
+    }
+
+    /// The same over HTTP/1, where the answer to the request whose head passed the budget says
+    /// that the connection closes, and an answer before it does not.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http1_head_in_transit_when_the_budget_is_passed_is_answered() -> n0_error::Result
+    {
+        let server = Recording::start()?;
+        let mut stream = TcpStream::connect(server.addr).await.anyerr()?;
+        let request = format!(
+            "GET /n/p HTTP/1.1\r\nhost: localhost\r\nx-pad: {}\r\n\r\n",
+            "a".repeat(3_000)
+        );
+        let mut sent = 0;
+        while super::idle::LIFETIME_READ_BOUND + 1 - sent > 6_000 {
+            stream.write_all(request.as_bytes()).await.anyerr()?;
+            let answer = h1_answer(&mut stream).await?;
+            assert!(
+                !answer.to_ascii_lowercase().contains("connection: close"),
+                "an answer under the budget says that the connection closes"
+            );
+            sent += request.len();
+        }
+        let left = super::idle::LIFETIME_READ_BOUND + 1 - sent;
+        let head = format!(
+            "GET /n/slow HTTP/1.1\r\nhost: localhost\r\nx-pad: {}",
+            "a".repeat(left + 50)
+        );
+        stream.write_all(head.as_bytes()).await.anyerr()?;
+        // The server reads the first part, which passes the budget, before the clock moves.
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf))
+                .await
+                .is_err(),
+            "the server answered a head that is not whole"
+        );
+        advance(Duration::from_secs(2)).await;
+        stream.write_all(b"\r\n\r\n").await.anyerr()?;
+        let answer = h1_answer(&mut stream).await?;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(
+            answer.to_ascii_lowercase().contains("connection: close"),
+            "the answer does not say that the connection closes: {answer}"
+        );
+        Ok(())
+    }
+
+    /// An ordinary client that keeps its connections sends requests across the budget three
+    /// times: its caller sees no error, no request runs twice, and the request that meets a spent
+    /// connection is answered on a new one.
+    async fn an_ordinary_client_is_served_across_the_budget(
+        client: reqwest::Client,
+    ) -> n0_error::Result {
+        let server = Recording::start()?;
+        let mut requests = 0;
+        let mut reached = None;
+        loop {
+            let url = format!("http://{}/n/{requests}", server.addr);
+            let response = client.get(url).send().await.anyerr()?;
+            assert_eq!(response.status(), 200, "request {requests}");
+            assert_eq!(response.text().await.anyerr()?, "OK");
+            requests += 1;
+            let ran = server.ran();
+            let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
+            if peers.len() == 4 && reached.is_none() {
+                reached = Some(requests);
+            }
+            if reached.is_some_and(|at| requests >= at + 5) {
+                break;
+            }
+            assert!(
+                requests < 20_000,
+                "{} connections in {requests} requests",
+                peers.len()
+            );
+        }
+        let ran = server.ran();
+        let ids: Vec<_> = ran.iter().map(|(id, _)| id.clone()).collect();
+        let expected: Vec<_> = (0..requests).map(|n| n.to_string()).collect();
+        assert_eq!(ids, expected, "each request runs once, in order");
+        let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
+        assert_eq!(peers.len(), 4, "connections that served the requests");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http1_ordinary_client_is_served_across_the_lifetime_budget() -> n0_error::Result {
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .use_preconfigured_tls(self::tls::insecure_tls_config())
+            .build()
+            .anyerr()?;
+        an_ordinary_client_is_served_across_the_budget(client).await
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_ordinary_client_is_served_across_the_lifetime_budget() -> n0_error::Result {
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .use_preconfigured_tls(self::tls::insecure_tls_config())
+            .build()
+            .anyerr()?;
+        an_ordinary_client_is_served_across_the_budget(client).await
+    }
+
     /// A DNS query as large as the stream's window is read and answered `200`, and one frame past
     /// the window is a flow-control error on that stream.
     #[tokio::test]

@@ -24,7 +24,7 @@ pub(super) const UNDEFINED: u8 = 0xfa;
 
 pub(super) const END_STREAM: u8 = 0x1;
 pub(super) const ACK: u8 = 0x1;
-const END_HEADERS: u8 = 0x4;
+pub(super) const END_HEADERS: u8 = 0x4;
 
 pub(super) const FLOW_CONTROL_ERROR: u32 = 3;
 pub(super) const REFUSED_STREAM: u32 = 7;
@@ -270,6 +270,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         for _ in 0..continuations {
             let _ = self.send(CONTINUATION, 0, stream, &[0; 16_384]).await;
         }
+    }
+
+    /// Sends the first `first` bytes of a request's header block on a new stream, without
+    /// `END_HEADERS`, and gives the stream's number and the rest of the block, which
+    /// `finish_block` sends.
+    pub(super) async fn request_in_parts(
+        &mut self,
+        method: &str,
+        path: &str,
+        extra: &[(&str, String)],
+        first: usize,
+    ) -> Result<(u32, Vec<u8>)> {
+        let stream = self.next_stream;
+        self.next_stream += 2;
+        let block = request_block(method, path, extra);
+        self.send(HEADERS, END_STREAM, stream, &block[..first])
+            .await?;
+        Ok((stream, block[first..].to_vec()))
+    }
+
+    /// Sends `rest` as the last part of the header block that `request_in_parts` began.
+    pub(super) async fn finish_block(&mut self, stream: u32, rest: &[u8]) -> Result<()> {
+        self.send(CONTINUATION, END_HEADERS, stream, rest).await
     }
 
     /// Sends a `DATA` frame with `body`.

@@ -1899,6 +1899,115 @@ mod tests {
         Ok(())
     }
 
+    /// A client that keeps one connection and sends small requests one after another is answered
+    /// until the request in whose bytes the connection's budget is passed, answer included, and
+    /// the next request meets a closed connection; a new connection answers it. Over HTTP/1 the
+    /// figure is exact: every request has the same length.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http1_connection_is_answered_up_to_its_lifetime_budget() -> n0_error::Result {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+        let request = b"GET /healthcheck HTTP/1.1\r\nhost: localhost\r\n\r\n";
+
+        // Whether the server answers `request` on `stream` with all of a `200` and its body.
+        async fn answered(stream: &mut tokio::net::TcpStream, request: &[u8]) -> bool {
+            if stream.write_all(request).await.is_err() {
+                return false;
+            }
+            let mut answer = Vec::new();
+            let mut buf = [0u8; 256];
+            while !answer.ends_with(b"\r\n\r\nOK") {
+                match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => answer.extend_from_slice(&buf[..n]),
+                    _ => return false,
+                }
+            }
+            answer.starts_with(b"HTTP/1.1 200")
+        }
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        let mut count = 0;
+        while answered(&mut stream, request).await {
+            count += 1;
+            assert!(count < 10_000, "the connection was never closed");
+        }
+        assert_eq!(
+            count,
+            super::idle::LIFETIME_READ_BOUND / request.len() + 1,
+            "requests answered on one connection"
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        assert!(answered(&mut stream, request).await, "a new connection");
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The same over HTTP/2: the connection answers until its budget is passed and then ends, and
+    /// the figure counts what the peer sent from its first byte, the preface and its settings
+    /// included.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_http2_connection_is_answered_up_to_its_lifetime_budget() -> n0_error::Result {
+        let dir = tempfile::tempdir()?;
+        let server = Server::spawn_for_tests(dir.path()).await?;
+        let addr = server.http_addr().expect("http is bound");
+        let sent = |count: usize| {
+            // the preface, the peer's settings and the acknowledgement of the server's, then the requests
+            raw_h2::PREFACE.len()
+                + 18
+                + count
+                    * raw_h2::frame(
+                        raw_h2::HEADERS,
+                        5,
+                        1,
+                        &raw_h2::request_block("GET", "/healthcheck", &[]),
+                    )
+                    .len()
+        };
+
+        let mut peer = raw_h2::Peer::connect(addr).await?;
+        let mut count = 0;
+        'requests: loop {
+            let stream = peer.request("GET", "/healthcheck", &[], true).await?;
+            loop {
+                let Ok(frame) = peer.next_frame().await else {
+                    break 'requests;
+                };
+                if frame.kind == raw_h2::HEADERS && frame.stream == stream {
+                    assert_eq!(frame.status(), Some(200));
+                    break;
+                }
+            }
+            count += 1;
+            assert!(count < 10_000, "the connection was never closed");
+        }
+        assert!(
+            sent(count) > super::idle::LIFETIME_READ_BOUND,
+            "the connection ended after {count} requests, before its budget"
+        );
+        assert!(
+            sent(count - 1) <= super::idle::LIFETIME_READ_BOUND,
+            "the connection answered {count} requests, past its budget"
+        );
+        let mut peer = raw_h2::Peer::connect(addr).await?;
+        let stream = peer.request("GET", "/healthcheck", &[], true).await?;
+        loop {
+            let frame = peer.next_frame().await?;
+            if frame.kind == raw_h2::HEADERS && frame.stream == stream {
+                assert_eq!(frame.status(), Some(200), "a new connection");
+                break;
+            }
+        }
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A DNS query as large as the stream's window is read and answered `200`, and one frame past
     /// the window is a flow-control error on that stream.
     #[tokio::test]

@@ -187,7 +187,7 @@ fn bounded_server<A>(
 /// each held an unfinished HTTP/1 head of the largest size, and 0.85 GiB when each held two HTTP/2
 /// streams open with a header list of the largest size and a body of 4,090 bytes. Each figure
 /// measures its own workload.
-pub(crate) const MAX_CONNECTIONS: usize = 16_384;
+pub(crate) const MAX_CONNECTIONS: usize = 8_192;
 
 /// How long a request may take from its headers until the server has made its answer, its body
 /// included. Delivering the answer is not part of it: a connection that does not take its answer
@@ -1058,7 +1058,7 @@ mod tests {
 
     /// The connection past the most the server holds is closed at once, the ones held still
     /// answer, a place comes free when one of them ends, and a refused connection leaves no task.
-    /// The figure of the deployment is 16,384; this case holds four, and the figure itself is
+    /// The figure of the deployment is 8,192; this case holds four, and the figure itself is
     /// measured on a server with its real limits.
     #[tokio::test]
     #[traced_test]

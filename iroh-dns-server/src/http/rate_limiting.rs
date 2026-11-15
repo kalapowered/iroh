@@ -105,7 +105,8 @@ const SHARD_CAPACITY: usize = STORE_CAPACITY / SHARDS;
 /// Each of the [`SHARDS`] shards holds the most recently used [`SHARD_CAPACITY`] sources, and a
 /// source that arrives at a full shard removes the one that was used least recently. A source is
 /// used when it sends a request, whether the limiter lets the request through or refuses it, so a
-/// source that keeps sending, a refused one included, is not the one that goes.
+/// source that keeps sending, a refused one included, goes only if [`SHARD_CAPACITY`] other sources
+/// reach its shard between two of its requests.
 ///
 /// The shard of a source is chosen by a hash with a key that is made when the store is, and each
 /// shard's table has a hash with a key of its own. A sender cannot see either key, so it cannot
@@ -117,10 +118,13 @@ const SHARD_CAPACITY: usize = STORE_CAPACITY / SHARDS;
 /// burst for each entry removed.
 ///
 /// A shard's table is made for [`SHARD_CAPACITY`] entries, and under churn (entries that come and
-/// go) it may grow to a table of 8,192 buckets before it is made again, so a limiter's store takes
-/// about 16.5 MiB when it is full: 131,072 entries of about 64 bytes, and up to 64 tables of 8,192
-/// buckets of 17 bytes. The count of entries is exported (`rate_limit_lookup_entries` and
-/// `rate_limit_put_entries`).
+/// go) it may grow to a table of 8,192 buckets before it is made again. From that rule a full
+/// store comes to at most about 16.5 MiB: 131,072 entries of about 64 bytes, and up to 64 tables
+/// of 8,192 buckets of 17 bytes. That is an upper figure for one limit's store, taken from the
+/// rule and not measured; the code enforces the cap on entries and no limit on resident memory.
+/// The growth of the whole process was measured beside it, as a separate fact: with both limits'
+/// stores full, 20.81 MiB over its size after a warm-up. The count of entries is exported
+/// (`rate_limit_lookup_entries` and `rate_limit_put_entries`).
 ///
 /// There is no sweep that removes the entries of sources that have gone quiet: when a shard is
 /// full the entry that goes is the one used least recently, which is not always the one that has
@@ -489,7 +493,8 @@ mod tests {
     }
 
     /// A source that is refused is still a source in use: while others come and go it stays in
-    /// the store, indebted, as long as it keeps sending.
+    /// the store, indebted, as long as it sends before a shard's capacity of other sources has
+    /// reached its shard.
     #[test]
     fn a_refused_source_stays_indebted_while_others_come_and_go() {
         let (limiter, _clock) = limiter(64, 2_048);
@@ -567,9 +572,30 @@ mod tests {
         )
     }
 
+    /// A request from `peer` to the route `/`, with no body.
+    fn request_from(peer: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("a request");
+        request.extensions_mut().insert(ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().expect("an address"),
+        ));
+        request
+    }
+
+    /// A router with one route, behind `limiter`.
+    fn router_behind(limiter: Arc<Limiter>) -> axum::Router {
+        axum::Router::new()
+            .route("/", axum::routing::get(|| async { "through" }))
+            .route_layer(axum::middleware::from_fn_with_state(limiter, limit))
+    }
+
     /// The limit lets a source within its quota through and answers one over it as the library's
     /// own layer did: `429`, the two headers with the same whole number of seconds, and the
-    /// body that names it. A request whose source is unknown is answered `500`.
+    /// body that names it. The number of seconds is the one that the library's own limiter,
+    /// asked in the same order with the same quota, gives for its refusal. A request whose
+    /// source is unknown is answered `500`.
     #[tokio::test]
     async fn the_limit_answers_a_refusal_with_the_libraries_headers_and_body() {
         let metrics = metrics();
@@ -579,34 +605,38 @@ mod tests {
         };
         let limiter =
             create(&RateLimitConfig::Simple, quota, &metrics).expect("rate limiting is enabled");
-        let mut router = axum::Router::new()
-            .route("/", axum::routing::get(|| async { "through" }))
-            .route_layer(axum::middleware::from_fn_with_state(limiter, limit));
-        let from = |peer: &str| {
-            let mut request = Request::builder()
-                .uri("/")
-                .body(Body::empty())
-                .expect("a request");
-            request.extensions_mut().insert(ConnectInfo(
-                peer.parse::<std::net::SocketAddr>().expect("an address"),
-            ));
-            request
-        };
+        let mut router = router_behind(limiter);
+        let library = RateLimiter::keyed(
+            GovernorQuota::with_period(quota.replenish)
+                .expect("a period above zero")
+                .allow_burst(NonZeroU32::new(quota.burst).expect("a burst above zero")),
+        );
+        let source = ip("203.0.113.9");
 
-        let (status, _, body) = status_and_body(&mut router, from("203.0.113.9:1000")).await;
+        let (status, _, body) =
+            status_and_body(&mut router, request_from("203.0.113.9:1000")).await;
         assert_eq!((status, body.as_str()), (200, "through"));
+        assert!(library.check_key(&source).is_ok());
         assert_eq!(metrics.rate_limit_put_entries.get(), 1);
 
-        let (status, headers, body) = status_and_body(&mut router, from("203.0.113.9:1001")).await;
+        let (status, headers, body) =
+            status_and_body(&mut router, request_from("203.0.113.9:1001")).await;
         assert_eq!(status, 429);
+        let refusal = library
+            .check_key(&source)
+            .expect_err("the library refuses the second request too");
+        let expected = refusal
+            .wait_time_from(DefaultClock::default().now())
+            .as_secs();
+        assert!((1..=4).contains(&expected), "{expected}");
         let after = headers.get("x-ratelimit-after").expect("a header");
         assert_eq!(headers.get("retry-after"), Some(after));
         let wait: u64 = after.to_str().expect("a text").parse().expect("a number");
-        assert!(wait <= 4, "{wait}");
+        assert_eq!(wait, expected, "the wait is not the library's own");
         assert_eq!(body, format!("Too Many Requests! Wait for {wait}s"));
 
         // Another source is not held back by it.
-        let (status, _, _) = status_and_body(&mut router, from("203.0.113.10:1000")).await;
+        let (status, _, _) = status_and_body(&mut router, request_from("203.0.113.10:1000")).await;
         assert_eq!(status, 200);
         assert_eq!(metrics.rate_limit_put_entries.get(), 2);
 
@@ -617,5 +647,34 @@ mod tests {
             .expect("a request");
         let (status, _, body) = status_and_body(&mut router, request).await;
         assert_eq!((status, body.as_str()), (500, "Unable To Extract Key!"));
+    }
+
+    /// Each limiter sets the gauge of the entries of its own store and no other: the lookup
+    /// limiter the lookup gauge, the publication limiter the publication gauge.
+    #[tokio::test]
+    async fn each_limiter_reports_the_entries_of_its_own_store() {
+        let metrics = metrics();
+        let quota = Quota {
+            replenish: Duration::from_secs(4),
+            burst: 5,
+        };
+        let lookup =
+            create_lookup(&RateLimitConfig::Simple, quota, &metrics).expect("lookups are limited");
+        let put = create(&RateLimitConfig::Simple, quota, &metrics).expect("puts are limited");
+        let (mut lookups, mut puts) = (router_behind(lookup), router_behind(put));
+        assert_eq!(metrics.rate_limit_lookup_entries.get(), 0);
+        assert_eq!(metrics.rate_limit_put_entries.get(), 0);
+
+        for peer in ["203.0.113.1:1", "203.0.113.2:1", "203.0.113.3:1"] {
+            let (status, _, _) = status_and_body(&mut lookups, request_from(peer)).await;
+            assert_eq!(status, 200);
+        }
+        assert_eq!(metrics.rate_limit_lookup_entries.get(), 3);
+        assert_eq!(metrics.rate_limit_put_entries.get(), 0);
+
+        let (status, _, _) = status_and_body(&mut puts, request_from("203.0.113.1:1")).await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics.rate_limit_lookup_entries.get(), 3);
+        assert_eq!(metrics.rate_limit_put_entries.get(), 1);
     }
 }

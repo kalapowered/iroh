@@ -148,6 +148,21 @@ impl Peer<TcpStream> {
         let stream = TcpStream::connect(addr).await.anyerr()?;
         Self::over_with_settings(stream, &setting).await
     }
+
+    /// Writes a `PING` and gives the write's own result, so that a case can tell a reset from any
+    /// other failure.
+    pub(super) async fn probe(&mut self) -> std::io::Result<()> {
+        let frame = frame(PING, 0, 0, &[0; 8]);
+        self.sent += frame.len();
+        self.stream.write_all(&frame).await
+    }
+
+    /// The bytes that have reached the peer's socket and that it has not read, counted without
+    /// reading them.
+    pub(super) async fn unread(&self) -> std::io::Result<usize> {
+        let mut bytes = vec![0; 1 << 16];
+        self.stream.peek(&mut bytes).await
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
@@ -318,9 +333,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         Ok(stream)
     }
 
-    /// Sends a header block that never ends on a new stream: `HEADERS` and `continuations`
-    /// `CONTINUATION` frames of 16,384 bytes, none of them with `END_HEADERS`. A write that fails
-    /// is ignored, since the server may have closed the connection already.
+    /// Sends, on a new stream, the head of a request that never ends: a first part and
+    /// `continuations` parts after it. A write that fails is ignored, since the server may have
+    /// closed the connection already.
     pub(super) async fn unfinished_block(&mut self, continuations: usize) {
         let stream = self.next_stream;
         self.next_stream += 2;

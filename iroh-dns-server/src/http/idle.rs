@@ -48,23 +48,18 @@ pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// it: the body of the same request, and the heads of the next two requests, which HTTP/2 allows
 /// open at once.
 ///
-/// An honest interval at the largest sizes is two HTTP/2 heads of 8,192 bytes read ahead (16,400),
-/// the tail of the body before them (4,096 and its frame headers, about 4,100) and the first
-/// settings and window frames, about 20.6 kB, so the figure leaves about 4 kB over; on HTTP/1 it is
-/// at most 4,096 + 8,192 + 4,096, about 16.4 kB, and ordinary traffic is near 13 to 16 kB. A legal
-/// shape does not fit: two POSTs at once, each with a head near 8,191 bytes and a body of 4,096,
-/// come to about 24.6 kB, and the connection that sends them is closed, as a POST's head is a few
-/// hundred bytes in practice.
+/// An honest interval at the largest sizes comes to about 20.6 kB, so the figure leaves about 4 kB
+/// over; on HTTP/1 it is at most about 16.4 kB, and ordinary traffic is near 13 to 16 kB. The
+/// largest requests that the other limits allow, two at once, come to about 24.6 kB, and the
+/// connection that sends them is closed, as a POST's head is a few hundred bytes in practice.
 ///
 /// It is a threshold at which the connection is closed, not a ceiling on what the server holds.
 /// Bytes read before a start stay in what hyper has buffered for the other requests; no read takes
 /// more than the one byte that passes the threshold, which ends the connection; and the socket's
-/// buffers and those of the TLS and HTTP libraries lie outside it. What it bounds is what hyper keeps raw for a
-/// request that has not started: HTTP/2 keeps a header block as it arrives until its last frame,
-/// and `HEADERS` with five `CONTINUATION` frames of 16,384 bytes that do not end the block is not
-/// a stream, so the limit on streams and the header list limit do not count it. A connection that
-/// reads more is closed, and its client meets a connection that ends with no status, as with the
-/// idle bound.
+/// buffers and those of the TLS and HTTP libraries lie outside it. What it bounds is what hyper
+/// keeps raw for a request that has not started, which the limit on streams and the header list
+/// limit do not count. A connection that reads more is closed, and its client meets a connection
+/// that ends with no status, as with the idle bound.
 pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 
 /// The most bytes a connection may read in its life before it is shut down gracefully: 65,536,
@@ -98,7 +93,7 @@ pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 ///   the connection's life, and the connection reads at most [`READ_BOUND`] bytes in all from the
 ///   figure's first byte: 24,575 more, and the 90,113th byte ends it with no further notice. The
 ///   count is that of the connection's life, so a request start does not begin it again. Every byte
-///   that the wrapper reads counts, control frames after the first `GOAWAY` included.
+///   that the wrapper reads counts, whatever it carries.
 /// - **Time after the figure.** A connection that passed the figure with no request in progress
 ///   stands under the ordinary idle time, [`IDLE_TIMEOUT`] from its last request, until a request
 ///   starts, and then for [`DRAIN_TIMEOUT`] from the call.
@@ -117,7 +112,7 @@ pub(super) const READ_BOUND: usize = 3 * super::REQUEST_HEAD_LIMIT;
 /// - **A head in transit.** A head that stays in transit for more than 20 seconds after the call,
 ///   beside a request in progress, is cut with the connection.
 /// - **Bytes after the figure.** More than 24,575 bytes after the byte that passes the figure end
-///   the connection, whatever they carry, including control frames after the first `GOAWAY`.
+///   the connection, whatever they carry.
 /// - **Two cuts that are not new.** An answer that the client's window blocks and that is not
 ///   delivered ends at the idle bound of 30 seconds after its handler has returned. Over HTTP/1 a
 ///   request that the client pipelined behind the closing answer is not answered.

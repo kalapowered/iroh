@@ -216,13 +216,11 @@ fn bounded_server<A>(
 /// The most connections the HTTP and HTTPS listeners hold at once, together: 8,192. A connection
 /// past it is closed at once, before its handshake, and its request is not queued; the
 /// connections already held stay usable. The figure was taken from what a connection costs in the
-/// heaviest shape measured, on the build box inside a control group: two HTTP/2 streams open, each
-/// with a header list of 8,191 bytes and 4,090 body bytes, and, 2.5 seconds after the second, a
-/// header block of 20,000 bytes that does not end, which stays under `READ_BOUND`. 16,384
-/// connections in that shape held 1,642 MiB at the group's peak, 102.1 KiB each, and 8,192 held
-/// 857 MiB, 106 KiB each; with an empty server of 9 MiB, 8,192 times 102.1 KiB is 826 MiB, from
-/// which the figure was taken. The same connections each sending a request every 20 seconds held
-/// 227 MiB. Each figure measures its own workload, and no heavier shape has been measured.
+/// heaviest shape measured, on the build box inside a control group: 16,384 connections in that
+/// shape held 1,642 MiB at the group's peak, 102.1 KiB each, and 8,192 held 857 MiB, 106 KiB each;
+/// with an empty server of 9 MiB, 8,192 times 102.1 KiB is 826 MiB, from which the figure was
+/// taken. The lightest shape measured held 227 MiB at 8,192 connections. Each figure measures its
+/// own workload, and no heavier shape has been measured.
 pub(crate) const MAX_CONNECTIONS: usize = 8_192;
 
 /// How long a request may take from its headers until the server has made its answer, its body
@@ -1521,13 +1519,12 @@ mod tests {
         Ok(())
     }
 
-    /// A header block that never ends, which HTTP/2 holds as it arrives and does not count as a
-    /// stream, is cut off at the bound on what a connection reads between two request starts,
-    /// with no request in progress and with one held open beside it. The client meets a
-    /// connection that ends.
+    /// A request head that never ends is cut off at the bound on what a connection reads between
+    /// two request starts, with no request in progress and with one held open beside it. The
+    /// client meets a connection that ends.
     #[tokio::test]
     #[traced_test]
-    async fn test_http2_unfinished_header_block_closes_the_connection() -> n0_error::Result {
+    async fn test_http2_unfinished_request_head_closes_the_connection() -> n0_error::Result {
         let dir = tempfile::tempdir()?;
         let server = Server::spawn_for_tests(dir.path()).await?;
         let addr = server.http_addr().expect("http is bound");
@@ -1536,7 +1533,7 @@ mod tests {
         peer.unfinished_block(5).await;
         assert!(
             peer.ended_within(CLOSE_DEADLINE).await,
-            "an unfinished header block, with no request in progress, was held"
+            "an unfinished request head, with no request in progress, was held"
         );
 
         let mut peer = raw_h2::Peer::connect(addr).await?;
@@ -1545,7 +1542,7 @@ mod tests {
         peer.unfinished_block(5).await;
         assert!(
             peer.ended_within(CLOSE_DEADLINE).await,
-            "an unfinished header block, with a request held open, was held"
+            "an unfinished request head, with a request held open, was held"
         );
 
         server.shutdown().await?;
@@ -1556,10 +1553,9 @@ mod tests {
     /// settings (9) and the acknowledgement of the server's (9).
     const PEER_CONNECT_BYTES: usize = 42;
 
-    /// Sends frames of a type that the protocol does not define, which the server discards, until
-    /// the server has read `total` bytes from the connection in all, the last 17 of them a ping,
-    /// and waits for the ping's answer, which shows that the server has read all of them and kept
-    /// the connection open.
+    /// Sends bytes that start no request until the server has read `total` bytes from the
+    /// connection in all, the last 17 of them a ping, and waits for the ping's answer, which shows
+    /// that the server has read all of them and kept the connection open.
     async fn read_exactly<S>(peer: &mut raw_h2::Peer<S>, total: usize) -> n0_error::Result
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1634,7 +1630,7 @@ mod tests {
         let mut peer = raw_h2::Peer::connect(http).await?;
         let mut refused = TcpStream::connect(http).await.anyerr()?;
         assert_refused(&mut refused).await?;
-        // A frame of 16,384 bytes and one of 8,200 take the connection past 24,576 bytes.
+        // Two sends of bytes that start no request take the connection past 24,576 bytes.
         for payload in [16_384, 8_200] {
             let _ = peer.send(raw_h2::UNDEFINED, 0, 0, &vec![0; payload]).await;
         }
@@ -1935,9 +1931,7 @@ mod tests {
 
     /// A peer that announces a header table of 1 MiB does not get a table of that size for the
     /// answers: the library caps what the encoder takes at 4 KiB, which is its starting size, so
-    /// the first answer carries no size update above it. Without the cap each answer's `Date`
-    /// value adds an entry to the table, and 2,048 seconds of one request a second hold over
-    /// 0.3 MiB a connection.
+    /// the first answer carries no size update above it.
     #[tokio::test]
     #[traced_test]
     async fn test_http2_answers_keep_the_header_table_at_4_kib() -> n0_error::Result {
@@ -2217,8 +2211,7 @@ mod tests {
         peer.request("GET", path, &extra, true).await
     }
 
-    /// Bytes that start no request and pass the lifetime figure: a frame of a type that the
-    /// protocol does not define.
+    /// Bytes that start no request and pass the lifetime figure.
     async fn h2_pass_the_figure_with_no_request(peer: &mut raw_h2::Peer) -> n0_error::Result {
         let padding = vec![0; left_to_the_figure(peer) + 10];
         peer.send(raw_h2::UNDEFINED, 0, 0, &padding).await
@@ -2472,8 +2465,10 @@ mod tests {
     /// C3, the deliberate case. A peer that sends a window update and the `PING`'s
     /// acknowledgement at once and then reads nothing, while the server finishes and closes,
     /// still reads the answer's last data with its end and the last `GOAWAY` before any reset.
-    /// The case waits until its own writes fail, which is when the server's close has come back
-    /// to it as a reset.
+    /// The case sends a probe every few milliseconds until a write fails, which is when the
+    /// server's close has come back to it as a reset. It asserts that the failure is a reset and
+    /// that the bytes the server sent are at that moment still unread in the peer's socket, which
+    /// it counts without reading them, before it reads them.
     #[tokio::test]
     #[traced_test]
     async fn test_http2_peer_with_unread_input_at_the_close_reads_the_whole_answer()
@@ -2486,11 +2481,29 @@ mod tests {
         peer.window_update(0, 1).await?;
         peer.window_update(last, 1).await?;
         let mut probes = 0;
-        while peer.send(raw_h2::PING, 0, 0, &[0; 8]).await.is_ok() {
-            probes += 1;
-            assert!(probes < 1_000, "the server did not close the connection");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let failure = loop {
+            match peer.probe().await {
+                Ok(()) => {
+                    probes += 1;
+                    assert!(probes < 1_000, "the server did not close the connection");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(
+                failure.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ),
+            "the write failed for another reason: {failure:?}"
+        );
+        // At the least the last `GOAWAY`, 17 bytes, stands unread.
+        let unread = peer.unread().await.anyerr()?;
+        assert!(
+            unread >= 17,
+            "the server's last frames were not unread in the peer's socket at the reset: {unread}"
+        );
         while let Ok(Some(frame)) = peer.frame_within(CLOSE_DEADLINE).await {
             seen.push(frame);
         }
@@ -2714,13 +2727,13 @@ mod tests {
         Ok(())
     }
 
-    /// C15, on the wire. Control frames that the peer sends after the first `GOAWAY` count
-    /// toward the bytes: a flood of window updates that a compliant peer may send ends the
-    /// connection at the hard stop, which is not a cut by the drain time and is not counted.
+    /// C15, on the wire. Bytes that the peer sends after the first `GOAWAY` count toward the
+    /// stop, whatever they carry: a peer that goes on sending ends the connection at the hard
+    /// stop, which is not a cut by the drain time and is not counted.
     #[tokio::test]
     #[traced_test]
-    async fn test_http2_control_frames_after_the_first_goaway_spend_the_bytes() -> n0_error::Result
-    {
+    async fn test_http2_bytes_after_the_first_goaway_end_the_connection_at_the_stop()
+    -> n0_error::Result {
         let server = Recording::start()?;
         let mut peer = h2_peer_near_the_figure(server.addr).await?;
         peer.request("GET", "/wait/a", &[], true).await?;
@@ -2763,13 +2776,16 @@ mod tests {
         assert!(h1_ended(&mut stream).await, "the connection stood on");
 
         let (mut stream, left) = h1_near_the_figure(server.addr).await?;
-        let mut requests = format!(
+        let head = format!(
             "POST /hold HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4\r\nx-pad: {}\r\n\r\n",
             "a".repeat(left + 50)
         );
-        requests.push_str("GET /n/second HTTP/1.1\r\nhost: localhost\r\n\r\n");
-        stream.write_all(requests.as_bytes()).await.anyerr()?;
-        stream.write_all(b"abcd").await.anyerr()?;
+        stream.write_all(head.as_bytes()).await.anyerr()?;
+        // The declared body, and behind it a whole second request.
+        stream
+            .write_all(b"abcdGET /n/second HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .anyerr()?;
         let answer = h1_answer(&mut stream).await?;
         assert!(says_close(&answer), "{answer}");
         assert!(h1_ended(&mut stream).await, "the connection stood on");
@@ -2831,28 +2847,32 @@ mod tests {
     /// and whether the answer says that the connection closes.
     type Answered = Vec<(usize, reqwest::Version, bool)>;
 
-    /// Eight tasks on four threads send 400 requests in all through `client`, each request with a
-    /// pad of its own, across the lifetime figure several times: no caller sees an error, every
-    /// body is whole, no handler runs twice, and more connections serve them than the figure
-    /// alone makes necessary. The server cuts none of them by the drain time.
+    /// The clients of an ordinary-client case, and the requests that each of them sends.
+    const CLIENTS: usize = 8;
+    const REQUESTS_PER_CLIENT: usize = 200;
+    const _: () = assert!(
+        REQUESTS_PER_CLIENT * LEAST_BYTES_PER_REQUEST > 2 * super::idle::HARD_READ_BOUND,
+        "a client's requests must cost more than two connections' whole allowance"
+    );
+
+    /// Eight clients, each on a task of its own and so with a connection of its own, send 200
+    /// requests one at a time through `make_client`, each request with a pad of its own. The
+    /// requests of one client cost more than twice what a connection may read in its life, so each
+    /// client crosses the figure at least twice: no caller sees an error, every body is whole, no
+    /// handler runs twice, each client is served by at least three connections, and the server
+    /// cuts none of them by the drain time.
     async fn ordinary_clients_cross_the_figure(
         server: &Recording,
         scheme: &str,
         make_client: impl Fn() -> reqwest::Client,
     ) -> n0_error::Result<Answered> {
-        const REQUESTS: usize = 400;
-        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let tasks: Vec<_> = (0..8)
-            .map(|_| {
-                let (client, next, addr) = (make_client(), next.clone(), server.addr);
+        let tasks: Vec<_> = (0..CLIENTS)
+            .map(|index| {
+                let (client, addr) = (make_client(), server.addr);
                 let scheme = scheme.to_string();
                 tokio::spawn(async move {
                     let mut answered = Vec::new();
-                    loop {
-                        let id = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if id >= REQUESTS {
-                            return n0_error::Ok(answered);
-                        }
+                    for id in index * REQUESTS_PER_CLIENT..(index + 1) * REQUESTS_PER_CLIENT {
                         let response = client
                             .get(format!("{scheme}://{addr}/n/{id}"))
                             .header("x-pad", pad_of(id))
@@ -2868,6 +2888,7 @@ mod tests {
                         assert_eq!(response.text().await.anyerr()?, "OK", "request {id}");
                         answered.push((id, version, closes));
                     }
+                    n0_error::Ok(answered)
                 })
             })
             .collect();
@@ -2883,17 +2904,23 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(
             ids,
-            (0..REQUESTS).collect::<Vec<_>>(),
+            (0..CLIENTS * REQUESTS_PER_CLIENT).collect::<Vec<_>>(),
             "each request runs once"
         );
-        let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
-        let crossings = REQUESTS * LEAST_BYTES_PER_REQUEST / super::idle::HARD_READ_BOUND;
-        assert!(crossings >= 3, "the case sends too little: {crossings}");
-        assert!(
-            peers.len() > crossings,
-            "{} connections for at least {crossings} crossings",
-            peers.len()
-        );
+        for index in 0..CLIENTS {
+            let connections: std::collections::HashSet<_> = ran
+                .iter()
+                .filter(|(id, _)| {
+                    id.parse::<usize>().expect("an id") / REQUESTS_PER_CLIENT == index
+                })
+                .map(|(_, peer)| *peer)
+                .collect();
+            assert!(
+                connections.len() >= 3,
+                "client {index}: {} connections for requests that cost more than two crossings",
+                connections.len()
+            );
+        }
         assert_eq!(server.drain_timeouts(), 0);
         Ok(answered)
     }
@@ -2987,7 +3014,7 @@ mod tests {
         }
         let peers: std::collections::HashSet<_> = ran.iter().map(|(_, peer)| *peer).collect();
         assert!(
-            peers.len() - closing.len() <= 8,
+            peers.len() - closing.len() <= CLIENTS,
             "{} connections, {} answers that close",
             peers.len(),
             closing.len()

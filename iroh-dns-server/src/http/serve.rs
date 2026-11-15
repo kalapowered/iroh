@@ -322,4 +322,27 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(metrics.http_connections_drain_timeouts.get(), 0);
     }
+
+    /// A signal that is raised and a connection that ends are both ready at the first poll: the
+    /// signal is taken first, so the call is made, and the connection, which ends at once, is not
+    /// counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_and_an_end_that_are_ready_together_make_the_call_and_count_nothing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shared = Shared::new();
+        let metrics: Arc<Metrics> = Arc::default();
+        shared.drain.notify_one();
+        let counted = calls.clone();
+        drive(
+            std::future::ready(Ok::<(), io::Error>(())),
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            },
+            &shared,
+            &metrics,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the end was taken first");
+        assert_eq!(metrics.http_connections_drain_timeouts.get(), 0);
+    }
 }

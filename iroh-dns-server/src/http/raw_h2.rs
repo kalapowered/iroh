@@ -166,9 +166,9 @@ impl Peer<TcpStream> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
-    /// A peer on `stream` that has sent the preface, its settings and requests on the streams 1
-    /// and 3 already, as one write before the connection was open. It has read nothing, and it
-    /// does not acknowledge the settings that the server sends.
+    /// A peer on `stream` that has sent its opening bytes and its first two requests in one write,
+    /// before the connection was open. It has read nothing, and it answers nothing that the
+    /// server sends.
     pub(super) fn resumed(stream: S) -> Self {
         Self {
             stream,
@@ -333,9 +333,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         Ok(stream)
     }
 
-    /// Sends, on a new stream, the head of a request that never ends: a first part and
-    /// `continuations` parts after it. A write that fails is ignored, since the server may have
-    /// closed the connection already.
+    /// Sends, on a new stream, the head of a request that never ends. A write that fails is
+    /// ignored, since the server may have closed the connection already.
     pub(super) async fn unfinished_block(&mut self, continuations: usize) {
         let stream = self.next_stream;
         self.next_stream += 2;
@@ -345,9 +344,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         }
     }
 
-    /// Sends the first `first` bytes of a request's header block on a new stream, without
-    /// `END_HEADERS`, and gives the stream's number and the rest of the block, which
-    /// `finish_block` sends.
+    /// Sends the first `first` bytes of a request's head on a new stream and leaves the head
+    /// unfinished. It gives the stream's number and the rest of the head, which `finish_block`
+    /// sends.
     pub(super) async fn request_in_parts(
         &mut self,
         method: &str,
@@ -363,7 +362,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         Ok((stream, block[first..].to_vec()))
     }
 
-    /// Sends `rest` as the last part of the header block that `request_in_parts` began.
+    /// Sends `rest` as the end of the head that `request_in_parts` began.
     pub(super) async fn finish_block(&mut self, stream: u32, rest: &[u8]) -> Result<()> {
         self.send(CONTINUATION, END_HEADERS, stream, rest).await
     }

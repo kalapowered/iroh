@@ -594,7 +594,12 @@ mod tests {
     /// The limit lets a source within its quota through and answers one over it as the library's
     /// own layer did: `429`, the two headers with the same whole number of seconds, and the
     /// body that names it. The number of seconds is the one that the library's own limiter,
-    /// asked in the same order with the same quota, gives for its refusal. A request whose
+    /// asked in the same order with the same quota, gives for its refusal. The two limiters read
+    /// the system clock at their own moments, a few microseconds apart, and a wait counts whole
+    /// seconds, so the two numbers differ by one if a whole second falls between the readings,
+    /// which takes a stall of the process of about a second. The limiter of this server keeps the
+    /// system clock and the case cannot set one; a failure with the two numbers one apart can be
+    /// that stall, and a failure with any other difference is a wrong wait. A request whose
     /// source is unknown is answered `500`.
     #[tokio::test]
     async fn the_limit_answers_a_refusal_with_the_libraries_headers_and_body() {
@@ -632,7 +637,10 @@ mod tests {
         let after = headers.get("x-ratelimit-after").expect("a header");
         assert_eq!(headers.get("retry-after"), Some(after));
         let wait: u64 = after.to_str().expect("a text").parse().expect("a number");
-        assert_eq!(wait, expected, "the wait is not the library's own");
+        assert_eq!(
+            wait, expected,
+            "the wait is not the library's own (the header says {wait}, the library {expected})"
+        );
         assert_eq!(body, format!("Too Many Requests! Wait for {wait}s"));
 
         // Another source is not held back by it.

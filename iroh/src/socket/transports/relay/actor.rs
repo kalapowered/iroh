@@ -49,7 +49,7 @@ use iroh_relay::{
 };
 use n0_error::{AnyError, e, stack_error};
 use n0_future::{
-    FuturesUnorderedBounded, MaybeFuture, SinkExt, StreamExt,
+    FuturesUnorderedBounded, SinkExt, StreamExt,
     task::{JoinError, JoinSet},
     time::{self, Duration, Instant, MissedTickBehavior},
 };
@@ -1132,10 +1132,6 @@ impl RelayActor {
         mut receiver: mpsc::Receiver<RelayActorMessage>,
         mut datagram_send_channel: mpsc::Receiver<RelaySendItem>,
     ) {
-        // When this future is present, it is sending pending datagrams to an
-        // ActiveRelayActor.  We can not process further datagrams during this time.
-        let mut datagram_send_fut = std::pin::pin!(MaybeFuture::None);
-
         loop {
             tokio::select! {
                 biased;
@@ -1155,22 +1151,13 @@ impl RelayActor {
                     let cancel_token = self.cancel_token.child_token();
                     cancel_token.run_until_cancelled(self.handle_msg(msg)).await;
                 }
-                // Only poll for new datagrams if we are not blocked on sending them.
-                item = datagram_send_channel.recv(), if datagram_send_fut.is_none() => {
+                item = datagram_send_channel.recv() => {
                     let Some(item) = item else {
                         debug!("Datagram send channel dropped, shutting down.");
                         break;
                     };
                     let token = self.cancel_token.child_token();
-                    if let Some(Some(fut)) = token.run_until_cancelled(
-                        self.try_send_datagram(item)
-                    ).await {
-                        datagram_send_fut.as_mut().set_future(fut);
-                    }
-                }
-                // Only poll this future if it is in use.
-                _ = &mut datagram_send_fut, if datagram_send_fut.is_some() => {
-                    datagram_send_fut.as_mut().set_none();
+                    token.run_until_cancelled(self.try_send_datagram(item)).await;
                 }
             }
         }
@@ -1198,33 +1185,24 @@ impl RelayActor {
         }
     }
 
-    /// Sends datagrams to the correct [`ActiveRelayActor`], or returns a future.
+    /// Sends datagrams to the correct [`ActiveRelayActor`].
     ///
-    /// If the datagram can not be sent immediately, because the destination channel is
-    /// full, a future is returned that will complete once the datagrams have been sent to
-    /// the [`ActiveRelayActor`].
-    async fn try_send_datagram(
-        &mut self,
-        item: RelaySendItem,
-    ) -> Option<impl Future<Output = ()> + use<>> {
+    /// If the destination queue is full the datagrams are dropped and QUIC handles them
+    /// as lost.  This actor serves the datagrams of every relay, so it must never wait for
+    /// the queue of one relay: a relay that does not read its queue would then hold back
+    /// the datagrams for all other relays as well.
+    async fn try_send_datagram(&mut self, item: RelaySendItem) {
         let url = item.url.clone();
         let handle = self
             .active_relay_handle_for_endpoint(&item.url, &item.remote_endpoint)
             .await;
         match handle.datagrams_send_queue.try_send(item) {
-            Ok(()) => None,
+            Ok(()) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!(?url, "Dropped datagram(s): ActiveRelayActor closed.");
-                None
             }
-            Err(mpsc::error::TrySendError::Full(item)) => {
-                let sender = handle.datagrams_send_queue.clone();
-                let fut = async move {
-                    if sender.send(item).await.is_err() {
-                        warn!(?url, "Dropped datagram(s): ActiveRelayActor closed.");
-                    }
-                };
-                Some(fut)
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!(?url, "Dropped datagram(s): ActiveRelayActor queue full.");
             }
         }
     }
@@ -1525,19 +1503,16 @@ mod tests {
     use tracing::{Instrument, info, info_span};
 
     use super::{
-        ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayMessage, ActiveRelayPrioMessage,
-        Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor, RelayConnectionOptions, RelayMap,
-        RelayRecvDatagram, RelaySendItem, UNDELIVERABLE_DATAGRAM_TIMEOUT,
+        ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayHandle, ActiveRelayMessage,
+        ActiveRelayPrioMessage, Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor,
+        RelayConnectionOptions, RelayMap, RelayRecvDatagram, RelaySendItem,
+        UNDELIVERABLE_DATAGRAM_TIMEOUT,
     };
     use crate::{dns::DnsResolver, metrics::SocketMetrics, test_utils};
 
-    /// Abort stands in for the runtime drop that triggers this in the wild:
-    /// `join_next` yields a cancelled `JoinError` either way.
-    #[tokio::test]
-    #[traced_test]
-    async fn close_all_active_relays_survives_a_cancelled_task() {
-        let (relay_datagram_recv_queue, _recv_rx) = mpsc::channel(1);
-        let config = Config {
+    /// A [`Config`] for a [`RelayActor`] that has no relay server to talk to.
+    fn test_relay_actor_config() -> Config {
+        Config {
             my_relay: Default::default(),
             secret_key: SecretKey::from_bytes(&[0u8; 32]),
             dns_resolver: DnsResolver::new(),
@@ -1548,9 +1523,20 @@ mod tests {
                 .expect("infallible"),
             metrics: Default::default(),
             relay_map: RelayMap::empty(),
-        };
-        let mut actor =
-            RelayActor::new(config, relay_datagram_recv_queue, CancellationToken::new());
+        }
+    }
+
+    /// Abort stands in for the runtime drop that triggers this in the wild:
+    /// `join_next` yields a cancelled `JoinError` either way.
+    #[tokio::test]
+    #[traced_test]
+    async fn close_all_active_relays_survives_a_cancelled_task() {
+        let (relay_datagram_recv_queue, _recv_rx) = mpsc::channel(1);
+        let mut actor = RelayActor::new(
+            test_relay_actor_config(),
+            relay_datagram_recv_queue,
+            CancellationToken::new(),
+        );
 
         let handle = actor.active_relay_tasks.spawn(std::future::pending::<()>());
         handle.abort();
@@ -1560,6 +1546,69 @@ mod tests {
 
         assert!(actor.active_relay_tasks.is_empty());
         assert!(logs_contain("ActiveRelayActor cancelled"));
+    }
+
+    /// A relay which does not read its queue must not hold back the datagrams for the
+    /// other relays: the [`RelayActor`] serves all of them.
+    #[tokio::test]
+    #[traced_test]
+    async fn full_relay_queue_does_not_block_other_relays() {
+        let (relay_datagram_recv_queue, _recv_rx) = mpsc::channel(1);
+        let mut actor = RelayActor::new(
+            test_relay_actor_config(),
+            relay_datagram_recv_queue,
+            CancellationToken::new(),
+        );
+
+        // Handles to relays whose actors are stand-ins: the test reads the queue of one and
+        // never reads the queue of the other.
+        let stuck_url: RelayUrl = "https://stuck.invalid".parse().unwrap();
+        let healthy_url: RelayUrl = "https://healthy.invalid".parse().unwrap();
+        let (stuck_queue_tx, mut stuck_queue_rx) = mpsc::channel(1);
+        let (healthy_queue_tx, mut healthy_queue_rx) = mpsc::channel(8);
+        let (prio_inbox_tx, _prio_inbox_rx) = mpsc::channel(8);
+        let (inbox_tx, _inbox_rx) = mpsc::channel(8);
+        for (url, datagrams_send_queue) in [
+            (stuck_url.clone(), stuck_queue_tx),
+            (healthy_url.clone(), healthy_queue_tx),
+        ] {
+            actor.active_relays.insert(
+                url,
+                ActiveRelayHandle {
+                    prio_inbox_addr: prio_inbox_tx.clone(),
+                    inbox_addr: inbox_tx.clone(),
+                    datagrams_send_queue,
+                },
+            );
+        }
+
+        let (_actor_inbox_tx, actor_inbox_rx) = mpsc::channel(8);
+        let (send_tx, send_rx) = mpsc::channel(16);
+        let _task = AbortOnDropHandle::new(tokio::spawn(actor.run(actor_inbox_rx, send_rx)));
+
+        let remote_endpoint = SecretKey::from_bytes(&[2u8; 32]).public();
+        let item = |url: &RelayUrl, data: &'static [u8]| RelaySendItem {
+            remote_endpoint,
+            url: url.clone(),
+            datagrams: Datagrams::from(data),
+        };
+
+        // The first datagram fills the queue of the stuck relay, the next ones find it full.
+        for data in [b"stuck 1", b"stuck 2", b"stuck 3"] {
+            send_tx.send(item(&stuck_url, data)).await.unwrap();
+        }
+        send_tx.send(item(&healthy_url, b"healthy")).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), healthy_queue_rx.recv())
+            .await
+            .expect("datagram for the healthy relay was not delivered")
+            .expect("queue closed");
+        assert_eq!(received.datagrams, Datagrams::from(b"healthy"));
+
+        // The datagrams that found the queue full are dropped, not kept for later.
+        let first = stuck_queue_rx.try_recv().expect("first datagram is queued");
+        assert_eq!(first.datagrams, Datagrams::from(b"stuck 1"));
+        assert!(stuck_queue_rx.try_recv().is_err());
     }
 
     /// Starts a new [`ActiveRelayActor`].

@@ -25,6 +25,19 @@ opt-level = 3
 panic = 'abort'
 incremental = false
 
+[patch.crates-io]
+# `simple-dns` 0.12.0, a library that parses and writes DNS packets, lacks two fixes that upstream
+# released in 0.13.1: "limit items vec capacity when parsing packets" and "Return write errors
+# when DNS output buffers fill". This source is the 0.12.0 release with those two upstream commits
+# picked onto it as they are; nothing of 0.13.0 is in it. It also leaves out the crate
+# repository's `bind9` submodule, which only the crate's `bind9-tests` package uses, so that a
+# build fetches nothing from another host. An update cannot bring the fixes: `iroh`, `iroh-dns`
+# and `iroh-dns-server` in this workspace and the registry package `n0-dns-resolver` require the
+# crate's `0.12` line. Remove this entry, and the git source it gives `simple-dns` in
+# `Cargo.lock`, when the workspace can take a release of the crate that holds both fixes, which is
+# version 0.13.1 or later; 0.13.0 holds neither.
+simple-dns = { git = "https://github.com/kalapowered/simple-dns", rev = "def27859a02d7f38391f0e3f9d9fcf33e51d05ce" }
+
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
 

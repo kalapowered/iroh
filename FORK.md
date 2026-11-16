@@ -158,6 +158,25 @@ Not bounded by these figures: the settings of the host's kernel, whose limits on
 A deployment builds with `KR_FORK_REV` set to the commit it pins, and compares `/healthz` with
 it.
 
+### Dependency: `simple-dns` 0.12.0 with two upstream fixes
+
+The root `Cargo.toml` takes the DNS packet library `simple-dns` from
+[`kalapowered/simple-dns`](https://github.com/kalapowered/simple-dns) at commit
+`def27859a02d7f38391f0e3f9d9fcf33e51d05ce`, in place of the registry's 0.12.0, through
+`[patch.crates-io]`. The registry's 0.12.0 lacks two fixes that upstream released in 0.13.1:
+"limit items vec capacity when parsing packets" and "Return write errors when DNS output buffers
+fill". That source is the 0.12.0 release with those two upstream commits picked onto it as they
+are, and without the crate repository's `bind9` submodule, which only the crate's `bind9-tests`
+package uses, so that a build fetches nothing from another host. `iroh`, `iroh-dns`,
+`iroh-dns-server` and the registry package `n0-dns-resolver` require the crate's `0.12` line, so an
+update cannot bring the fixes. The entry, and the git source it gives the crate in `Cargo.lock`,
+go when the workspace can take a release of the crate that holds both fixes, which is version
+0.13.1 or later; 0.13.0 holds neither.
+
+Tests, in the crate's fork, `simple-dns/src/dns/packet.rs`, module `tests`:
+`plain_bounded_packet_writer_returns_errors_when_full` and
+`compressed_bounded_packet_writer_returns_errors_when_full`.
+
 ## Fixing a vulnerability
 
 The daily check reads the lock files that build the two deployed binaries: the fork's `Cargo.lock`

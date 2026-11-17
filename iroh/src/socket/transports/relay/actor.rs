@@ -67,6 +67,13 @@ use crate::{endpoint::RelayStatus, net_report::Report, socket::Metrics as Socket
 /// How long a non-home relay connection needs to be idle (last written to) before we close it.
 const RELAY_INACTIVE_CLEANUP_TIME: Duration = Duration::from_secs(60);
 
+/// How long to wait for the relay server to finish closing a relay connection.
+///
+/// A relay server which has stopped answering never finishes the close, so the connection
+/// is dropped after this time.  This is the same time [`RelayActor`] gives all relay
+/// connections to close at shutdown.
+const RELAY_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Interval in which we ping the relay server to ensure the connection is alive.
 ///
 /// The default QUIC max_idle_timeout is 30s, so setting that to half this time gives some
@@ -703,10 +710,12 @@ impl ActiveRelayActor {
             }
         };
 
-        if res.is_ok()
-            && let Err(err) = client_sink.close().await
-        {
-            debug!("Failed to close client sink gracefully: {err:#}");
+        if res.is_ok() {
+            match time::timeout(RELAY_CLOSE_TIMEOUT, client_sink.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => debug!("Failed to close client sink gracefully: {err:#}"),
+                Err(_) => debug!("Timed out closing client sink, dropping the connection."),
+            }
         }
 
         res.map_err(|err| state.map_err(err))
@@ -1486,7 +1495,11 @@ pub(crate) struct RelayRecvDatagram {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, atomic::AtomicBool},
+        net::{Ipv4Addr, SocketAddr},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -1497,8 +1510,14 @@ mod tests {
         tls::{CaTlsConfig, default_provider},
     };
     use n0_error::{AnyError as Error, Result, StackResultExt, StdResultExt};
+    use n0_future::time::Instant;
     use n0_tracing_test::traced_test;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::{mpsc, oneshot},
+        task::JoinSet,
+    };
     use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
     use tracing::{Instrument, info, info_span};
 
@@ -1883,22 +1902,7 @@ mod tests {
             info_span!("actor-under-test"),
         );
 
-        // Wait until the actor is connected to the relay server.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let (tx, rx) = oneshot::channel();
-                inbox_tx.send(ActiveRelayMessage::PingServer(tx)).await.ok();
-                if tokio::time::timeout(Duration::from_millis(200), rx)
-                    .await
-                    .map(|resp| resp.is_ok())
-                    .unwrap_or_default()
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .std_context("timeout")?;
+        wait_until_connected(&inbox_tx).await?;
 
         assert_eq!(metrics.relay_conns_success.get(), 1);
         assert_eq!(
@@ -1946,6 +1950,151 @@ mod tests {
         );
 
         cancel_token.cancel();
+        Ok(())
+    }
+
+    /// Waits until the [`ActiveRelayActor`] behind `inbox_tx` is connected to its relay server.
+    async fn wait_until_connected(inbox_tx: &mpsc::Sender<ActiveRelayMessage>) -> Result {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (tx, rx) = oneshot::channel();
+                inbox_tx.send(ActiveRelayMessage::PingServer(tx)).await.ok();
+                if tokio::time::timeout(Duration::from_millis(200), rx)
+                    .await
+                    .map(|resp| resp.is_ok())
+                    .unwrap_or_default()
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .std_context("timeout")?;
+        Ok(())
+    }
+
+    /// Forwards bytes from `from` to `to`, or discards them once `silent` is set.
+    async fn forward(
+        mut from: impl AsyncRead + Unpin,
+        mut to: impl AsyncWrite + Unpin,
+        silent: Arc<AtomicBool>,
+    ) {
+        let mut buf = vec![0u8; 16 * 1024];
+        while let Ok(n) = from.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            if !silent.load(Ordering::Relaxed) && to.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// A TCP forwarder in front of a relay server which can be told to go silent.
+    ///
+    /// Once silent it keeps all connections open but forwards nothing in either direction,
+    /// like a relay server which has stopped answering.
+    struct SilentableProxy {
+        addr: SocketAddr,
+        silent: Arc<AtomicBool>,
+        _task: AbortOnDropHandle<()>,
+    }
+
+    impl SilentableProxy {
+        async fn start(target: SocketAddr) -> Result<Self> {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .std_context("bind proxy")?;
+            let addr = listener.local_addr().std_context("proxy address")?;
+            let silent = Arc::new(AtomicBool::new(false));
+            let task = tokio::spawn({
+                let silent = silent.clone();
+                async move {
+                    let mut connections = JoinSet::new();
+                    while let Ok((client, _)) = listener.accept().await {
+                        let Ok(server) = TcpStream::connect(target).await else {
+                            break;
+                        };
+                        let (client_read, client_write) = client.into_split();
+                        let (server_read, server_write) = server.into_split();
+                        connections.spawn(forward(client_read, server_write, silent.clone()));
+                        connections.spawn(forward(server_read, client_write, silent.clone()));
+                    }
+                }
+            });
+            Ok(Self {
+                addr,
+                silent,
+                _task: AbortOnDropHandle::new(task),
+            })
+        }
+
+        fn go_silent(&self) {
+            self.silent.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// An idle relay connection is given up even when the relay server no longer answers:
+    /// closing it must not wait for the relay server forever.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_active_relay_inactive_silent_relay() -> Result {
+        let (_relay_map, _relay_url, server) = test_utils::run_relay_server().await?;
+        let proxy =
+            SilentableProxy::start(server.https_addr().context("no https address")?).await?;
+        let relay_url: RelayUrl = format!("https://{}", proxy.addr)
+            .parse()
+            .expect("invalid relay url");
+
+        let (datagram_recv_tx, _datagram_recv_rx) = mpsc::channel(16);
+        let (_send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
+        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
+        let (inbox_tx, inbox_rx) = mpsc::channel(16);
+        let opts = ActiveRelayActorOptions {
+            url: relay_url,
+            prio_inbox_: prio_inbox_rx,
+            inbox: inbox_rx,
+            relay_datagrams_send: send_datagram_rx,
+            relay_datagrams_recv: datagram_recv_tx,
+            connection_opts: RelayConnectionOptions {
+                secret_key: SecretKey::from_bytes(&[1u8; 32]),
+                dns_resolver: DnsResolver::new(),
+                proxy_url: None,
+                prefer_ipv6: Arc::new(AtomicBool::new(true)),
+                tls_config: CaTlsConfig::insecure_skip_verify()
+                    .client_config(default_provider())
+                    .expect("infallible"),
+                auth_token: None,
+            },
+            stop_token: CancellationToken::new(),
+            metrics: Default::default(),
+            my_relay: Default::default(),
+        };
+        let mut actor = ActiveRelayActor::new(opts);
+        // The idle time is over from the start, but the actor is the home relay, which never
+        // exits for being idle: the case decides when the actor may.
+        actor.is_home_relay = true;
+        actor.inactive_timeout.as_mut().reset(Instant::now());
+        let mut task = AbortOnDropHandle::new(tokio::spawn(actor.run()));
+        wait_until_connected(&inbox_tx).await?;
+
+        // The relay server answered, then it stops answering. Only then may the actor become
+        // idle, so it exits with a connection to a server which is silent.
+        proxy.go_silent();
+        inbox_tx
+            .send(ActiveRelayMessage::SetHomeRelay(false))
+            .await
+            .std_context("send set home relay message")?;
+
+        // The actor stops once the bound on the close has passed, and the closed inbox is what
+        // lets the parent actor drop its handle to this relay.
+        tokio::time::timeout(Duration::from_secs(30), &mut task)
+            .await
+            .expect("actor still waits for the silent relay server")
+            .std_context("actor task failed")?;
+        assert!(inbox_tx.is_closed());
+        // The close did not finish by itself: the time limit ended it.
+        assert!(logs_contain("Timed out closing client sink"));
         Ok(())
     }
 
